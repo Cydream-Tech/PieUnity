@@ -4,7 +4,7 @@
   "displayName": "Pie AI Agent",
   "description": "Platform for Intelligent Engineering - runtime-first AI agent framework for Unity.",
   "unity": "2022.3",
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "keywords": [
     "ai",
     "agent",

@@ -65,7 +65,7 @@ npm run export:pie-unity -- \
 --commit --tag
 ```
 
-当前仓库内的许可证占位是 `UNLICENSED`。在真正公开发布独立仓库或接入 OpenUPM 之前，请先替换 `LICENSE` 和 `package.json` 中的许可证信息。
+当前仓库已经使用 `Apache-2.0` 许可证。发布独立仓库时，请保持 `LICENSE` 与 `package.json` 中的许可证字段一致。
 
 ## 快速开始
 
