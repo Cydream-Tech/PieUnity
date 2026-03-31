@@ -30,7 +30,7 @@ Install through Unity Package Manager:
 - Git release repository:
   `Add package from git URL...`
 - Current public Git URL:
-  `https://github.com/Cydream-Tech/PieUnity.git#0.1.0`
+  `https://github.com/Cydream-Tech/PieUnity.git#0.1.1`
 
 After installation, you can import the `Extension Demo` sample from the Package Manager Samples section.
 
