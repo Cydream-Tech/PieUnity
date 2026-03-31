@@ -210,6 +210,7 @@ namespace Pie.Editor
             {
                 _provider = newProvider;
                 EditorPrefs.SetString(PREF_PROVIDER, _provider);
+                PushSettings();
             }
             EditorGUILayout.EndHorizontal();
 
@@ -221,6 +222,7 @@ namespace Pie.Editor
             {
                 _model = newModel;
                 EditorPrefs.SetString(PREF_MODEL, _model);
+                PushSettings();
             }
             EditorGUILayout.EndHorizontal();
 
@@ -232,6 +234,7 @@ namespace Pie.Editor
             {
                 _baseUrl = newBaseUrl;
                 EditorPrefs.SetString(PREF_BASE_URL, _baseUrl);
+                PushSettings();
             }
             EditorGUILayout.EndHorizontal();
 
