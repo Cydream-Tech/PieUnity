@@ -243,6 +243,10 @@ namespace Pie
             return CS.Pie.PieProjectPaths.GetProjectMemoryPath(globalThis.pieBridge.projectRoot);
         }},
 
+        getPersistentDataPath: function() {{
+            return String(CS.UnityEngine.Application.persistentDataPath || '').replace(/\\/g, '/');
+        }},
+
         getRuntimeStateRoot: function() {{
             return CS.Pie.PieProjectPaths.GetRuntimeStateRoot();
         }},

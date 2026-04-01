@@ -166,6 +166,7 @@ namespace Pie.Editor
             else
             {
                 DrawMessages();
+                DrawTokenSummaryBar();
                 DrawInput();
             }
         }
@@ -334,7 +335,7 @@ namespace Pie.Editor
             EditorGUILayout.BeginVertical("box");
             EditorGUILayout.LabelField($"{session.title} ({session.id})", EditorStyles.miniBoldLabel);
             var messageLabel = session.messageCount == 1 ? "1 message" : $"{session.messageCount} messages";
-            EditorGUILayout.LabelField($"{session.modelId} | {messageLabel} | {session.updatedAt}", EditorStyles.wordWrappedMiniLabel);
+            EditorGUILayout.LabelField($"{session.modelId} | {messageLabel} | {FormatSessionTimestamp(session.updatedAt)}", EditorStyles.wordWrappedMiniLabel);
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("Resume", GUILayout.Width(60)))
                 SendCommand($"/resume {session.id}");
@@ -519,6 +520,10 @@ namespace Pie.Editor
                 normal = { textColor = roleColor }
             });
             GUILayout.FlexibleSpace();
+            if (msg.Role == "user" && msg.InputTokens > 0)
+                GUILayout.Label($"~↑{FormatTokenCount(msg.InputTokens)} tok", EditorStyles.miniLabel, GUILayout.Width(84));
+            if (msg.Role == "assistant" && msg.TotalTokens > 0)
+                GUILayout.Label($"{(msg.IsEstimatedUsage ? "~" : "")}{msg.TotalTokens} tok", EditorStyles.miniLabel, GUILayout.Width(72));
             if (GUILayout.Button("Copy", EditorStyles.miniButton, GUILayout.Width(42)))
                 EditorGUIUtility.systemCopyBuffer = msg.Content ?? "";
             EditorGUILayout.EndHorizontal();
@@ -559,6 +564,7 @@ namespace Pie.Editor
             var canSend = !_isStreaming
                 && !string.IsNullOrWhiteSpace(_inputText)
                 && _bridge?.IsInitialized == true;
+            var estimatedInputTokens = EstimateTextTokens(_inputText);
 
             EditorGUILayout.BeginVertical(GUILayout.Width(60));
             GUI.enabled = canSend;
@@ -574,6 +580,12 @@ namespace Pie.Editor
                     AbortCurrentTurn();
             }
             EditorGUILayout.EndVertical();
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.FlexibleSpace();
+            if (estimatedInputTokens > 0)
+                GUILayout.Label($"Next send ~{FormatTokenCount(estimatedInputTokens)} tok", EditorStyles.miniLabel);
             EditorGUILayout.EndHorizontal();
 
             EditorGUILayout.LabelField("Ctrl+Enter to send", EditorStyles.centeredGreyMiniLabel);
@@ -609,6 +621,44 @@ namespace Pie.Editor
 
             EditorGUILayout.EndHorizontal();
             GUILayout.Space(2f);
+        }
+
+        private void DrawTokenSummaryBar()
+        {
+            var totalInput = 0;
+            var totalOutput = 0;
+            var totalCacheRead = 0;
+            var totalCacheWrite = 0;
+            var hasEstimated = false;
+
+            foreach (var message in _messages)
+            {
+                if (message.Role != "assistant")
+                    continue;
+
+                totalInput += Math.Max(0, message.InputTokens);
+                totalOutput += Math.Max(0, message.OutputTokens);
+                totalCacheRead += Math.Max(0, message.CacheReadTokens);
+                totalCacheWrite += Math.Max(0, message.CacheWriteTokens);
+                hasEstimated = hasEstimated || message.IsEstimatedUsage;
+            }
+
+            var totalTokens = totalInput + totalOutput + totalCacheRead + totalCacheWrite;
+            if (totalTokens <= 0)
+            {
+                GUILayout.Space(4f);
+                return;
+            }
+
+            EditorGUILayout.BeginHorizontal("box");
+            var prefix = hasEstimated ? "~" : "";
+            GUILayout.Label(
+                $"Session tokens {prefix}↑{FormatTokenCount(totalInput)}  ↓{FormatTokenCount(totalOutput)}  Σ{FormatTokenCount(totalTokens)}",
+                EditorStyles.miniLabel);
+            GUILayout.FlexibleSpace();
+            if (totalCacheRead > 0 || totalCacheWrite > 0)
+                GUILayout.Label($"cache R{FormatTokenCount(totalCacheRead)} W{FormatTokenCount(totalCacheWrite)}", EditorStyles.miniLabel);
+            EditorGUILayout.EndHorizontal();
         }
 
         private void DrawLogs()
@@ -682,6 +732,7 @@ namespace Pie.Editor
                     }
                     return;
                 case "thinking_event":  HandleThinkingEvent(json); break;
+                case "message_metrics": HandleMessageMetrics(json); break;
                 case "state_event":     HandleStateEvent(json);    break;
                 case "tool_start":      HandleToolStart(json);     break;
                 case "tool_end":        HandleToolEnd(json);       break;
@@ -695,6 +746,40 @@ namespace Pie.Editor
                     break;
             }
             ScheduleRepaint();
+        }
+
+        private static int EstimateTextTokens(string text)
+        {
+            var normalized = (text ?? "").Trim();
+            if (string.IsNullOrEmpty(normalized))
+                return 0;
+            return Math.Max(1, Mathf.CeilToInt(normalized.Length / 4f));
+        }
+
+        private static string FormatTokenCount(int count)
+        {
+            if (count < 1000)
+                return count.ToString();
+            if (count < 10000)
+                return (count / 1000f).ToString("0.0") + "k";
+            if (count < 1000000)
+                return Mathf.RoundToInt(count / 1000f) + "k";
+            return (count / 1000000f).ToString("0.0") + "M";
+        }
+
+        private static string FormatSessionTimestamp(string raw)
+        {
+            if (string.IsNullOrEmpty(raw))
+                return "";
+
+            if (!DateTime.TryParse(raw, null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsed))
+                return raw;
+
+            var local = parsed.ToLocalTime();
+            var now = DateTime.Now;
+            if (local.Year == now.Year)
+                return local.ToString("MM-dd HH:mm");
+            return local.ToString("yyyy-MM-dd HH:mm");
         }
 
         private void HandleMessageUpdate(string json)
@@ -930,7 +1015,15 @@ namespace Pie.Editor
                             content = $"⚠ {message.errorMessage}";
                         if (string.IsNullOrEmpty(content) && !string.IsNullOrEmpty(message.stopReason))
                             content = $"[{message.stopReason}]";
-                        _messages.Add(new ChatMessage(role, content ?? ""));
+                        _messages.Add(new ChatMessage(role, content ?? "")
+                        {
+                            InputTokens = message.usage != null ? message.usage.input : (role == "user" ? EstimateTextTokens(content) : 0),
+                            OutputTokens = message.usage != null ? message.usage.output : 0,
+                            CacheReadTokens = message.usage != null ? message.usage.cacheRead : 0,
+                            CacheWriteTokens = message.usage != null ? message.usage.cacheWrite : 0,
+                            TotalTokens = message.usage != null ? message.usage.totalTokens : (role == "user" ? EstimateTextTokens(content) : 0),
+                            IsEstimatedUsage = message.usage != null && message.usage.estimated,
+                        });
                     }
                 }
 
@@ -964,6 +1057,35 @@ namespace Pie.Editor
                 _messages[_messages.Count - 1] = new ChatMessage("assistant", $"⚠ {msg}");
             else
                 AddSystemMessage($"⚠ {msg}");
+        }
+
+        private void HandleMessageMetrics(string json)
+        {
+            try
+            {
+                var payload = JsonUtility.FromJson<MessageMetricsPayload>(json);
+                if (payload?.usage == null)
+                    return;
+
+                for (var i = _messages.Count - 1; i >= 0; i--)
+                {
+                    var message = _messages[i];
+                    if (message.Role != "assistant")
+                        continue;
+
+                    message.InputTokens = payload.usage.input;
+                    message.OutputTokens = payload.usage.output;
+                    message.CacheReadTokens = payload.usage.cacheRead;
+                    message.CacheWriteTokens = payload.usage.cacheWrite;
+                    message.TotalTokens = payload.usage.totalTokens;
+                    message.IsEstimatedUsage = payload.usage.estimated;
+                    break;
+                }
+            }
+            catch (Exception ex)
+            {
+                PieDiagnostics.Warning($"[PieChatWindow] HandleMessageMetrics: {ex.Message}");
+            }
         }
 
         private void HandleSkillsList(string json)
@@ -1174,8 +1296,18 @@ namespace Pie.Editor
         }
 
         // ─── Helpers ──────────────────────────────────────────────────────────
-        private void AddMessage(string role, string content) =>
-            _messages.Add(new ChatMessage(role, content));
+        private void AddMessage(string role, string content)
+        {
+            var message = new ChatMessage(role, content);
+            if (role == "user")
+            {
+                var estimated = EstimateTextTokens(content);
+                message.InputTokens = estimated;
+                message.TotalTokens = estimated;
+                message.IsEstimatedUsage = true;
+            }
+            _messages.Add(message);
+        }
 
         private void AddSystemMessage(string content) =>
             _messages.Add(new ChatMessage("system", content));
@@ -1707,6 +1839,12 @@ namespace Pie.Editor
             public string ArgsSummary;
             public string ToolName;
             public string ToolCallId;
+            public int InputTokens;
+            public int OutputTokens;
+            public int CacheReadTokens;
+            public int CacheWriteTokens;
+            public int TotalTokens;
+            public bool IsEstimatedUsage;
             public bool IsCompact;
             public bool IsRunning;
             public bool IsError;
@@ -1757,7 +1895,26 @@ namespace Pie.Editor
             public string role;
             public string errorMessage;
             public string stopReason;
+            public SessionSyncUsage usage;
             public SessionSyncContent[] content;
+        }
+
+        [Serializable]
+        private class SessionSyncUsage
+        {
+            public int input;
+            public int output;
+            public int cacheRead;
+            public int cacheWrite;
+            public int totalTokens;
+            public bool estimated;
+        }
+
+        [Serializable]
+        private class MessageMetricsPayload
+        {
+            public string role;
+            public SessionSyncUsage usage;
         }
 
         [Serializable]

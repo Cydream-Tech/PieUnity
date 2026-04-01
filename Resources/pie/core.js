@@ -14592,6 +14592,43 @@ ${skill.content}`
   if (!bridge) throw new Error("[pie] globalThis.pieBridge not found \u2014 was PieBridge.cs initialized?");
   var projectRoot = bridge.getProjectRoot();
   var isEditor = bridge.isEditor === true;
+  var persistentDataPath = typeof bridge.getPersistentDataPath === "function" ? String(bridge.getPersistentDataPath() || "").replace(/\\/g, "/") : "";
+  function parseJsonStringArray(raw) {
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(String(raw));
+      return Array.isArray(parsed) ? parsed.filter((item) => typeof item === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+  function uniquePaths(paths) {
+    const seen = /* @__PURE__ */ new Set();
+    const results = [];
+    for (const value of paths) {
+      if (!value || typeof value !== "string") continue;
+      const normalized = String(value).replace(/\\/g, "/");
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      results.push(normalized);
+    }
+    return results;
+  }
+  function buildFileToolPathOptions() {
+    const runtimeStateRoot = typeof bridge.getRuntimeStateRoot === "function" ? String(bridge.getRuntimeStateRoot() || "") : "";
+    const sessionsDirectory = typeof bridge.getSessionsDirectory === "function" ? String(bridge.getSessionsDirectory() || "") : "";
+    const extensionPaths = typeof bridge.getExtensionSearchPathsJson === "function" ? parseJsonStringArray(String(bridge.getExtensionSearchPathsJson() || "[]")) : [];
+    const skillPaths = typeof bridge.getSkillSearchPathsJson === "function" ? parseJsonStringArray(String(bridge.getSkillSearchPathsJson() || "[]")) : [];
+    const editorOnlyPaths = isEditor ? [projectRoot, ...extensionPaths, ...skillPaths] : [];
+    return {
+      allowlistedDirs: uniquePaths([
+        persistentDataPath,
+        runtimeStateRoot,
+        sessionsDirectory,
+        ...editorOnlyPaths
+      ])
+    };
+  }
   var httpClient = new UnityHttpClient();
   setHttpClient(httpClient);
   var PROVIDER_PRESETS = {
@@ -14637,7 +14674,9 @@ ${extensionSection.join("\n\n---\n\n")}
       return [
         "You are Pie, an expert AI coding assistant embedded in Unity Editor.",
         `The Unity project is located at: ${root}`,
+        `Default filesystem root is Application.persistentDataPath: ${persistentDataPath || "(unavailable)"}`,
         "You can work with files using these structured tools: read_file, write_file, edit_file, list_directory, search_file_content, search_files.",
+        "In Editor, both Application.persistentDataPath and project paths such as Assets/... are accessible.",
         "You can execute JavaScript in Unity via the eval_js tool and the global CS object.",
         "Prefer making small, targeted edits. Always read a file before writing it.",
         "Be concise and helpful.",
@@ -14648,8 +14687,9 @@ ${extensionSection.join("\n\n---\n\n")}
     }
     return [
       "You are Pie, an AI agent running inside a Unity runtime application.",
-      `Your primary working directory is: ${root}`,
+      `Your primary working directory is Application.persistentDataPath: ${persistentDataPath || root}`,
       "You can work with files using these structured tools: read_file, write_file, edit_file, list_directory, search_file_content, search_files.",
+      "At runtime, treat Application.persistentDataPath as the default filesystem root. Do not assume Assets/... paths are accessible.",
       "You can execute JavaScript in Unity via the eval_js tool and the global CS object.",
       "You are intended for runtime automation, NPC behaviors, and voice-to-action control.",
       "Be concise and helpful.",
@@ -14694,39 +14734,41 @@ ${extensionSection.join("\n\n---\n\n")}
     todoState: []
   });
   var todoTool = createManageTodoListTool();
+  var fileToolPathOptions = buildFileToolPathOptions();
+  var fileToolRoot = persistentDataPath || projectRoot;
   var builtinFileTools = [
     aliasTool(
-      createReadTool(projectRoot),
+      createReadTool(fileToolRoot, fileToolPathOptions),
       "read_file",
       "read_file",
-      "Read a file by relative path. Example: read_file path='Assets/Scripts/DemoScript.cs'."
+      "Read a file by relative path. Default root is Application.persistentDataPath. In Editor, project paths such as Assets/... are also allowed."
     ),
     aliasTool(
-      createWriteTool(projectRoot),
+      createWriteTool(fileToolRoot, fileToolPathOptions),
       "write_file",
       "write_file",
-      "Write a full file by relative path. Example: write_file path='Assets/Scripts/DemoScript.cs' content='...'."
+      "Write a file by relative path. Default root is Application.persistentDataPath. In Editor, project paths are also allowed."
     ),
     aliasTool(
-      createEditTool(projectRoot),
+      createEditTool(fileToolRoot, fileToolPathOptions),
       "edit_file",
       "edit_file",
       "Edit an existing file by replacing exact oldText with newText. Read the file first so oldText matches exactly."
     ),
     aliasTool(
-      createLsTool(projectRoot),
+      createLsTool(fileToolRoot, fileToolPathOptions),
       "list_directory",
       "list_directory",
-      "List a directory by relative path. Example: list_directory path='Assets/Scripts'."
+      "List a directory by relative path. Default root is Application.persistentDataPath. In Editor, project paths are also allowed."
     ),
     aliasTool(
-      createNativeGrepTool(projectRoot),
+      createNativeGrepTool(fileToolRoot, fileToolPathOptions),
       "search_file_content",
       "search_file_content",
       "Search inside files for text or regex. Best practice: pattern='MonoBehaviour', glob='*.cs', literal=true."
     ),
     aliasTool(
-      createNativeFindTool(projectRoot),
+      createNativeFindTool(fileToolRoot, fileToolPathOptions),
       "search_files",
       "search_files",
       "Search for files by filename fragment or glob pattern. Best practice: use a simple filename like 'DemoScript' or 'DemoScript.cs'. Do not pass a shell command."
@@ -14850,15 +14892,77 @@ ${extensionSection.join("\n\n---\n\n")}
     bridge.sendToUnity("turn_end", { role: "assistant", stopReason: "stop" });
     bridge.sendToUnity("agent_end", {});
   }
+  function hasRealUsage(usage) {
+    if (!usage || typeof usage !== "object") return false;
+    return Number(usage.input || 0) > 0 || Number(usage.output || 0) > 0 || Number(usage.cacheRead || 0) > 0 || Number(usage.cacheWrite || 0) > 0 || Number(usage.totalTokens || 0) > 0;
+  }
+  function estimateTokensFromText(text) {
+    const normalized = (text || "").trim();
+    if (!normalized) return 0;
+    return Math.max(1, Math.ceil(normalized.length / 4));
+  }
+  function collectMessageText(message) {
+    if (!message) return "";
+    const content = message.content;
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content.map((block) => {
+      if (!block || typeof block !== "object") return "";
+      if (block.type === "text") return typeof block.text === "string" ? block.text : "";
+      if (block.type === "thinking") return typeof block.thinking === "string" ? block.thinking : "";
+      if (block.type === "toolCall") {
+        const name = typeof block.name === "string" ? block.name : "";
+        const args = block.arguments !== void 0 ? JSON.stringify(block.arguments) : "";
+        return `${name}${args}`;
+      }
+      return "";
+    }).join("");
+  }
+  function buildUsagePayload(messages, message, fallbackIndex) {
+    if (hasRealUsage(message?.usage)) {
+      return {
+        input: Number(message.usage.input || 0),
+        output: Number(message.usage.output || 0),
+        cacheRead: Number(message.usage.cacheRead || 0),
+        cacheWrite: Number(message.usage.cacheWrite || 0),
+        totalTokens: Number(message.usage.totalTokens || 0),
+        estimated: false
+      };
+    }
+    if ((message?.role || "") !== "assistant") {
+      return null;
+    }
+    const resolvedIndex = typeof fallbackIndex === "number" ? fallbackIndex : Math.max(0, messages.lastIndexOf(message));
+    let inputTokens = 0;
+    for (let i = resolvedIndex - 1; i >= 0; i--) {
+      const candidate = messages[i];
+      if ((candidate?.role || "") !== "user") continue;
+      inputTokens = estimateTokensFromText(collectMessageText(candidate));
+      if (inputTokens > 0) break;
+    }
+    const outputTokens = estimateTokensFromText(collectMessageText(message));
+    const totalTokens = inputTokens + outputTokens;
+    if (totalTokens <= 0) return null;
+    return {
+      input: inputTokens,
+      output: outputTokens,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens,
+      estimated: true
+    };
+  }
   function emitSessionSync() {
-    const messages = (agent.state.messages || []).map((message) => ({
+    const stateMessages = agent.state.messages || [];
+    const messages = stateMessages.map((message, index) => ({
       role: String(message?.role || "assistant"),
       content: Array.isArray(message?.content) ? message.content.filter((block) => block && typeof block === "object").map((block) => ({
         type: String(block?.type || "text"),
         text: typeof block?.text === "string" ? block.text : ""
       })) : [],
       errorMessage: typeof message?.errorMessage === "string" ? message.errorMessage : "",
-      stopReason: typeof message?.stopReason === "string" ? message.stopReason : ""
+      stopReason: typeof message?.stopReason === "string" ? message.stopReason : "",
+      usage: buildUsagePayload(stateMessages, message, index)
     }));
     bridge.sendToUnity("session_sync", {
       id: _currentSession.id,
@@ -15151,6 +15255,13 @@ ${initialMemory}`);
           break;
         }
         case "message_end":
+          if (event.message?.role === "assistant") {
+            const usage = buildUsagePayload(agent.state.messages || [], event.message);
+            bridge.sendToUnity("message_metrics", {
+              role: "assistant",
+              usage
+            });
+          }
           bridge.sendToUnity("state_event", { name: "message_end", detail: `role=${event.message?.role ?? "assistant"}` });
           break;
         case "tool_execution_start":
