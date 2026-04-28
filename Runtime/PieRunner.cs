@@ -102,14 +102,14 @@ namespace Pie
 
             return true;
         }
-
+#if UNITY_EDITOR
         private void Update()
         {
             PieDevRpcDispatcher.Tick();
             PieUnityCapabilitiesBootstrap.HeartbeatRuntime();
             _bridge?.Tick();
         }
-
+#endif
         private void OnDestroy()
         {
             if (ActiveRunner == this)
