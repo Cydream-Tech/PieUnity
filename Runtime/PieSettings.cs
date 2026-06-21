@@ -1690,7 +1690,7 @@ namespace Pie
     // Merged from Runtime/UnityCapabilities/PieUnityCapabilitiesConstants.cs
     public static class PieUnityCapabilitiesConstants
         {
-            public const string Version = "0.1.23";
+            public const string Version = "0.1.24";
             public const string ManifestSchemaVersion = "2";
             public const string SkillProtocolVersion = "pie-unity-rpc/2";
             public const int DefaultPort = 8091;

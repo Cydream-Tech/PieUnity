@@ -3165,6 +3165,27 @@ var _PieAgent = (() => {
     }
   };
 
+  // ../../packages/platform/src/text-hash.ts
+  function createTextHasher() {
+    let hash = 2166136261;
+    return {
+      update(text) {
+        for (let index = 0; index < text.length; index++) {
+          hash ^= text.charCodeAt(index);
+          hash = Math.imul(hash, 16777619) >>> 0;
+        }
+      },
+      digest() {
+        return hash.toString(16).padStart(8, "0");
+      }
+    };
+  }
+  function hashText(text) {
+    const hasher = createTextHasher();
+    hasher.update(text);
+    return hasher.digest();
+  }
+
   // ../../packages/platform/src/detector.ts
   function isPuerTS() {
     try {
@@ -3320,6 +3341,17 @@ var _PieAgent = (() => {
       mtime: stats.mtime
     };
   }
+  function byteLength(text) {
+    return Buffer.byteLength(text, "utf-8");
+  }
+  function normalizeRangeOptions(options) {
+    return {
+      offsetLine: Math.max(0, Math.floor(options?.offsetLine ?? 0)),
+      limitLines: options?.limitLines === void 0 ? Number.POSITIVE_INFINITY : Math.max(0, Math.floor(options.limitLines)),
+      maxOutputLines: Math.max(0, Math.floor(options?.maxOutputLines ?? Number.POSITIVE_INFINITY)),
+      maxOutputBytes: Math.max(0, Math.floor(options?.maxOutputBytes ?? Number.POSITIVE_INFINITY))
+    };
+  }
   var NodeFileSystem = class {
     platform = "node";
     sep;
@@ -3333,6 +3365,142 @@ var _PieAgent = (() => {
     }
     readFileSync(path, encoding = "utf-8") {
       return getNodeFs().readFileSync(path, encoding);
+    }
+    async readTextRange(path, options, signal) {
+      const fs = getNodeFs();
+      const range = normalizeRangeOptions(options);
+      const stat = await fs.promises.stat(path);
+      const fullHasher = createTextHasher();
+      const selectedHasher = createTextHasher();
+      const outputLines = [];
+      let lineStarted = false;
+      let currentLineSelected = false;
+      let currentLineBytes = 0;
+      let currentOutputLine = "";
+      let currentOutputLineBytes = 0;
+      let currentOutputPrefixBytes = 0;
+      let currentLineCanOutput = false;
+      let lineIndex = 0;
+      let selectedLines = 0;
+      let selectedBytes = 0;
+      let firstLineBytes = 0;
+      let outputBytes = 0;
+      let truncated = false;
+      let truncatedBy = null;
+      let firstLineExceedsLimit = false;
+      const selectedEndLine = Number.isFinite(range.limitLines) ? range.offsetLine + range.limitLines : Number.POSITIVE_INFINITY;
+      const startLine = () => {
+        if (lineStarted) return;
+        currentLineSelected = lineIndex >= range.offsetLine && lineIndex < selectedEndLine;
+        currentLineBytes = 0;
+        currentOutputLine = "";
+        currentOutputLineBytes = 0;
+        currentOutputPrefixBytes = outputLines.length > 0 ? 1 : 0;
+        currentLineCanOutput = false;
+        lineStarted = true;
+        if (!currentLineSelected) return;
+        if (selectedLines > 0) {
+          selectedHasher.update("\n");
+          selectedBytes += 1;
+        }
+        if (!truncated && !firstLineExceedsLimit) {
+          if (outputLines.length >= range.maxOutputLines) {
+            truncated = true;
+            truncatedBy = "lines";
+          } else {
+            currentLineCanOutput = true;
+          }
+        }
+      };
+      const scanLineChar = (char) => {
+        startLine();
+        if (!currentLineSelected) return;
+        selectedHasher.update(char);
+        const charBytes = byteLength(char);
+        currentLineBytes += charBytes;
+        selectedBytes += charBytes;
+        if (selectedLines === 0 && currentLineBytes > range.maxOutputBytes) {
+          firstLineExceedsLimit = true;
+          truncated = true;
+          truncatedBy = "bytes";
+          currentLineCanOutput = false;
+          currentOutputLine = "";
+          currentOutputLineBytes = 0;
+          return;
+        }
+        if (!currentLineCanOutput) return;
+        const candidateOutputBytes = outputBytes + currentOutputPrefixBytes + currentOutputLineBytes + charBytes;
+        if (candidateOutputBytes > range.maxOutputBytes) {
+          truncated = true;
+          truncatedBy = "bytes";
+          currentLineCanOutput = false;
+          currentOutputLine = "";
+          currentOutputLineBytes = 0;
+          return;
+        }
+        currentOutputLine += char;
+        currentOutputLineBytes += charBytes;
+      };
+      const finishLine = () => {
+        startLine();
+        if (currentLineSelected) {
+          if (selectedLines === 0) {
+            firstLineBytes = currentLineBytes;
+          }
+          if (currentLineCanOutput) {
+            const candidateOutputBytes = outputBytes + currentOutputPrefixBytes + currentOutputLineBytes;
+            if (candidateOutputBytes > range.maxOutputBytes) {
+              truncated = true;
+              truncatedBy = "bytes";
+              currentLineCanOutput = false;
+            } else {
+              outputLines.push(currentOutputLine);
+              outputBytes = candidateOutputBytes;
+            }
+          }
+          selectedLines++;
+        }
+        lineStarted = false;
+        lineIndex++;
+      };
+      const stream = fs.createReadStream(path, { encoding: "utf-8" });
+      try {
+        for await (const chunk of stream) {
+          if (signal?.aborted) {
+            stream.destroy();
+            throw new Error("Operation aborted");
+          }
+          const text = String(chunk);
+          fullHasher.update(text);
+          for (const char of text) {
+            if (char === "\n") {
+              finishLine();
+            } else {
+              scanLineChar(char);
+            }
+          }
+        }
+        finishLine();
+      } finally {
+        stream.destroy();
+      }
+      return {
+        content: outputLines.join("\n"),
+        contentHash: fullHasher.digest(),
+        selectedContentHash: selectedHasher.digest(),
+        totalLines: lineIndex,
+        totalBytes: stat.size,
+        selectedLines,
+        selectedBytes,
+        firstLineBytes,
+        outputLines: outputLines.length,
+        outputBytes,
+        truncated,
+        truncatedBy,
+        firstLineExceedsLimit,
+        mtimeMs: stat.mtime.getTime(),
+        size: stat.size
+      };
     }
     async writeFile(path, data, encoding = "utf-8") {
       return getNodeFs().promises.writeFile(path, data, encoding);
@@ -3460,6 +3628,87 @@ var _PieAgent = (() => {
       mtime: new Date((Number(result?.LastWriteTicksUtc || 0) - 621355968e9) / 1e4)
     };
   }
+  function normalizeOptionalNumber(value, fallback) {
+    if (value === void 0 || !Number.isFinite(value)) {
+      return fallback;
+    }
+    return Math.max(0, Math.floor(value));
+  }
+  function convertTextRangeResult(result) {
+    return {
+      content: String(result?.Content ?? ""),
+      contentHash: String(result?.ContentHash ?? ""),
+      selectedContentHash: String(result?.SelectedContentHash ?? ""),
+      totalLines: Number(result?.TotalLines ?? 0),
+      totalBytes: Number(result?.TotalBytes ?? 0),
+      selectedLines: Number(result?.SelectedLines ?? 0),
+      selectedBytes: Number(result?.SelectedBytes ?? 0),
+      firstLineBytes: Number(result?.FirstLineBytes ?? 0),
+      outputLines: Number(result?.OutputLines ?? 0),
+      outputBytes: Number(result?.OutputBytes ?? 0),
+      truncated: !!result?.Truncated,
+      truncatedBy: result?.TruncatedBy ? String(result.TruncatedBy) : null,
+      firstLineExceedsLimit: !!result?.FirstLineExceedsLimit,
+      mtimeMs: (Number(result?.LastWriteTicksUtc || 0) - 621355968e9) / 1e4,
+      size: Number(result?.Size ?? 0)
+    };
+  }
+  function byteLength2(text) {
+    if (typeof Buffer !== "undefined") {
+      return Buffer.byteLength(text, "utf-8");
+    }
+    return unescape(encodeURIComponent(text)).length;
+  }
+  function buildTextRangeFallback(content, stat, offsetLine, limitLines, maxOutputLines, maxOutputBytes) {
+    const lines = content.split("\n");
+    const endLine = Number.isFinite(limitLines) ? Math.min(lines.length, offsetLine + limitLines) : lines.length;
+    const selectedLinesArray = offsetLine >= lines.length ? [] : lines.slice(offsetLine, endLine);
+    const selectedContent = selectedLinesArray.join("\n");
+    const outputLines = [];
+    let outputBytes = 0;
+    let truncated = false;
+    let truncatedBy = null;
+    let firstLineExceedsLimit = false;
+    for (const line of selectedLinesArray) {
+      const lineBytes = byteLength2(line);
+      if (outputLines.length === 0 && lineBytes > maxOutputBytes) {
+        firstLineExceedsLimit = true;
+        truncated = true;
+        truncatedBy = "bytes";
+        break;
+      }
+      if (outputLines.length >= maxOutputLines) {
+        truncated = true;
+        truncatedBy = "lines";
+        break;
+      }
+      const candidateBytes = lineBytes + (outputLines.length > 0 ? 1 : 0);
+      if (outputBytes + candidateBytes > maxOutputBytes) {
+        truncated = true;
+        truncatedBy = "bytes";
+        break;
+      }
+      outputLines.push(line);
+      outputBytes += candidateBytes;
+    }
+    return {
+      content: outputLines.join("\n"),
+      contentHash: hashText(content),
+      selectedContentHash: hashText(selectedContent),
+      totalLines: lines.length,
+      totalBytes: stat.size,
+      selectedLines: selectedLinesArray.length,
+      selectedBytes: byteLength2(selectedContent),
+      firstLineBytes: selectedLinesArray.length > 0 ? byteLength2(selectedLinesArray[0]) : 0,
+      outputLines: outputLines.length,
+      outputBytes,
+      truncated,
+      truncatedBy,
+      firstLineExceedsLimit,
+      mtimeMs: stat.mtime.getTime(),
+      size: stat.size
+    };
+  }
   function convertDateTime(dateTime) {
     if (!dateTime) return /* @__PURE__ */ new Date(0);
     const ticks = dateTime.get_Ticks?.() || 0;
@@ -3524,6 +3773,33 @@ var _PieAgent = (() => {
         return String(CS.System.Convert.ToBase64String(IO.File.ReadAllBytes(normalizedPath)) ?? "");
       }
       return IO.File.ReadAllText(normalizedPath);
+    }
+    async readTextRange(path, options, signal) {
+      if (signal?.aborted) {
+        throw new Error("Operation aborted");
+      }
+      const bridge2 = getPieFileBridge();
+      const normalizedPath = this.normalizePath(path);
+      if (typeof bridge2.ReadTextRangeAsync !== "function") {
+        const content = await this.readFile(path, "utf-8");
+        const stat = await this.stat(path);
+        const offsetLine = normalizeOptionalNumber(options?.offsetLine, 0);
+        const limitLines = options?.limitLines === void 0 ? Number.POSITIVE_INFINITY : normalizeOptionalNumber(options.limitLines, 0);
+        const maxOutputLines = normalizeOptionalNumber(options?.maxOutputLines, Number.POSITIVE_INFINITY);
+        const maxOutputBytes = normalizeOptionalNumber(options?.maxOutputBytes, Number.POSITIVE_INFINITY);
+        return buildTextRangeFallback(content, stat, offsetLine, limitLines, maxOutputLines, maxOutputBytes);
+      }
+      const payload = await taskToPromise(bridge2.ReadTextRangeAsync(
+        normalizedPath,
+        normalizeOptionalNumber(options?.offsetLine, 0),
+        options?.limitLines === void 0 ? -1 : normalizeOptionalNumber(options.limitLines, 0),
+        normalizeOptionalNumber(options?.maxOutputLines, -1),
+        normalizeOptionalNumber(options?.maxOutputBytes, -1)
+      ));
+      if (signal?.aborted) {
+        throw new Error("Operation aborted");
+      }
+      return convertTextRangeResult(JSON.parse(String(payload ?? "{}")));
     }
     async writeFile(path, data, encoding = "utf-8") {
       const bridge2 = getPieFileBridge();
@@ -4444,6 +4720,31 @@ var _PieAgent = (() => {
       return fs.readFileSync(path, encoding);
     }
     /**
+     * Read at most the first maxBytes of a file.
+     */
+    readFileHead(path, maxBytes, encoding = "utf-8") {
+      this.validatePath(path, "read");
+      const byteLimit = Math.max(0, Math.floor(maxBytes));
+      if (byteLimit === 0) return "";
+      const platform = detectPlatform();
+      if (platform === "puerts" && typeof CS !== "undefined") {
+        if (!CS.System.IO.File.Exists(path)) {
+          throw new Error(`File not found: ${path}`);
+        }
+        return CS.System.IO.File.ReadAllText(path).slice(0, byteLimit);
+      }
+      const fs = nodeRequire("fs");
+      const fileSize = fs.existsSync(path) ? fs.statSync(path).size : 0;
+      const buffer = Buffer.alloc(Math.min(byteLimit, fileSize));
+      const fd = fs.openSync(path, "r");
+      try {
+        const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+        return buffer.subarray(0, bytesRead).toString(encoding);
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+    /**
      * Write file content
      */
     writeFile(path, content, encoding = "utf-8") {
@@ -4610,6 +4911,21 @@ var _PieAgent = (() => {
       const fs = nodeRequire("fs");
       if (!fs.existsSync(path)) return 0;
       return fs.statSync(path).size;
+    }
+    /**
+     * Get file modified time in milliseconds since epoch.
+     */
+    getModifiedTime(path) {
+      this.validatePath(path, "getModifiedTime");
+      const platform = detectPlatform();
+      if (platform === "puerts" && typeof CS !== "undefined") {
+        if (!CS.System.IO.File.Exists(path)) return 0;
+        const ticks = Number(CS.System.IO.File.GetLastWriteTimeUtc(path).Ticks);
+        return Number.isFinite(ticks) ? ticks / 1e4 - 621355968e5 : 0;
+      }
+      const fs = nodeRequire("fs");
+      if (!fs.existsSync(path)) return 0;
+      return fs.statSync(path).mtimeMs;
     }
     /**
      * Get config
@@ -14113,12 +14429,171 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       toolErrors: 0
     };
   }
+  function summarizeString(value, maxLength = 300) {
+    return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
+  }
+  function summarizeMessage(message) {
+    if (!isRecord(message)) return typeof message;
+    if ("contentBlocks" in message && !("content" in message)) return message;
+    const content = Array.isArray(message.content) ? message.content : [];
+    const blockTypes = content.filter(isRecord).map((block) => String(block.type || "unknown")).slice(0, 10);
+    const text = getTextFromMessageContent(content);
+    return {
+      role: message.role,
+      stopReason: message.stopReason,
+      errorMessage: typeof message.errorMessage === "string" ? summarizeString(message.errorMessage) : void 0,
+      contentBlocks: content.length,
+      blockTypes,
+      textLength: text.length
+    };
+  }
+  function summarizeToolResults(value) {
+    if (isRecord(value) && typeof value.count === "number" && !Array.isArray(value)) return value;
+    if (!Array.isArray(value)) return typeof value;
+    let errors = 0;
+    const toolNames = [];
+    for (const result of value) {
+      if (!isRecord(result)) continue;
+      if (result.isError === true) errors++;
+      const toolName = typeof result.toolName === "string" ? result.toolName : typeof result.name === "string" ? result.name : void 0;
+      if (toolName && toolNames.length < 10) toolNames.push(toolName);
+    }
+    return { count: value.length, errors, toolNames };
+  }
+  function collectTextLength(content) {
+    if (typeof content === "string") return content.length;
+    if (!Array.isArray(content)) return 0;
+    let length = 0;
+    for (const block of content) {
+      if (!isRecord(block)) continue;
+      if (typeof block.text === "string") length += block.text.length;
+    }
+    return length;
+  }
+  function collectArgumentLength(content) {
+    if (!Array.isArray(content)) return 0;
+    let length = 0;
+    for (const block of content) {
+      if (!isRecord(block) || !("arguments" in block)) continue;
+      if (typeof block.arguments === "string") {
+        length += block.arguments.length;
+        continue;
+      }
+      try {
+        length += JSON.stringify(block.arguments).length;
+      } catch {
+        length += String(block.arguments).length;
+      }
+    }
+    return length;
+  }
+  function summarizeMessages(value) {
+    if (!Array.isArray(value)) return typeof value;
+    const roles = [];
+    const toolNames = [];
+    const stopReasons = [];
+    let errorCount = 0;
+    let contentBlocks = 0;
+    let textLength = 0;
+    let argumentLength = 0;
+    for (const message of value) {
+      if (!isRecord(message)) continue;
+      const role = typeof message.role === "string" ? message.role : void 0;
+      if (role && roles.length < 20) roles.push(role);
+      if (typeof message.stopReason === "string" && stopReasons.length < 20) stopReasons.push(message.stopReason);
+      if (typeof message.errorMessage === "string" && message.errorMessage) errorCount++;
+      if (typeof message.toolName === "string" && toolNames.length < 20) toolNames.push(message.toolName);
+      const content = Array.isArray(message.content) ? message.content : [];
+      contentBlocks += content.length;
+      textLength += collectTextLength(message.content);
+      argumentLength += collectArgumentLength(message.content);
+      for (const block of content) {
+        if (isRecord(block) && typeof block.name === "string" && toolNames.length < 20) {
+          toolNames.push(block.name);
+        }
+      }
+    }
+    return {
+      count: value.length,
+      roles,
+      toolNames: [...new Set(toolNames)].slice(0, 20),
+      stopReasons: [...new Set(stopReasons)].slice(0, 20),
+      errorCount,
+      contentBlocks,
+      textLength,
+      argumentLength
+    };
+  }
+  function summarizeFailure(value) {
+    if (!isRecord(value)) return typeof value;
+    return {
+      kind: value.kind,
+      retryable: value.retryable,
+      compactable: value.compactable,
+      userAbort: value.userAbort,
+      terminal: value.terminal,
+      message: typeof value.message === "string" ? summarizeString(value.message) : void 0
+    };
+  }
+  function summarizeRuntimeEvent(value) {
+    if (!isRecord(value)) return typeof value;
+    const summary = {
+      type: value.type
+    };
+    if ("toolCallId" in value) summary.toolCallId = value.toolCallId;
+    if ("toolName" in value) summary.toolName = value.toolName;
+    if ("turnIndex" in value) summary.turnIndex = value.turnIndex;
+    if ("isError" in value) summary.isError = value.isError;
+    if ("errorMessage" in value && typeof value.errorMessage === "string") {
+      summary.errorMessage = summarizeString(value.errorMessage);
+    }
+    if ("message" in value) summary.message = summarizeMessage(value.message);
+    if ("toolResults" in value) summary.toolResults = summarizeToolResults(value.toolResults);
+    return summary;
+  }
+  function shouldRecordRuntimeEvent(type) {
+    const normalizedType = type.startsWith("runtime:") ? type.slice("runtime:".length) : type;
+    return normalizedType !== "agent_event" && normalizedType !== "semantic_event";
+  }
+  function recomputeRuntimeSummaryFromTimeline(events) {
+    const summary = createEmptyRuntimeSummary();
+    for (const event of events ?? []) {
+      if (/queue|queued_turn/.test(event.type)) summary.queuedTurnEvents++;
+      if (/retry/.test(event.type)) summary.retryEvents++;
+      if (/auto_compaction|auto_compact|compaction/.test(event.type)) summary.autoCompactionEvents++;
+      if (/runtime_guard|repeated_tool_error/.test(event.type)) summary.runtimeGuardEvents++;
+      if (/subagent/.test(event.type)) summary.subagentEvents++;
+      if (event.type === "tool_end" || event.type === "tool_error") summary.toolResults++;
+      if (event.type === "tool_error") summary.toolErrors++;
+    }
+    return summary;
+  }
   function summarizeMeta(meta) {
     if (!isRecord(meta)) return meta;
     const summary = {};
     for (const [key, value] of Object.entries(meta)) {
       if (key === "messages" || key === "queuedInputs" || key === "result") {
         summary[key] = Array.isArray(value) ? { count: value.length } : typeof value;
+        continue;
+      }
+      if (key === "addedMessages") {
+        summary[key] = summarizeMessages(value);
+        continue;
+      }
+      if (key === "message") {
+        summary[key] = summarizeMessage(value);
+        continue;
+      }
+      if (key === "toolResults") {
+        summary[key] = summarizeToolResults(value);
+        continue;
+      }
+      if (key === "failure") {
+        summary[key] = summarizeFailure(value);
+        continue;
+      }
+      if (key === "event") {
+        summary[key] = summarizeRuntimeEvent(value);
         continue;
       }
       if (key === "queuedInput" && isRecord(value)) {
@@ -14130,7 +14605,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
         };
         continue;
       }
-      summary[key] = typeof value === "string" && value.length > 300 ? `${value.slice(0, 300)}...` : value;
+      summary[key] = typeof value === "string" ? summarizeString(value) : value;
     }
     return summary;
   }
@@ -14244,9 +14719,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
         failure: typeof data.failureCategory === "string" && data.failureCategory.length > 0
       };
     }
-    if (normalizedType === "subagent_summary") {
-      return { type: "subagent_child_end", summary: `subagent summary count=${String(data.count ?? "?")}`, details: detail };
-    }
+    if (normalizedType === "subagent_summary") return null;
     return null;
   }
   function cloneTurn(turn) {
@@ -14287,6 +14760,9 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       if (!Array.isArray(this.trace.recentTimeline)) {
         this.trace.recentTimeline = [];
       }
+      this.trace.recentEvents = this.trace.recentEvents.slice(-this.recentEventsLimit);
+      this.trace.recentTimeline = this.trace.recentTimeline.slice(-this.recentEventsLimit);
+      this.trace.runtimeSummary = recomputeRuntimeSummaryFromTimeline(this.trace.recentTimeline);
     }
     trace;
     recentTurnsLimit;
@@ -14301,7 +14777,6 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       if (this.trace.recentEvents.length > this.recentEventsLimit) {
         this.trace.recentEvents = this.trace.recentEvents.slice(-this.recentEventsLimit);
       }
-      this.updateRuntimeSummary(type, meta);
       const timelineEvent = timelineEventFromTraceEvent(type, meta);
       if (timelineEvent) {
         this.pushTimeline(timelineEvent);
@@ -14316,17 +14791,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       if (this.trace.recentTimeline.length > this.recentEventsLimit) {
         this.trace.recentTimeline = this.trace.recentTimeline.slice(-this.recentEventsLimit);
       }
-    }
-    updateRuntimeSummary(type, meta) {
-      const summary = this.trace.runtimeSummary ?? createEmptyRuntimeSummary();
-      if (/queue|queued_turn/.test(type)) summary.queuedTurnEvents++;
-      if (/retry/.test(type)) summary.retryEvents++;
-      if (/auto_compaction|auto_compact|compaction/.test(type)) summary.autoCompactionEvents++;
-      if (/runtime_guard|repeated_tool_error/.test(type)) summary.runtimeGuardEvents++;
-      if (/subagent/.test(type)) summary.subagentEvents++;
-      if (type === "tool_end") summary.toolResults++;
-      if (type === "tool_end" && isRecord(meta) && meta.isError) summary.toolErrors++;
-      this.trace.runtimeSummary = summary;
+      this.trace.runtimeSummary = recomputeRuntimeSummaryFromTimeline(this.trace.recentTimeline);
     }
     nextTurnIndex() {
       if (this.trace.activeTurn) {
@@ -14398,6 +14863,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       this.touch();
     }
     noteRuntimeEvent(type, meta) {
+      if (!shouldRecordRuntimeEvent(type)) return;
       this.pushEvent(`runtime:${type}`, summarizeMeta(meta));
       this.touch();
     }
@@ -14422,7 +14888,6 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       if (!message || message.role !== "assistant" || !this.trace.activeTurn) return;
       this.trace.activeTurn.state = this.trace.activeTurn.toolCalls.some((tool) => tool.status === "running") ? "tool_running" : "streaming";
       this.trace.activeTurn.assistantText = getTextFromMessageContent(message.content);
-      this.pushEvent("assistant_update");
       this.touch();
     }
     startTool(toolCallId, toolName, args) {
@@ -15884,6 +16349,7 @@ Use this for independent investigation, search, review, or triage work. Provide 
     return `${summaryPrefix}
 ${compactSummary}`;
   }
+  var utf8Encoder = typeof globalThis.TextEncoder === "function" ? new globalThis.TextEncoder() : void 0;
 
   // ../../packages/agent-framework/src/session/types.ts
   function generateEntryId() {
@@ -16081,6 +16547,15 @@ ${compactSummary}`;
     return 1;
   }
   function chooseBestCandidate(candidates) {
+    const main = candidates.find((candidate) => candidate.role === "main");
+    if (main) {
+      const backup = candidates.find((candidate) => candidate.role === "backup");
+      const previous = candidates.find((candidate) => candidate.role === "previous");
+      if (backup && previous && backup.content !== main.content && previous.content === main.content && backup.updatedAt >= main.updatedAt) {
+        return backup;
+      }
+      return main;
+    }
     return [...candidates].sort((a, b) => {
       const updatedAtDiff = b.updatedAt - a.updatedAt;
       if (updatedAtDiff !== 0) return updatedAtDiff;
@@ -16169,6 +16644,8 @@ ${compactSummary}`;
 
   // ../../packages/agent-framework/src/session/store.ts
   var SESSION_VERSION = 2;
+  var METADATA_INDEX_VERSION = 3;
+  var METADATA_FAST_READ_BYTES = 64 * 1024;
   function isSessionEntry(value) {
     return !!value && typeof value === "object" && "id" in value && "type" in value;
   }
@@ -16190,6 +16667,60 @@ ${compactSummary}`;
       parentId = entry.id;
     }
     return entries;
+  }
+  function extractJsonObjectProperty(content, propertyName) {
+    const propertyIndex = content.indexOf(`"${propertyName}"`);
+    if (propertyIndex < 0) return null;
+    const colonIndex = content.indexOf(":", propertyIndex + propertyName.length + 2);
+    if (colonIndex < 0) return null;
+    let index = colonIndex + 1;
+    while (index < content.length && /\s/.test(content[index])) index += 1;
+    if (content[index] !== "{") return null;
+    let depth = 0;
+    let inString = false;
+    let escaping = false;
+    for (let cursor = index; cursor < content.length; cursor += 1) {
+      const char = content[cursor];
+      if (inString) {
+        if (escaping) {
+          escaping = false;
+        } else if (char === "\\") {
+          escaping = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === "{") {
+        depth += 1;
+      } else if (char === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          return content.slice(index, cursor + 1);
+        }
+      }
+    }
+    return null;
+  }
+  function parseMetadataOnly(content) {
+    const metadataText = extractJsonObjectProperty(content, "metadata");
+    if (!metadataText) return null;
+    const parsed = JSON.parse(metadataText);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const metadata = parsed;
+    if (typeof metadata.id !== "string" || typeof metadata.name !== "string" || typeof metadata.createdAt !== "number" || typeof metadata.updatedAt !== "number" || typeof metadata.entryCount !== "number" || typeof metadata.messageCount !== "number") {
+      return null;
+    }
+    return metadata;
+  }
+  function durableRolePriority(role) {
+    if (role === "main") return 3;
+    if (role === "backup") return 2;
+    return 1;
   }
   var LEGACY_VERSION = 1;
   function getDefaultSessionsDir() {
@@ -16256,6 +16787,9 @@ ${compactSummary}`;
       const safeId = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_");
       return this.gateway.join(this.sessionsDir, `${safeId}.json`);
     }
+    getMetadataIndexPath() {
+      return this.gateway.join(this.sessionsDir, ".metadata-index.json");
+    }
     normalizeLoadedData(data) {
       if (data.version === LEGACY_VERSION || !data.version) {
         return { data: migrateV1ToV2(data), shouldPersist: true };
@@ -16290,6 +16824,8 @@ ${compactSummary}`;
       const normalizedEntries = normalizeEntriesInput(entries);
       const now = Date.now();
       const existing = await this.load(sessionId);
+      const requestedUpdatedAt = metadata?.updatedAt ?? now;
+      const updatedAt = Math.max(requestedUpdatedAt, existing?.metadata.updatedAt ?? 0);
       const messageCount = normalizedEntries.filter((e) => e.type === "message" && e.message).length;
       const rootEntry = normalizedEntries.find((e) => e.parentId === null);
       const activeEntryId = metadata?.activeEntryId ?? existing?.metadata.activeEntryId ?? normalizedEntries[normalizedEntries.length - 1]?.id ?? null;
@@ -16299,13 +16835,13 @@ ${compactSummary}`;
           id: sessionId,
           name: metadata?.name ?? existing?.metadata.name ?? `Session ${sessionId.slice(0, 8)}`,
           createdAt: existing?.metadata.createdAt ?? now,
-          updatedAt: now,
           entryCount: normalizedEntries.length,
           messageCount,
           activeEntryId: activeEntryId ?? rootEntry?.id ?? null,
           rootEntryId: rootEntry?.id ?? null,
           tags: metadata?.tags ?? existing?.metadata.tags,
-          ...metadata
+          ...metadata,
+          updatedAt
         },
         entries: normalizedEntries,
         messages: flattenTreeToMessages(normalizedEntries, activeEntryId ?? null)
@@ -16317,6 +16853,7 @@ ${compactSummary}`;
         filePath,
         parse: (content, path) => this.parseSessionContent(content, path)
       }, json);
+      this.upsertMetadataIndexBestEffort(sessionData.metadata);
     }
     /**
      * Legacy save method for backward compatibility
@@ -16372,7 +16909,9 @@ ${compactSummary}`;
     async delete(sessionId) {
       const filePath = this.getSessionPath(sessionId);
       try {
-        return deleteDurableFile(this.gateway, filePath);
+        const deleted = deleteDurableFile(this.gateway, filePath);
+        if (deleted) this.removeMetadataIndexEntryBestEffort(sessionId);
+        return deleted;
       } catch (e) {
         console.error(`[SessionStore] Failed to delete session: ${sessionId}`, e);
         return false;
@@ -16389,13 +16928,16 @@ ${compactSummary}`;
      * List all session IDs
      */
     async list() {
+      return this.listSessionIdsSync();
+    }
+    listSessionIdsSync() {
       if (!this.gateway.exists(this.sessionsDir)) {
         return [];
       }
       const files = this.gateway.readdir(this.sessionsDir);
       const sessionIds = /* @__PURE__ */ new Set();
       for (const file of files) {
-        if (file.endsWith("-files.json") || file.endsWith("-files.json.bak") || file.endsWith("-files.json.prev")) {
+        if (isSessionSidecarFile(file)) {
           continue;
         }
         if (file.endsWith(".json")) {
@@ -16412,24 +16954,235 @@ ${compactSummary}`;
      * List all session metadata
      */
     async listMetadata() {
-      const sessionIds = await this.list();
-      const metadata = [];
-      for (const id of sessionIds) {
-        const meta = await this.getMetadata(id);
-        if (meta) {
-          metadata.push(meta);
-        }
+      return await this.listMetadataIndexed();
+    }
+    async listMetadataPage(input) {
+      const limit = Math.max(0, input.limit);
+      if (limit === 0) return { metadata: [], hasMore: false };
+      const result = [];
+      for (const metadata of await this.listMetadataIndexed()) {
+        if (input.after && compareMetadataListPosition(metadata, input.after) <= 0) continue;
+        if (input.filter && !input.filter(metadata)) continue;
+        result.push(metadata);
+        if (result.length > limit) break;
       }
-      return metadata.sort((a, b) => b.updatedAt - a.updatedAt);
+      return {
+        metadata: result.slice(0, limit),
+        hasMore: result.length > limit
+      };
     }
     /**
      * Get session metadata without loading full entries
      */
     async getMetadata(sessionId) {
+      const fastMetadata = this.getMetadataFast(sessionId);
+      if (fastMetadata) return fastMetadata;
       const data = await this.load(sessionId);
       return data?.metadata ?? null;
     }
+    getMetadataFast(sessionId) {
+      const paths = durableFilePaths(this.getSessionPath(sessionId));
+      const candidates = [];
+      for (const [role, path] of [
+        ["main", paths.main],
+        ["backup", paths.backup],
+        ["previous", paths.previous]
+      ]) {
+        try {
+          if (!this.gateway.exists(path)) continue;
+          const metadata = this.readMetadataOnlyFast(path);
+          if (metadata) candidates.push({ metadata, role });
+        } catch {
+        }
+      }
+      if (candidates.length === 0) return null;
+      return chooseBestMetadataCandidate(candidates).metadata;
+    }
+    readMetadataOnlyFast(path) {
+      const fileSize = this.gateway.getFileSize(path);
+      if (fileSize <= METADATA_FAST_READ_BYTES) {
+        return parseMetadataOnly(this.gateway.readFile(path, "utf-8"));
+      }
+      const head = this.gateway.readFileHead(path, METADATA_FAST_READ_BYTES, "utf-8");
+      const metadata = parseMetadataOnly(head);
+      if (metadata) return metadata;
+      return parseMetadataOnly(this.gateway.readFile(path, "utf-8"));
+    }
+    async listMetadataIndexed() {
+      const sessionIds = await this.list();
+      const sessionIdSet = new Set(sessionIds);
+      const index = this.readMetadataIndexBestEffort();
+      if (index && this.metadataIndexMatchesSessionFiles(index, sessionIdSet)) {
+        return sortMetadata(index.sessions.map((entry) => entry.metadata).filter((metadata2) => sessionIdSet.has(metadata2.id)));
+      }
+      const metadata = [];
+      for (const id of sessionIds) {
+        const meta = await this.getMetadata(id);
+        if (meta) metadata.push(meta);
+      }
+      const sorted = sortMetadata(metadata);
+      this.writeMetadataIndexBestEffort(sorted);
+      return sorted;
+    }
+    readMetadataIndexBestEffort() {
+      try {
+        if (!this.gateway.exists(this.getMetadataIndexPath())) return null;
+        const parsed = JSON.parse(this.gateway.readFile(this.getMetadataIndexPath(), "utf-8"));
+        if (!isRecord2(parsed) || parsed.v !== METADATA_INDEX_VERSION || !Array.isArray(parsed.sessions)) return null;
+        const sessions = parsed.sessions.filter(isMetadataIndexEntry);
+        if (sessions.length !== parsed.sessions.length) return null;
+        return {
+          v: METADATA_INDEX_VERSION,
+          sessions,
+          updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0
+        };
+      } catch {
+        return null;
+      }
+    }
+    writeMetadataIndexBestEffort(sessions) {
+      try {
+        this.gateway.writeFile(this.getMetadataIndexPath(), JSON.stringify({
+          v: METADATA_INDEX_VERSION,
+          updatedAt: Date.now(),
+          sessions: sortMetadata(sessions).map((metadata) => ({
+            metadata,
+            files: this.sessionFileSignature(metadata.id)
+          }))
+        }, null, 2));
+      } catch {
+      }
+    }
+    upsertMetadataIndexBestEffort(metadata) {
+      const current = this.readMetadataIndexBestEffort();
+      if (current && !this.metadataIndexCanAcceptUpsert(current, metadata.id)) {
+        this.removeMetadataIndexFileBestEffort();
+        return;
+      }
+      const next = (current?.sessions.map((entry) => entry.metadata) ?? []).filter((item) => item.id !== metadata.id);
+      next.push(metadata);
+      this.writeMetadataIndexBestEffort(next);
+    }
+    removeMetadataIndexEntryBestEffort(sessionId) {
+      const current = this.readMetadataIndexBestEffort();
+      if (!current) return;
+      if (!this.metadataIndexCanRemoveSession(current, sessionId)) {
+        this.removeMetadataIndexFileBestEffort();
+        return;
+      }
+      this.writeMetadataIndexBestEffort(current.sessions.map((entry) => entry.metadata).filter((item) => item.id !== sessionId));
+    }
+    removeMetadataIndexFileBestEffort() {
+      try {
+        if (this.gateway.exists(this.getMetadataIndexPath())) this.gateway.deleteFile(this.getMetadataIndexPath());
+      } catch {
+      }
+    }
+    metadataIndexCanAcceptUpsert(index, upsertedSessionId) {
+      const sessionIds = new Set(this.listSessionIdsSync());
+      const indexedIds = new Set(index.sessions.map((entry) => entry.metadata.id));
+      if (indexedIds.size !== index.sessions.length) return false;
+      for (const id of sessionIds) {
+        if (id !== upsertedSessionId && !indexedIds.has(id)) return false;
+      }
+      for (const entry of index.sessions) {
+        const id = entry.metadata.id;
+        if (id !== upsertedSessionId && !sessionIds.has(id)) return false;
+        if (id !== upsertedSessionId && !sessionFileSignaturesEqual(entry.files, this.sessionFileSignature(id))) return false;
+      }
+      return true;
+    }
+    metadataIndexCanRemoveSession(index, removedSessionId) {
+      const sessionIds = new Set(this.listSessionIdsSync());
+      return index.sessions.every(
+        (entry) => entry.metadata.id === removedSessionId || sessionIds.has(entry.metadata.id) && sessionFileSignaturesEqual(entry.files, this.sessionFileSignature(entry.metadata.id))
+      );
+    }
+    metadataIndexMatchesSessionFiles(index, sessionIds) {
+      if (index.sessions.length !== sessionIds.size) return false;
+      const indexedIds = new Set(index.sessions.map((entry) => entry.metadata.id));
+      if (indexedIds.size !== index.sessions.length) return false;
+      for (const id of sessionIds) {
+        if (!indexedIds.has(id)) return false;
+      }
+      return index.sessions.every((entry) => sessionFileSignaturesEqual(entry.files, this.sessionFileSignature(entry.metadata.id)));
+    }
+    sessionFileSignature(sessionId) {
+      const paths = durableFilePaths(this.getSessionPath(sessionId));
+      return {
+        ...this.gateway.exists(paths.main) ? { main: this.fileSignature(paths.main) } : {},
+        ...this.gateway.exists(paths.backup) ? { backup: this.fileSignature(paths.backup) } : {},
+        ...this.gateway.exists(paths.previous) ? { previous: this.fileSignature(paths.previous) } : {}
+      };
+    }
+    fileSignature(path) {
+      return {
+        size: this.gateway.getFileSize(path),
+        modifiedAt: this.gateway.getModifiedTime(path)
+      };
+    }
   };
+  function isSessionSidecarFile(file) {
+    return file === ".metadata-index.json" || file.endsWith(".trace.json") || file.endsWith(".trace.json.bak") || file.endsWith(".trace.json.prev") || file.endsWith("-files.json") || file.endsWith("-files.json.bak") || file.endsWith("-files.json.prev");
+  }
+  function sortMetadata(metadata) {
+    return [...metadata].sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
+  }
+  function chooseBestMetadataCandidate(candidates) {
+    const main = candidates.find((candidate) => candidate.role === "main");
+    if (main) {
+      const backup = candidates.find((candidate) => candidate.role === "backup");
+      const previous = candidates.find((candidate) => candidate.role === "previous");
+      if (backup && previous && !metadataObjectsEqual(backup.metadata, main.metadata) && metadataObjectsEqual(previous.metadata, main.metadata) && backup.metadata.updatedAt >= main.metadata.updatedAt) {
+        return backup;
+      }
+      return main;
+    }
+    return [...candidates].sort((left, right) => {
+      const updatedAtDiff = right.metadata.updatedAt - left.metadata.updatedAt;
+      if (updatedAtDiff !== 0) return updatedAtDiff;
+      return durableRolePriority(right.role) - durableRolePriority(left.role);
+    })[0];
+  }
+  function metadataObjectsEqual(left, right) {
+    return stableJson(left) === stableJson(right);
+  }
+  function stableJson(value) {
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => stableJson(item)).join(",")}]`;
+    }
+    if (isRecord2(value)) {
+      return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(value);
+  }
+  function compareMetadataListPosition(metadata, boundary) {
+    const updatedAtDiff = boundary.updatedAt - metadata.updatedAt;
+    if (updatedAtDiff !== 0) return updatedAtDiff;
+    return metadata.id.localeCompare(boundary.id);
+  }
+  function isSessionMetadata(value) {
+    if (!isRecord2(value)) return false;
+    return typeof value.id === "string" && typeof value.name === "string" && typeof value.createdAt === "number" && typeof value.updatedAt === "number" && typeof value.entryCount === "number" && typeof value.messageCount === "number";
+  }
+  function isMetadataIndexEntry(value) {
+    if (!isRecord2(value) || !isSessionMetadata(value.metadata) || !isRecord2(value.files)) return false;
+    return optionalFileSignature(value.files.main) && optionalFileSignature(value.files.backup) && optionalFileSignature(value.files.previous);
+  }
+  function optionalFileSignature(value) {
+    if (value === void 0) return true;
+    return isRecord2(value) && typeof value.size === "number" && Number.isFinite(value.size) && typeof value.modifiedAt === "number" && Number.isFinite(value.modifiedAt);
+  }
+  function sessionFileSignaturesEqual(left, right) {
+    return fileSignaturesEqual(left.main, right.main) && fileSignaturesEqual(left.backup, right.backup) && fileSignaturesEqual(left.previous, right.previous);
+  }
+  function fileSignaturesEqual(left, right) {
+    if (!left || !right) return left === right;
+    return left.size === right.size && left.modifiedAt === right.modifiedAt;
+  }
+  function isRecord2(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  }
 
   // ../../packages/agent-framework/src/session/manager.ts
   function generateSessionId() {
@@ -16518,10 +17271,12 @@ ${compactSummary}`;
     /**
      * Load an existing session
      */
-    async loadSession(sessionId) {
+    async loadSession(sessionId, options) {
       const data = await this.store.load(sessionId);
       if (!data) {
-        console.warn(`[SessionManager] Session not found: ${sessionId}`);
+        if (options?.warnIfMissing !== false) {
+          console.warn(`[SessionManager] Session not found: ${sessionId}`);
+        }
         return false;
       }
       if (!data.entries) {
@@ -16989,13 +17744,21 @@ ${compactSummary}`;
     options;
     autoCompactTimer;
     pendingAutoCompact;
+    runningAutoCompact;
+    runningAbortController;
+    pendingWait;
+    resolvePendingWait;
     get hasPendingAutoCompact() {
-      return this.autoCompactTimer !== void 0;
+      return this.autoCompactTimer !== void 0 || this.pendingAutoCompact !== void 0 || this.runningAutoCompact !== void 0;
+    }
+    waitForAutoCompact() {
+      return this.pendingWait ?? Promise.resolve();
     }
     schedule(decision, delayMs = 0) {
       if (this.options.getRuntimeGuardTriggered()) {
         return;
       }
+      this.ensurePendingWait();
       this.pendingAutoCompact = decision;
       if (this.autoCompactTimer !== void 0) {
         return;
@@ -17006,6 +17769,7 @@ ${compactSummary}`;
         const pending = this.pendingAutoCompact;
         this.pendingAutoCompact = void 0;
         if (!pending || this.options.getDisposed()) {
+          this.resolvePending();
           return;
         }
         if (this.options.isStreaming()) {
@@ -17013,17 +17777,42 @@ ${compactSummary}`;
           this.schedule(pending, 100);
           return;
         }
-        void this.options.runAutoCompact(pending);
+        const abortController = new AbortController();
+        this.runningAbortController = abortController;
+        const running = this.options.runAutoCompact(pending, abortController.signal).catch(() => {
+        }).finally(() => {
+          if (this.runningAutoCompact === running) {
+            this.runningAutoCompact = void 0;
+            this.runningAbortController = void 0;
+            this.resolvePending();
+          }
+        });
+        this.runningAutoCompact = running;
       }, delayMs);
     }
     cancel() {
-      if (this.autoCompactTimer === void 0) {
-        return;
+      if (this.autoCompactTimer !== void 0) {
+        const clearTimer = this.options.retry?.clearTimeout ?? defaultClearTimeout;
+        clearTimer(this.autoCompactTimer);
+        this.autoCompactTimer = void 0;
       }
-      const clearTimer = this.options.retry?.clearTimeout ?? defaultClearTimeout;
-      clearTimer(this.autoCompactTimer);
-      this.autoCompactTimer = void 0;
       this.pendingAutoCompact = void 0;
+      this.runningAbortController?.abort();
+      this.runningAbortController = void 0;
+      this.runningAutoCompact = void 0;
+      this.resolvePending();
+    }
+    ensurePendingWait() {
+      if (this.pendingWait) return;
+      this.pendingWait = new Promise((resolve2) => {
+        this.resolvePendingWait = resolve2;
+      });
+    }
+    resolvePending() {
+      const resolve2 = this.resolvePendingWait;
+      this.pendingWait = void 0;
+      this.resolvePendingWait = void 0;
+      resolve2?.();
     }
   };
 
@@ -17040,15 +17829,24 @@ ${compactSummary}`;
     }
     options;
     autoContinueTimer;
+    pendingAutoContinue;
+    resolvePendingAutoContinue;
+    get hasPendingAutoContinue() {
+      return this.autoContinueTimer !== void 0 || this.pendingAutoContinue !== void 0;
+    }
+    waitForAutoContinue() {
+      return this.pendingAutoContinue ?? Promise.resolve();
+    }
     schedule(messages) {
       if (!this.options.getAutoContinueMessage || this.options.getDisposed() || this.autoContinueTimer !== void 0) {
         return;
       }
+      this.ensurePending();
       const setTimer = this.options.retry?.setTimeout ?? defaultSetTimeout2;
       const snapshot = messages.slice();
       this.autoContinueTimer = setTimer(() => {
         this.autoContinueTimer = void 0;
-        void this.maybeScheduleAutoContinue(snapshot);
+        void this.maybeScheduleAutoContinue(snapshot).finally(() => this.resolvePending());
       }, 0);
     }
     cancel() {
@@ -17058,9 +17856,10 @@ ${compactSummary}`;
       const clearTimer = this.options.retry?.clearTimeout ?? defaultClearTimeout2;
       clearTimer(this.autoContinueTimer);
       this.autoContinueTimer = void 0;
+      this.resolvePending();
     }
     async maybeScheduleAutoContinue(messages) {
-      if (!this.options.getAutoContinueMessage || this.options.getDisposed() || this.options.getRuntimeGuardTriggered() || this.options.hasQueuedMessages() || this.options.isStreaming()) {
+      if (!this.options.getAutoContinueMessage || this.options.getDisposed() || this.options.getRuntimeGuardTriggered() || this.options.isBlockedByRuntimePolicy() || this.options.hasQueuedMessages() || this.options.isStreaming()) {
         if (this.options.hasQueuedMessages()) {
           this.options.emit({ type: "auto_continue_skipped", reason: "queued_messages" });
         }
@@ -17084,21 +17883,36 @@ ${compactSummary}`;
         this.options.emit({ type: "auto_continue_skipped", reason: reason ?? "no_message" });
         return;
       }
-      if (this.options.hasQueuedMessages() || this.options.isStreaming()) {
+      if (this.options.hasQueuedMessages() || this.options.isStreaming() || this.options.isBlockedByRuntimePolicy()) {
         this.options.emit({ type: "auto_continue_skipped", reason: "runtime_busy" });
         return;
       }
       this.options.emit({ type: "auto_continue_scheduled", reason });
       this.options.agent.followUp(message);
       const setTimer = this.options.retry?.setTimeout ?? defaultSetTimeout2;
-      this.autoContinueTimer = setTimer(() => {
-        this.autoContinueTimer = void 0;
-        if (this.options.getDisposed()) {
-          return;
-        }
-        void this.options.continueTurn().catch(() => {
-        });
-      }, 0);
+      await new Promise((resolve2) => {
+        this.autoContinueTimer = setTimer(() => {
+          this.autoContinueTimer = void 0;
+          if (this.options.getDisposed()) {
+            resolve2();
+            return;
+          }
+          void this.options.continueTurn().catch(() => {
+          }).finally(resolve2);
+        }, 0);
+      });
+    }
+    ensurePending() {
+      if (this.pendingAutoContinue) return;
+      this.pendingAutoContinue = new Promise((resolve2) => {
+        this.resolvePendingAutoContinue = resolve2;
+      });
+    }
+    resolvePending() {
+      const resolve2 = this.resolvePendingAutoContinue;
+      this.pendingAutoContinue = void 0;
+      this.resolvePendingAutoContinue = void 0;
+      resolve2?.();
     }
   };
 
@@ -17114,9 +17928,16 @@ ${compactSummary}`;
     if (!params.compaction) {
       throw new Error("No compaction handler configured");
     }
+    const abortedResult = () => ({ aborted: true });
+    const isAborted = () => params.signal?.aborted === true;
     params.emit({ type: "auto_compaction_start", reason: params.reason, willRetry: params.willRetry });
     try {
-      if (params.reason === "overflow") {
+      if (isAborted()) {
+        const result2 = abortedResult();
+        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: result2 });
+        return result2;
+      }
+      if (params.willRetry) {
         params.removeTrailingAssistantError();
       }
       const result = await params.compaction.compact({
@@ -17125,22 +17946,43 @@ ${compactSummary}`;
         agent: params.agent,
         sessionManager: params.sessionManager,
         messages: params.agent.state.messages.slice(),
-        cwd: params.cwd
+        cwd: params.cwd,
+        signal: params.signal
       });
+      if (isAborted() || result?.aborted) {
+        const aborted = { ...result, aborted: true };
+        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted });
+        return aborted;
+      }
       if (result?.summary && result.firstKeptEntryId) {
         params.sessionManager.appendCompaction(result.summary, result.firstKeptEntryId, result.tokensBefore);
         params.replaceMessagesAndMarkSynced(params.sessionManager.getMessages());
       } else if (result?.messages) {
         params.replaceMessagesAndMarkSynced(result.messages, { updateSession: true });
       }
+      if (isAborted()) {
+        const aborted = { ...result, aborted: true };
+        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted });
+        return aborted;
+      }
       params.markSyncedToAgentState();
       await params.sessionManager.save();
+      if (isAborted()) {
+        const aborted = { ...result, aborted: true };
+        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted });
+        return aborted;
+      }
       if (params.willRetry && !result?.aborted) {
         await params.continueTurn();
       }
       params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result });
       return result;
     } catch (error) {
+      if (isAborted()) {
+        const result = abortedResult();
+        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result });
+        return result;
+      }
       const errorMessage = error instanceof Error ? error.message : String(error);
       params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, errorMessage });
       throw error;
@@ -17208,6 +18050,27 @@ ${compactSummary}`;
       messages: result?.messages ?? params.messages,
       systemPrompt: result?.systemPrompt
     };
+  }
+
+  // ../../packages/agent-framework/src/session/controller/pre-request-policy.ts
+  async function runPreRequestAutoCompact(params) {
+    if (params.disposed || params.runtimeGuardTriggered || params.isStreaming || params.recoveryActive || params.agent.state.messages.length === 0) {
+      return;
+    }
+    const decision = params.getAutoCompactDecision?.({
+      agent: params.agent,
+      sessionManager: params.sessionManager,
+      cwd: params.cwd,
+      messages: params.agent.state.messages.slice()
+    });
+    if (decision?.reason !== "threshold") {
+      return;
+    }
+    try {
+      await params.runAutoCompact();
+    } catch {
+      params.setRecoveryState("none");
+    }
   }
 
   // ../../packages/agent-framework/src/session/controller/queue.ts
@@ -17368,14 +18231,23 @@ ${compactSummary}`;
     }
     options;
     dispatchTimer;
+    pendingDispatch;
+    resolvePendingDispatch;
+    get hasPendingDispatch() {
+      return this.dispatchTimer !== void 0 || this.pendingDispatch !== void 0;
+    }
+    waitForDispatch() {
+      return this.pendingDispatch ?? Promise.resolve();
+    }
     schedule(delayMs = 0) {
       if (this.options.getDisposed() || this.options.getRuntimeGuardTriggered() || this.dispatchTimer !== void 0) {
         return;
       }
+      this.ensurePending();
       const setTimer = this.options.retry?.setTimeout ?? defaultSetTimeout3;
       this.dispatchTimer = setTimer(() => {
         this.dispatchTimer = void 0;
-        void this.dispatchNext();
+        void this.dispatchNext().finally(() => this.resolvePending());
       }, delayMs);
     }
     cancel() {
@@ -17385,6 +18257,7 @@ ${compactSummary}`;
       const clearTimer = this.options.retry?.clearTimeout ?? defaultClearTimeout3;
       clearTimer(this.dispatchTimer);
       this.dispatchTimer = void 0;
+      this.resolvePending();
     }
     async dispatchNext() {
       if (this.options.getDisposed() || this.options.isStreaming() || this.options.isBlockedByRuntimePolicy()) {
@@ -17410,6 +18283,11 @@ ${compactSummary}`;
         if (dispatchDecision.retryAfterMs !== void 0 && dispatchDecision.retryAfterMs >= 0) {
           this.schedule(dispatchDecision.retryAfterMs);
         }
+        return false;
+      }
+      await this.options.runPreRequestAutoCompact();
+      if (this.options.getDisposed() || this.options.isStreaming() || this.options.isBlockedByRuntimePolicy()) {
+        this.schedule(100);
         return false;
       }
       const dispatched = this.options.queue.shift();
@@ -17441,7 +18319,55 @@ ${compactSummary}`;
       }
       return true;
     }
+    ensurePending() {
+      if (this.pendingDispatch) return;
+      this.pendingDispatch = new Promise((resolve2) => {
+        this.resolvePendingDispatch = resolve2;
+      });
+    }
+    resolvePending() {
+      const resolve2 = this.resolvePendingDispatch;
+      this.pendingDispatch = void 0;
+      this.resolvePendingDispatch = void 0;
+      resolve2?.();
+    }
   };
+
+  // ../../packages/agent-framework/src/session/controller/failure-classification.ts
+  function isAssistantFailureMessage(message) {
+    return message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted");
+  }
+  function isAssistantTerminalCompletion(message) {
+    if (message?.role !== "assistant") return false;
+    if (message.stopReason === "error" || message.stopReason === "aborted") return false;
+    if (message.stopReason === "toolUse") return false;
+    return !message.content.some((block) => block.type === "toolCall");
+  }
+  function createFailureClassification(context, retry, classifyFailure) {
+    const hostClassification = classifyFailure?.(context);
+    if (hostClassification) {
+      return hostClassification;
+    }
+    const retryable = retry?.isRetryableError(context.errorMessage) === true;
+    const userAbort = context.message?.role === "assistant" && context.message.stopReason === "aborted";
+    return {
+      kind: userAbort ? "user_abort" : retryable ? "provider_transient" : "unknown",
+      retryable: retryable && !userAbort,
+      compactable: false,
+      userAbort,
+      terminal: !retryable || userAbort,
+      message: context.errorMessage
+    };
+  }
+  function asTerminalFailure(failure, message = failure.message) {
+    return {
+      ...failure,
+      retryable: false,
+      compactable: false,
+      terminal: true,
+      message
+    };
+  }
 
   // ../../packages/agent-framework/src/session/controller/retry-policy.ts
   function defaultSetTimeout4(callback, delay) {
@@ -17451,59 +18377,99 @@ ${compactSummary}`;
     clearTimeout(handle);
   }
   var AgentSessionRetryController = class {
-    constructor(retry, emit, removeTrailingAssistantError2, continueTurn) {
+    constructor(retry, emit, removeTrailingAssistantError2, continueTurn, setRecoveryState) {
       this.retry = retry;
       this.emit = emit;
       this.removeTrailingAssistantError = removeTrailingAssistantError2;
       this.continueTurn = continueTurn;
+      this.setRecoveryState = setRecoveryState;
     }
     retry;
     emit;
     removeTrailingAssistantError;
     continueTurn;
+    setRecoveryState;
     retryAttempt = 0;
     retryTimer;
-    get hasPendingRetry() {
-      return this.retryTimer !== void 0;
+    pendingRetry;
+    resolvePendingRetry;
+    get policy() {
+      return this.retry;
     }
-    async handleTurnEnd(message) {
+    get hasPendingRetry() {
+      return this.retryTimer !== void 0 || this.pendingRetry !== void 0;
+    }
+    waitForRetry() {
+      return this.pendingRetry ?? Promise.resolve();
+    }
+    async handleTurnEnd(message, failure) {
       if (!this.retry || !message || message.role !== "assistant") {
         return;
       }
-      const errorMessage = message.stopReason === "error" ? message.errorMessage : void 0;
-      if (!errorMessage) {
+      if (!failure) {
         if (this.retryAttempt > 0) {
           this.emit({ type: "retry_succeeded", attempts: this.retryAttempt });
+          this.emit({ type: "turn_retry_succeeded", attempts: this.retryAttempt });
           this.retryAttempt = 0;
+          this.setRecoveryState("none");
+          this.resolvePending();
         }
         return;
       }
-      if (!this.retry.isRetryableError(errorMessage)) {
+      if (!failure.retryable) {
+        if (this.retryAttempt > 0) {
+          this.retryAttempt = 0;
+          this.setRecoveryState("none");
+          this.resolvePending();
+        }
         return;
       }
       const maxRetries = this.retry.maxRetries ?? 3;
       this.retryAttempt += 1;
       if (this.retryAttempt > maxRetries) {
-        this.emit({ type: "retry_exhausted", errorMessage, maxRetries });
+        const terminalFailure = asTerminalFailure(failure);
+        this.emit({ type: "retry_exhausted", errorMessage: failure.message, maxRetries });
+        this.emit({ type: "turn_failed_terminal", failure: terminalFailure, message });
+        this.emit({ type: "turn_settled" });
         this.retryAttempt = 0;
+        this.setRecoveryState("terminal");
+        this.resolvePending();
         return;
       }
       const attempt = this.retryAttempt;
       const delayMs = (this.retry.baseDelayMs ?? 2e3) * 2 ** (attempt - 1);
-      this.emit({ type: "retry_scheduled", errorMessage, attempt, maxRetries, delayMs });
+      this.ensurePending();
+      this.setRecoveryState("retry_pending");
+      this.emit({ type: "turn_recovery_pending", recovery: "retry", failure, attempt, maxRetries, delayMs });
+      this.emit({ type: "retry_scheduled", errorMessage: failure.message, attempt, maxRetries, delayMs });
       this.cancelTimerOnly();
       const setTimer = this.retry.setTimeout ?? defaultSetTimeout4;
       this.retryTimer = setTimer(() => {
         this.retryTimer = void 0;
+        this.setRecoveryState("retrying");
         this.emit({ type: "retry_start", attempt, maxRetries });
+        this.emit({ type: "turn_retry_started", attempt, maxRetries, failure });
         this.removeTrailingAssistantError();
-        void this.continueTurn().catch(() => {
+        void this.continueTurn().catch((error) => {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          const terminalFailure = asTerminalFailure(failure, errorMessage);
+          this.emit({
+            type: "retry_exhausted",
+            errorMessage,
+            maxRetries
+          });
+          this.emit({ type: "turn_failed_terminal", failure: terminalFailure, message });
+          this.emit({ type: "turn_settled" });
+          this.retryAttempt = 0;
+          this.setRecoveryState("terminal");
+          this.resolvePending();
         });
       }, delayMs);
     }
     cancel() {
       this.cancelTimerOnly();
       this.retryAttempt = 0;
+      this.resolvePending();
     }
     cancelTimerOnly() {
       if (this.retryTimer === void 0) {
@@ -17513,11 +18479,28 @@ ${compactSummary}`;
       clearTimer(this.retryTimer);
       this.retryTimer = void 0;
     }
+    ensurePending() {
+      if (this.pendingRetry) {
+        return;
+      }
+      this.pendingRetry = new Promise((resolve2) => {
+        this.resolvePendingRetry = resolve2;
+      });
+    }
+    resolvePending() {
+      const resolve2 = this.resolvePendingRetry;
+      this.pendingRetry = void 0;
+      this.resolvePendingRetry = void 0;
+      resolve2?.();
+    }
   };
 
   // ../../packages/agent-framework/src/session/controller/runtime-guard.ts
   var RUNAWAY_TOOLCALL_WHITESPACE_DELTA_CHARS = 16384;
   var RUNAWAY_TOOLCALL_WHITESPACE_DELTA_EVENTS = 40;
+  var TOOL_FAILURE_SIGNATURE_CHARS = 1e3;
+  var TOOL_FAILURE_SIGNATURE_CONTEXT_LINES = 5;
+  var FAILURE_DIAGNOSTIC_LINE_PATTERN = /\b(E2E_FAILED|AssertionError|TimeoutError|SyntaxError|ReferenceError|TypeError|Error):|(^|\b)(failed|failure|timed out|timeout|exit code|command failed|npm ERR!)/i;
   function stableStringify(value) {
     if (value === null || typeof value !== "object") {
       return JSON.stringify(value) ?? String(value);
@@ -17535,6 +18518,20 @@ ${compactSummary}`;
     const content = Array.isArray(result.content) ? result.content : [];
     const text = content.filter((block) => !!block && typeof block === "object" && "type" in block).filter((block) => block.type === "text").map((block) => block.text || "").join("\n").trim();
     return text || stableStringify(result);
+  }
+  function summarizeToolFailureSignature(result) {
+    const summary = summarizeToolResultForGuard(result).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+    if (!summary) {
+      return "";
+    }
+    const lines = summary.split("\n");
+    for (let index = lines.length - 1; index >= 0; index--) {
+      if (!FAILURE_DIAGNOSTIC_LINE_PATTERN.test(lines[index] ?? "")) {
+        continue;
+      }
+      return lines.slice(index, Math.min(lines.length, index + TOOL_FAILURE_SIGNATURE_CONTEXT_LINES)).join("\n").slice(0, TOOL_FAILURE_SIGNATURE_CHARS);
+    }
+    return summary.slice(-TOOL_FAILURE_SIGNATURE_CHARS);
   }
   var AgentSessionRuntimeGuard = class {
     constructor(trigger) {
@@ -17600,7 +18597,7 @@ ${compactSummary}`;
         }
         return;
       }
-      const resultSummary = summarizeToolResultForGuard(event.result).slice(0, 500);
+      const resultSummary = summarizeToolFailureSignature(event.result);
       const key = `${event.toolName}:${stableStringify(event.args)}:${resultSummary}`;
       const repeatCount = (this.repeatedToolFailures.get(key) ?? 0) + 1;
       this.repeatedToolFailures.set(key, repeatCount);
@@ -17611,6 +18608,33 @@ ${compactSummary}`;
       this.trigger(event.toolName, repeatCount, "repeated_tool_error");
     }
   };
+
+  // ../../packages/agent-framework/src/session/controller/runtime-phase-policy.ts
+  function classifyControllerRuntimeError(params) {
+    const errorMessage = params.error instanceof Error ? params.error.message : String(params.error);
+    return createFailureClassification({ errorMessage, phase: params.phase }, params.retry, params.classifyFailure);
+  }
+  async function runAgentSessionRuntimePhase(params) {
+    try {
+      return await params.action();
+    } catch (error) {
+      const failure = classifyControllerRuntimeError({
+        error,
+        phase: params.phase,
+        retry: params.retry,
+        classifyFailure: params.classifyFailure
+      });
+      if (failure.userAbort) {
+        params.setRecoveryState("cancelled");
+        params.emit({ type: "turn_cancelled", reason: failure.message });
+      } else {
+        params.setRecoveryState("terminal");
+        params.emit({ type: "turn_failed_terminal", failure: asTerminalFailure(failure) });
+      }
+      params.emit({ type: "turn_settled" });
+      throw error;
+    }
+  }
 
   // ../../packages/agent-framework/src/session/controller/session-sync.ts
   function getConversationMessages(messages) {
@@ -17716,6 +18740,163 @@ ${compactSummary}`;
     }
   }
 
+  // ../../packages/agent-framework/src/session/controller/turn-lifecycle-policy.ts
+  function isAgentSessionRecoveryActive(state) {
+    return state === "retry_pending" || state === "retrying" || state === "compacting";
+  }
+  function createRuntimeGuardFailure(reason) {
+    return {
+      kind: "runtime_guard",
+      retryable: false,
+      compactable: false,
+      userAbort: false,
+      terminal: true,
+      message: reason
+    };
+  }
+  function classifyControllerTurnFailure(params) {
+    if (!isAssistantFailureMessage(params.message)) {
+      return void 0;
+    }
+    const errorMessage = params.message.errorMessage || (params.message.stopReason === "aborted" ? "Request was aborted" : "assistant response failed");
+    return createFailureClassification(
+      { errorMessage, message: params.message, phase: "stream" },
+      params.retry,
+      params.classifyFailure
+    );
+  }
+  async function handleAgentSessionTurnEndRuntimePolicies(params) {
+    if (params.disposed || params.runtimeGuardTriggered) {
+      return;
+    }
+    const failure = classifyControllerTurnFailure({
+      message: params.message,
+      retry: params.retry,
+      classifyFailure: params.classifyFailure
+    });
+    if (failure?.userAbort) {
+      params.cancelRetry();
+      params.setRecoveryState("cancelled");
+      params.emit({ type: "turn_cancelled", reason: failure.message, message: params.message });
+      params.emit({ type: "turn_settled" });
+      return;
+    }
+    const compactDecision = params.getAutoCompactDecision?.({
+      agent: params.agent,
+      sessionManager: params.sessionManager,
+      cwd: params.cwd,
+      message: params.message,
+      messages: params.agent.state.messages.slice()
+    });
+    if (failure?.compactable) {
+      params.scheduleAutoCompact(compactDecision ?? { reason: "overflow", willRetry: true }, failure);
+      return;
+    }
+    if (failure && compactDecision?.reason === "overflow") {
+      params.scheduleAutoCompact(compactDecision, failure);
+      return;
+    }
+    if (failure?.retryable && compactDecision?.reason === "threshold") {
+      params.scheduleAutoCompact({ reason: "threshold", willRetry: true }, failure);
+      return;
+    }
+    if (failure) {
+      if (failure.retryable) {
+        await params.handleRetryTurnEnd(params.message, failure);
+        return;
+      }
+      await params.handleRetryTurnEnd(params.message, failure);
+      params.setRecoveryState("terminal");
+      params.emit({ type: "turn_failed_terminal", failure: asTerminalFailure(failure), message: params.message });
+      params.emit({ type: "turn_settled" });
+      return;
+    }
+    await params.handleRetryTurnEnd(params.message);
+    if (isAssistantTerminalCompletion(params.message)) {
+      params.emit({ type: "turn_completed", message: params.message, toolResults: params.toolResults });
+      const postTurnCompactDecision = compactDecision ?? params.getAutoCompactDecision?.({
+        agent: params.agent,
+        sessionManager: params.sessionManager,
+        cwd: params.cwd,
+        message: params.message,
+        messages: params.agent.state.messages.slice()
+      });
+      if (postTurnCompactDecision?.reason === "threshold") {
+        params.scheduleAutoCompact(postTurnCompactDecision);
+        return;
+      }
+      params.setRecoveryState("none");
+      params.emit({ type: "turn_settled" });
+    }
+  }
+  async function runAgentSessionControllerAutoCompact(params) {
+    const emitSettled = params.emitSettled ?? true;
+    const runAfterAgentEndHook = params.runAfterAgentEndHook ?? true;
+    const cancelOnAbort = params.cancelOnAbort ?? true;
+    params.setRecoveryState("compacting");
+    params.emit({ type: "turn_compaction_started", reason: params.reason, willRetry: params.willRetry });
+    try {
+      const result = await runAgentSessionCompaction({
+        reason: params.reason,
+        willRetry: params.willRetry,
+        signal: params.signal,
+        compaction: params.compaction,
+        agent: params.agent,
+        sessionManager: params.sessionManager,
+        cwd: params.cwd,
+        emit: params.emit,
+        removeTrailingAssistantError: params.removeTrailingAssistantError,
+        replaceMessagesAndMarkSynced: params.replaceMessagesAndMarkSynced,
+        markSyncedToAgentState: params.markSyncedToAgentState,
+        continueTurn: params.continueTurn
+      });
+      if (!params.willRetry || result?.aborted) {
+        const alreadyCancelled = params.getRecoveryState?.() === "cancelled" || params.getDisposed?.() === true;
+        params.setRecoveryState(result?.aborted && cancelOnAbort ? "cancelled" : "none");
+        if (result?.aborted) {
+          params.cancelRetry();
+          if (cancelOnAbort && !alreadyCancelled) {
+            params.emit({ type: "turn_cancelled", reason: "compaction_aborted" });
+          }
+        }
+        if (emitSettled && !alreadyCancelled) {
+          params.emit({ type: "turn_settled" });
+        }
+        if (!result?.aborted && runAfterAgentEndHook) {
+          void params.handleAgentEndHook(params.agent.state.messages.slice());
+        }
+      }
+      return result;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (!params.willRetry && params.reason !== "overflow") {
+        params.setRecoveryState("none");
+        if (emitSettled) {
+          params.emit({ type: "turn_settled" });
+        }
+        if (runAfterAgentEndHook) {
+          void params.handleAgentEndHook(params.agent.state.messages.slice());
+        }
+        throw error;
+      }
+      const failure = asTerminalFailure(params.pendingFailure ?? {
+        kind: "internal_error",
+        retryable: false,
+        compactable: false,
+        userAbort: false,
+        terminal: true,
+        message: errorMessage
+      }, errorMessage);
+      params.cancelRetry();
+      params.setRecoveryState("terminal");
+      params.emit({ type: "turn_failed_terminal", failure });
+      params.emit({ type: "turn_settled" });
+      throw error;
+    } finally {
+      params.clearPendingFailure();
+    }
+  }
+
   // ../../packages/agent-framework/src/session/controller.ts
   var AgentSessionController = class {
     agent;
@@ -17737,6 +18918,9 @@ ${compactSummary}`;
     prepareTurn;
     afterAgentEnd;
     getAutoCompactDecision;
+    classifyFailure;
+    recoveryState = "none";
+    pendingCompactionFailure;
     lifecycleState = createInitialAgentSessionLifecycleState();
     constructor(options) {
       this.agent = options.agent;
@@ -17747,6 +18931,7 @@ ${compactSummary}`;
       this.prepareTurn = options.prepareTurn;
       this.afterAgentEnd = options.afterAgentEnd;
       this.getAutoCompactDecision = options.getAutoCompactDecision;
+      this.classifyFailure = options.classifyFailure;
       if (options.onEvent) {
         this.listeners.add(options.onEvent);
       }
@@ -17762,15 +18947,18 @@ ${compactSummary}`;
         options.retry,
         (event) => this.emit(event),
         () => this.removeTrailingAssistantError(),
-        () => this.continue()
+        () => this.continue(),
+        (state) => {
+          this.recoveryState = state;
+        }
       );
       this.autoCompact = new AgentSessionAutoCompactScheduler({
         retry: options.retry,
         getDisposed: () => this.disposed,
         getRuntimeGuardTriggered: () => this.runtimeGuard.triggered,
         isStreaming: () => this.isStreaming,
-        runAutoCompact: async (decision) => {
-          await this.runAutoCompact(decision.reason, decision.willRetry);
+        runAutoCompact: async (decision, signal) => {
+          await this.runAutoCompact(decision.reason, decision.willRetry, { signal });
         }
       });
       this.autoContinue = new AgentSessionAutoContinueController({
@@ -17782,6 +18970,7 @@ ${compactSummary}`;
         emit: (event) => this.emit(event),
         getDisposed: () => this.disposed,
         getRuntimeGuardTriggered: () => this.runtimeGuard.triggered,
+        isBlockedByRuntimePolicy: () => this.isBlockedByRuntimePolicy(),
         hasQueuedMessages: () => this.hasQueuedMessages,
         isStreaming: () => this.isStreaming,
         continueTurn: () => this.continue()
@@ -17797,7 +18986,8 @@ ${compactSummary}`;
         getDisposed: () => this.disposed,
         getRuntimeGuardTriggered: () => this.runtimeGuard.triggered,
         isStreaming: () => this.isStreaming,
-        isBlockedByRuntimePolicy: () => this.retryController.hasPendingRetry || this.autoCompact.hasPendingAutoCompact,
+        isBlockedByRuntimePolicy: () => this.isBlockedByRuntimePolicy(),
+        runPreRequestAutoCompact: () => this.runPreRequestAutoCompactIfNeeded(),
         preparePromptMessages: (messages, promptOptions) => this.preparePromptMessages(messages, promptOptions),
         continueTurn: () => this.continue(),
         syncNewAgentMessages: () => this.syncNewAgentMessages()
@@ -17820,6 +19010,9 @@ ${compactSummary}`;
     get queuedInputsSnapshot() {
       return this.queue.snapshot;
     }
+    get turnRecoveryState() {
+      return this.recoveryState;
+    }
     get activeSessionMetadata() {
       const metadata = this.sessionManager.getActiveSession()?.metadata;
       return metadata ? { ...metadata } : void 0;
@@ -17828,10 +19021,7 @@ ${compactSummary}`;
       return this.lastSyncedMessageCount;
     }
     get runtimeContext() {
-      return {
-        systemPrompt: this.agent.state.systemPrompt,
-        tools: this.agent.state.tools.slice()
-      };
+      return { systemPrompt: this.agent.state.systemPrompt, tools: this.agent.state.tools.slice() };
     }
     getRuntimeSnapshot() {
       return {
@@ -17878,6 +19068,17 @@ ${compactSummary}`;
     }
     async prompt(input, options) {
       const messages = normalizePromptInput(input);
+      if (this.isRecoveryActive()) {
+        this.queue.enqueue(messages, options?.streamingBehavior ?? "followUp", {
+          ...options,
+          streamingBehavior: options?.streamingBehavior ?? "followUp"
+        });
+        this.recordLifecycle({ type: "queued_input_added" });
+        return;
+      }
+      if (this.recoveryState === "terminal" || this.recoveryState === "cancelled") {
+        this.recoveryState = "none";
+      }
       if (options?.streamingBehavior) {
         this.queue.enqueue(messages, options.streamingBehavior, options);
         this.recordLifecycle({ type: "queued_input_added" });
@@ -17889,7 +19090,8 @@ ${compactSummary}`;
       if (this.isStreaming) {
         throw new Error("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
       }
-      const prepared = await this.preparePromptMessages(messages, options);
+      await this.runPreRequestAutoCompactIfNeeded();
+      const prepared = await this.runRuntimePhase("prepare", () => this.preparePromptMessages(messages, options));
       if (prepared.handled) {
         return;
       }
@@ -17897,41 +19099,72 @@ ${compactSummary}`;
       if (prepared.systemPrompt !== void 0) {
         this.agent.setSystemPrompt(prepared.systemPrompt);
       }
-      await this.agent.prompt(prepared.messages);
-      await this.syncNewAgentMessages();
+      await this.runRuntimePhase("request", () => this.agent.prompt(prepared.messages));
+      await this.runRuntimePhase("post_turn", () => this.syncNewAgentMessages());
     }
     async continue() {
       if (this.isStreaming) {
         throw new Error("Agent is already processing. Wait for completion before continuing.");
       }
+      await this.runPreRequestAutoCompactIfNeeded();
       this.recordLifecycle({ type: "prompt_started" });
-      await this.agent.continue();
-      await this.syncNewAgentMessages();
+      await this.runRuntimePhase("request", () => this.agent.continue());
+      await this.runRuntimePhase("post_turn", () => this.syncNewAgentMessages());
     }
     abort() {
       this.recordLifecycle({ type: "abort" });
+      const cancelPendingRecovery = this.isRecoveryActive() && !this.isStreaming;
       this.retryController.cancel();
       this.autoCompact.cancel();
       this.queueDispatcher.cancel();
       this.autoContinue.cancel();
+      if (cancelPendingRecovery) {
+        this.recoveryState = "cancelled";
+        this.emit({ type: "turn_cancelled", reason: "user_abort" });
+        this.emit({ type: "turn_settled" });
+      }
       this.agent.abort();
     }
     waitForIdle() {
       return this.agent.waitForIdle();
     }
-    async runAutoCompact(reason, willRetry = false) {
-      return runAgentSessionCompaction({
+    async waitForSettled() {
+      while (true) {
+        await this.agent.waitForIdle();
+        if (!this.hasPendingRuntimePolicy()) {
+          return;
+        }
+        await Promise.all([this.retryController.waitForRetry(), this.autoCompact.waitForAutoCompact(), this.autoContinue.waitForAutoContinue(), this.queueDispatcher.waitForDispatch()]);
+      }
+    }
+    async runAutoCompact(reason, willRetry = false, options) {
+      return runAgentSessionControllerAutoCompact({
         reason,
         willRetry,
+        signal: options?.signal,
         compaction: this.compaction,
         agent: this.agent,
         sessionManager: this.sessionManager,
         cwd: this.cwd,
+        pendingFailure: this.pendingCompactionFailure,
         emit: (event) => this.emit(event),
+        setRecoveryState: (state) => {
+          this.recoveryState = state;
+        },
+        getRecoveryState: () => this.recoveryState,
+        getDisposed: () => this.disposed,
+        cancelRetry: () => this.retryController.cancel(),
+        clearPendingFailure: () => {
+          this.pendingCompactionFailure = void 0;
+        },
         removeTrailingAssistantError: () => this.removeTrailingAssistantError(),
-        replaceMessagesAndMarkSynced: (messages, options) => this.replaceMessagesAndMarkSynced(messages, options),
+        replaceMessagesAndMarkSynced: (messages, options2) => this.replaceMessagesAndMarkSynced(messages, options2),
         markSyncedToAgentState: () => this.markSyncedToAgentState(),
-        continueTurn: () => this.continue()
+        continueTurn: () => this.continue(),
+        handleAgentEndHook: (messages) => this.handleAgentEndHook(messages),
+        emitSettled: options?.emitSettled,
+        runAfterAgentEndHook: options?.runAfterAgentEndHook,
+        cancelOnAbort: options?.cancelOnAbort
       });
     }
     dispose() {
@@ -17953,9 +19186,23 @@ ${compactSummary}`;
       this.queue.replaceText(search, replacement);
     }
     requestQueueDispatch() {
-      if (this.queue.length > 0) {
-        this.queueDispatcher.schedule();
-      }
+      if (this.queue.length > 0) this.queueDispatcher.schedule();
+    }
+    async runPreRequestAutoCompactIfNeeded() {
+      return runPreRequestAutoCompact({
+        disposed: this.disposed,
+        runtimeGuardTriggered: this.runtimeGuard.triggered,
+        isStreaming: this.isStreaming,
+        recoveryActive: this.isRecoveryActive(),
+        agent: this.agent,
+        sessionManager: this.sessionManager,
+        cwd: this.cwd,
+        getAutoCompactDecision: this.getAutoCompactDecision,
+        runAutoCompact: () => this.runAutoCompact("threshold", false, { emitSettled: false, runAfterAgentEndHook: false, cancelOnAbort: false }).then(() => void 0),
+        setRecoveryState: (state) => {
+          this.recoveryState = state;
+        }
+      });
     }
     handleAgentEvent(event) {
       this.emit({ type: "agent_event", event });
@@ -17976,7 +19223,7 @@ ${compactSummary}`;
       if (event.type === "turn_end") {
         void this.syncNewAgentMessages();
         this.recordLifecycle({ type: "turn_end_success" });
-        void this.handleTurnEndRuntimePolicies(event.message);
+        void this.handleTurnEndRuntimePolicies(event.message, event.toolResults);
       }
       if (event.type === "agent_end") {
         this.recordLifecycle({ type: "agent_end" });
@@ -18013,25 +19260,29 @@ ${compactSummary}`;
         replaceMessagesAndMarkSynced: (messages, options) => this.replaceMessagesAndMarkSynced(messages, options)
       });
     }
-    async handleTurnEndRuntimePolicies(message) {
-      if (this.disposed || this.runtimeGuard.triggered) {
-        return;
-      }
-      const compactDecision = this.getAutoCompactDecision?.({
+    async handleTurnEndRuntimePolicies(message, toolResults = []) {
+      return handleAgentSessionTurnEndRuntimePolicies({
+        disposed: this.disposed,
+        runtimeGuardTriggered: this.runtimeGuard.triggered,
+        message,
+        toolResults,
         agent: this.agent,
         sessionManager: this.sessionManager,
         cwd: this.cwd,
-        message,
-        messages: this.agent.state.messages.slice()
+        getAutoCompactDecision: this.getAutoCompactDecision,
+        classifyFailure: this.classifyFailure,
+        retry: this.retryController.policy,
+        emit: (event) => this.emit(event),
+        setRecoveryState: (state) => {
+          this.recoveryState = state;
+        },
+        handleRetryTurnEnd: (turnMessage, failure) => this.retryController.handleTurnEnd(turnMessage, failure),
+        cancelRetry: () => this.retryController.cancel(),
+        scheduleAutoCompact: (decision, failure) => this.scheduleAutoCompact(decision, failure)
       });
-      if (compactDecision) {
-        this.scheduleAutoCompact(compactDecision);
-        return;
-      }
-      await this.retryController.handleTurnEnd(message);
     }
     async handleAgentEndHook(messages) {
-      if (this.disposed || this.runtimeGuard.triggered) {
+      if (this.disposed || this.runtimeGuard.triggered || this.isBlockedByRuntimePolicy()) {
         return;
       }
       if (this.afterAgentEnd) {
@@ -18066,8 +19317,36 @@ ${compactSummary}`;
     recordToolExecutionEndForGuard(event) {
       this.runtimeGuard.recordToolExecutionEnd(event);
     }
-    scheduleAutoCompact(decision) {
+    async runRuntimePhase(phase, action) {
+      return runAgentSessionRuntimePhase({
+        phase,
+        action,
+        retry: this.retryController.policy,
+        classifyFailure: this.classifyFailure,
+        emit: (event) => this.emit(event),
+        setRecoveryState: (state) => {
+          this.recoveryState = state;
+        }
+      });
+    }
+    isRecoveryActive() {
+      return isAgentSessionRecoveryActive(this.recoveryState);
+    }
+    isBlockedByRuntimePolicy() {
+      return this.recoveryState !== "none" || this.retryController.hasPendingRetry || this.autoCompact.hasPendingAutoCompact;
+    }
+    hasPendingRuntimePolicy() {
+      return this.retryController.hasPendingRetry || this.autoCompact.hasPendingAutoCompact || this.autoContinue.hasPendingAutoContinue || this.queueDispatcher.hasPendingDispatch;
+    }
+    scheduleAutoCompact(decision, failure) {
       this.recordLifecycle({ type: "auto_compact_scheduled" });
+      if (failure) {
+        this.pendingCompactionFailure = failure;
+        this.recoveryState = "compacting";
+        this.emit({ type: "turn_recovery_pending", recovery: "compaction", failure });
+      } else if (decision.reason === "threshold") {
+        this.recoveryState = "compacting";
+      }
       this.autoCompact.schedule(decision);
     }
     triggerRuntimeGuard(toolName, repeatCount, reason) {
@@ -18079,7 +19358,13 @@ ${compactSummary}`;
       this.autoCompact.cancel();
       this.queueDispatcher.cancel();
       this.autoContinue.cancel();
+      this.recoveryState = "terminal";
       this.emit({ type: "runtime_guard_triggered", toolName, repeatCount, reason });
+      this.emit({
+        type: "turn_failed_terminal",
+        failure: createRuntimeGuardFailure(reason)
+      });
+      this.emit({ type: "turn_settled" });
       this.agent.abort();
     }
     emit(event) {
@@ -19262,9 +20547,98 @@ ${compactSummary}`;
     };
   }
 
+  // ../../packages/shared-headless-capabilities/src/builtin/fs/file-observation-state.ts
+  function snapshotsEqual(left, right) {
+    return left.mtimeMs === right.mtimeMs && left.size === right.size && left.contentHash === right.contentHash;
+  }
+  function snapshotsHaveSameContent(left, right) {
+    return left.size === right.size && left.contentHash === right.contentHash;
+  }
+  function snapshotFromStatAndContent(stat, content) {
+    return {
+      mtimeMs: stat.mtime.getTime(),
+      size: stat.size,
+      contentHash: hashText(content)
+    };
+  }
+  function createFileObservationState(options = {}) {
+    const files = /* @__PURE__ */ new Map();
+    const maxFiles = Math.max(1, Math.floor(options.maxFiles ?? 100));
+    const maxRangesPerFile = Math.max(0, Math.floor(options.maxRangesPerFile ?? 8));
+    function touchFile(absolutePath, observed) {
+      files.delete(absolutePath);
+      files.set(absolutePath, observed);
+      while (files.size > maxFiles) {
+        const oldest = files.keys().next().value;
+        if (oldest === void 0) break;
+        files.delete(oldest);
+      }
+    }
+    function touchRange(readRanges, rangeKey, range) {
+      if (maxRangesPerFile === 0) {
+        readRanges.clear();
+        return;
+      }
+      readRanges.delete(rangeKey);
+      readRanges.set(rangeKey, range);
+      while (readRanges.size > maxRangesPerFile) {
+        const oldest = readRanges.keys().next().value;
+        if (oldest === void 0) break;
+        readRanges.delete(oldest);
+      }
+    }
+    return {
+      isUnchangedReadRange(absolutePath, rangeKey, snapshot, selectedContentHash) {
+        const observed = files.get(absolutePath);
+        const range = observed?.readRanges.get(rangeKey);
+        if (!observed || !range) {
+          return false;
+        }
+        const unchanged = snapshotsEqual(range.snapshot, snapshot) && range.selectedContentHash === selectedContentHash;
+        touchRange(observed.readRanges, rangeKey, range);
+        touchFile(absolutePath, observed);
+        return unchanged;
+      },
+      recordTextRead(absolutePath, rangeKey, snapshot, selectedContentHash, completeTextKnown) {
+        const observed = files.get(absolutePath) ?? {
+          snapshot,
+          completeTextKnown: false,
+          readRanges: /* @__PURE__ */ new Map()
+        };
+        const preservesFreshCompleteRead = observed.completeTextKnown && snapshotsHaveSameContent(observed.snapshot, snapshot);
+        observed.snapshot = snapshot;
+        observed.completeTextKnown = completeTextKnown || preservesFreshCompleteRead;
+        touchRange(observed.readRanges, rangeKey, { snapshot, selectedContentHash });
+        touchFile(absolutePath, observed);
+      },
+      getCompleteTextSnapshot(absolutePath) {
+        const observed = files.get(absolutePath);
+        if (!observed?.completeTextKnown) {
+          return void 0;
+        }
+        touchFile(absolutePath, observed);
+        return observed.snapshot;
+      },
+      recordCompleteTextWrite(absolutePath, snapshot) {
+        touchFile(absolutePath, {
+          snapshot,
+          completeTextKnown: true,
+          readRanges: /* @__PURE__ */ new Map()
+        });
+      },
+      invalidate(absolutePath) {
+        files.delete(absolutePath);
+      },
+      clear() {
+        files.clear();
+      }
+    };
+  }
+
   // ../../packages/shared-headless-capabilities/src/builtin/fs/read.ts
   function createReadTool(cwd, options) {
     const fs = getFileSystem();
+    const fileObservationState = options?.fileObservationState ?? createFileObservationState();
     const rootSchema = buildRootParameterSchema(cwd, options);
     const readSchema = Type.Object({
       path: Type.String({ description: "Path to the file to read. Example: 'Scripts/PlayerController.cs' or 'Assets/Gen/config.json'." }),
@@ -19299,6 +20673,13 @@ ${compactSummary}`;
             (async () => {
               try {
                 await fs.access(absolutePath);
+                if (isSpecialDevicePath(absolutePath)) {
+                  throw new Error(`Refusing to read special device path: ${absolutePath}`);
+                }
+                const stat = await fs.stat(absolutePath);
+                if (!stat.isFile) {
+                  throw new Error(`Refusing to read non-regular file: ${absolutePath}`);
+                }
                 if (aborted) return;
                 const imageInfo = await readImageInfo(absolutePath, fs);
                 if (imageInfo) {
@@ -19359,24 +20740,62 @@ ${compactSummary}`;
                   });
                   return;
                 }
-                const content = String(await fs.readFile(absolutePath, "utf-8"));
-                const allLines = content.split("\n");
-                const totalFileLines = allLines.length;
                 const startLine = offset ? Math.max(0, offset - 1) : 0;
                 const startLineDisplay = startLine + 1;
-                if (startLine >= allLines.length) {
-                  throw new Error(`Offset ${offset} is beyond end of file (${allLines.length} lines total)`);
+                const range = await fs.readTextRange(absolutePath, {
+                  offsetLine: startLine,
+                  limitLines: limit,
+                  maxOutputLines: DEFAULT_MAX_LINES,
+                  maxOutputBytes: DEFAULT_MAX_BYTES
+                }, signal);
+                const snapshot = {
+                  mtimeMs: range.mtimeMs,
+                  size: range.size,
+                  contentHash: range.contentHash
+                };
+                const totalFileLines = range.totalLines;
+                if (startLine >= range.totalLines) {
+                  throw new Error(`Offset ${offset} is beyond end of file (${range.totalLines} lines total)`);
                 }
-                let selectedContent;
                 let userLimitedLines;
                 if (limit !== void 0) {
-                  const endLine = Math.min(startLine + limit, allLines.length);
-                  selectedContent = allLines.slice(startLine, endLine).join("\n");
-                  userLimitedLines = endLine - startLine;
-                } else {
-                  selectedContent = allLines.slice(startLine).join("\n");
+                  userLimitedLines = range.selectedLines;
                 }
-                const truncation = truncateHead(selectedContent);
+                const rangeKey = `${startLineDisplay}:${limit === void 0 ? "all" : limit}`;
+                const truncation = {
+                  content: range.content,
+                  truncated: range.truncated,
+                  truncatedBy: range.truncatedBy,
+                  totalLines: range.selectedLines,
+                  totalBytes: range.selectedBytes,
+                  outputLines: range.outputLines,
+                  outputBytes: range.outputBytes,
+                  lastLinePartial: false,
+                  firstLineExceedsLimit: range.firstLineExceedsLimit,
+                  maxLines: DEFAULT_MAX_LINES,
+                  maxBytes: DEFAULT_MAX_BYTES
+                };
+                const readStartsAtBeginning = offset === void 0 || offset === 1;
+                const readReachedEndOfFile = startLine + range.selectedLines >= range.totalLines;
+                const isCompleteTextKnown = readStartsAtBeginning && readReachedEndOfFile && !truncation.truncated && !truncation.firstLineExceedsLimit;
+                if (fileObservationState.isUnchangedReadRange(absolutePath, rangeKey, snapshot, range.selectedContentHash)) {
+                  if (signal) {
+                    signal.removeEventListener("abort", onAbort);
+                  }
+                  resolve2({
+                    content: [{
+                      type: "text",
+                      text: "File unchanged since previous read of this range. Use a different offset/limit if you need another section."
+                    }],
+                    details: {
+                      unchangedSincePreviousRead: true,
+                      path: absolutePath,
+                      offset: startLineDisplay,
+                      limit
+                    }
+                  });
+                  return;
+                }
                 let outputText;
                 let details;
                 const sourceHeader = `File: ${absolutePath}
@@ -19384,7 +20803,7 @@ Base directory: ${dirname(absolutePath)}
 
 `;
                 if (truncation.firstLineExceedsLimit) {
-                  const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], "utf-8"));
+                  const firstLineSize = formatSize(range.firstLineBytes);
                   outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit.]`;
                   details = { truncation };
                 } else if (truncation.truncated) {
@@ -19401,8 +20820,8 @@ Base directory: ${dirname(absolutePath)}
 [Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
                   }
                   details = { truncation };
-                } else if (userLimitedLines !== void 0 && startLine + userLimitedLines < allLines.length) {
-                  const remaining = allLines.length - (startLine + userLimitedLines);
+                } else if (userLimitedLines !== void 0 && startLine + userLimitedLines < range.totalLines) {
+                  const remaining = range.totalLines - (startLine + userLimitedLines);
                   const nextOffset = startLine + userLimitedLines + 1;
                   outputText = truncation.content;
                   outputText += `
@@ -19411,6 +20830,13 @@ Base directory: ${dirname(absolutePath)}
                 } else {
                   outputText = truncation.content;
                 }
+                fileObservationState.recordTextRead(
+                  absolutePath,
+                  rangeKey,
+                  snapshot,
+                  range.selectedContentHash,
+                  isCompleteTextKnown
+                );
                 outputText = sourceHeader + outputText;
                 const textContent = [{ type: "text", text: outputText }];
                 if (aborted) return;
@@ -19431,6 +20857,10 @@ Base directory: ${dirname(absolutePath)}
         );
       }
     };
+  }
+  function isSpecialDevicePath(path) {
+    const normalized = resolve(path).replace(/\\/g, "/");
+    return /^\/dev\/(?:zero|random|urandom|full|stdin|stdout|stderr|tty|console)$/.test(normalized) || /^\/dev\/fd\/[0-2]$/.test(normalized) || /^\/proc\/(?:self|\d+)\/fd\/[0-2]$/.test(normalized);
   }
   function detectUnderstandingKind(filePath) {
     const lower = filePath.toLowerCase();
@@ -19553,6 +20983,8 @@ Base directory: ${dirname(absolutePath)}
   // ../../packages/shared-headless-capabilities/src/builtin/fs/write.ts
   function createWriteTool(cwd, options) {
     const fs = getFileSystem();
+    const usesExternalFileObservationState = !!options?.fileObservationState;
+    const fileObservationState = options?.fileObservationState ?? createFileObservationState();
     const rootSchema = buildRootParameterSchema(cwd, options);
     const writeSchema = Type.Object({
       path: Type.String({ description: "Path to the file to write." }),
@@ -19563,7 +20995,7 @@ Base directory: ${dirname(absolutePath)}
     return {
       name: "write",
       label: "write",
-      description: `Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories. ${pathResolutionDescription}`,
+      description: `Write complete file contents. Use this to create a new file, or to intentionally replace an entire existing file after reading the latest full file with read_file. Do not use for targeted edits to existing files; use edit_file instead. For existing files, omitted content will be deleted. Automatically creates parent directories. ${pathResolutionDescription}`,
       parameters: writeSchema,
       execute: async (_toolCallId, params, signal) => {
         const { path: filePath, root, content } = params;
@@ -19587,7 +21019,33 @@ Base directory: ${dirname(absolutePath)}
               try {
                 await fs.mkdir(dir, { recursive: true });
                 if (aborted) return;
+                let fileExists = false;
+                try {
+                  const stat = await fs.stat(absolutePath);
+                  fileExists = stat.isFile;
+                } catch {
+                  fileExists = false;
+                }
+                if (fileExists) {
+                  const currentContent = String(await fs.readFile(absolutePath, "utf-8"));
+                  const currentStat = await fs.stat(absolutePath);
+                  const currentSnapshot = snapshotFromStatAndContent(currentStat, currentContent);
+                  const observedSnapshot = fileObservationState.getCompleteTextSnapshot(absolutePath);
+                  if (!observedSnapshot) {
+                    throw new Error(
+                      usesExternalFileObservationState ? "Read the current full file with read_file before overwriting it, or use edit_file for targeted changes." : "Existing-file overwrite requires write_file to share a fileObservationState with read_file; use createSharedFileSystemTools or pass the same fileObservationState to both tools."
+                    );
+                  }
+                  if (!snapshotsHaveSameContent(observedSnapshot, currentSnapshot)) {
+                    throw new Error("File changed since it was read. Read the latest file contents before overwriting it.");
+                  }
+                }
                 await fs.writeFile(absolutePath, content, "utf-8");
+                const writtenStat = await fs.stat(absolutePath);
+                fileObservationState.recordCompleteTextWrite(
+                  absolutePath,
+                  snapshotFromStatAndContent(writtenStat, content)
+                );
                 if (aborted) return;
                 if (signal) {
                   signal.removeEventListener("abort", onAbort);
@@ -19626,21 +21084,80 @@ Base directory: ${dirname(absolutePath)}
     return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
   }
   function normalizeForFuzzyMatch(text) {
-    return text.split("\n").map((line) => line.trimEnd()).join("\n").replace(/[\u2018\u2019\u201A\u201B]/g, "'").replace(/[\u201C\u201D\u201E\u201F]/g, '"').replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-").replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
+    return buildFuzzyIndexMap(text).normalized;
+  }
+  function normalizeCharForFuzzyMatch(char) {
+    if (/[\u2018\u2019\u201A\u201B]/.test(char)) return "'";
+    if (/[\u201C\u201D\u201E\u201F]/.test(char)) return '"';
+    if (/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/.test(char)) return "-";
+    if (/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/.test(char)) return " ";
+    return char;
+  }
+  function buildFuzzyIndexMap(text) {
+    const lines = text.split("\n");
+    let normalized = "";
+    const originalStartByNormalizedIndex = [];
+    const originalEndByNormalizedIndex = [];
+    let originalLineStart = 0;
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      const line = lines[lineIndex] ?? "";
+      const trimmedLine = line.trimEnd();
+      for (let index = 0; index < trimmedLine.length; index++) {
+        normalized += normalizeCharForFuzzyMatch(trimmedLine[index]);
+        originalStartByNormalizedIndex.push(originalLineStart + index);
+        originalEndByNormalizedIndex.push(originalLineStart + index + 1);
+      }
+      if (lineIndex < lines.length - 1) {
+        normalized += "\n";
+        originalStartByNormalizedIndex.push(originalLineStart + line.length);
+        originalEndByNormalizedIndex.push(originalLineStart + line.length + 1);
+      }
+      originalLineStart += line.length + (lineIndex < lines.length - 1 ? 1 : 0);
+    }
+    return { normalized, originalStartByNormalizedIndex, originalEndByNormalizedIndex };
+  }
+  function collectMatches(content, needle) {
+    if (needle.length === 0) return [];
+    const matches = [];
+    let index = 0;
+    while (true) {
+      const nextIndex = content.indexOf(needle, index);
+      if (nextIndex === -1) break;
+      matches.push({ index: nextIndex, matchLength: needle.length });
+      index = nextIndex + needle.length;
+    }
+    return matches;
   }
   function fuzzyFindText(content, oldText) {
     const exactIndex = content.indexOf(oldText);
     if (exactIndex !== -1) {
+      const matches2 = collectMatches(content, oldText);
       return {
         found: true,
         index: exactIndex,
         matchLength: oldText.length,
         usedFuzzyMatch: false,
-        contentForReplacement: content
+        contentForReplacement: content,
+        occurrences: matches2.length,
+        matches: matches2,
+        matchKind: "exact"
       };
     }
-    const fuzzyContent = normalizeForFuzzyMatch(content);
+    const fuzzyMap = buildFuzzyIndexMap(content);
+    const fuzzyContent = fuzzyMap.normalized;
     const fuzzyOldText = normalizeForFuzzyMatch(oldText);
+    if (fuzzyOldText.length === 0) {
+      return {
+        found: false,
+        index: -1,
+        matchLength: 0,
+        usedFuzzyMatch: false,
+        contentForReplacement: content,
+        occurrences: 0,
+        matches: [],
+        matchKind: "none"
+      };
+    }
     const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
     if (fuzzyIndex === -1) {
       return {
@@ -19648,39 +21165,76 @@ Base directory: ${dirname(absolutePath)}
         index: -1,
         matchLength: 0,
         usedFuzzyMatch: false,
-        contentForReplacement: content
+        contentForReplacement: content,
+        occurrences: 0,
+        matches: [],
+        matchKind: "none"
       };
     }
+    const fuzzyMatches = collectMatches(fuzzyContent, fuzzyOldText);
+    const matches = fuzzyMatches.map((match) => {
+      const endFuzzyIndex = match.index + match.matchLength - 1;
+      const originalStart = fuzzyMap.originalStartByNormalizedIndex[match.index] ?? match.index;
+      const originalEnd = fuzzyMap.originalEndByNormalizedIndex[endFuzzyIndex] ?? originalStart + match.matchLength;
+      return { index: originalStart, matchLength: originalEnd - originalStart };
+    });
+    const firstMatch = matches[0] ?? { index: -1, matchLength: 0 };
     return {
       found: true,
-      index: fuzzyIndex,
-      matchLength: fuzzyOldText.length,
+      index: firstMatch.index,
+      matchLength: firstMatch.matchLength,
       usedFuzzyMatch: true,
-      contentForReplacement: fuzzyContent
+      contentForReplacement: content,
+      occurrences: matches.length,
+      matches,
+      matchKind: "fuzzy"
     };
   }
   function stripBom(content) {
     return content.startsWith("\uFEFF") ? { bom: "\uFEFF", text: content.slice(1) } : { bom: "", text: content };
   }
-  function generateDiffString(oldContent, newContent, _contextLines = 4) {
-    const oldLines = oldContent.split("\n");
-    const newLines = newContent.split("\n");
-    let firstChangedLine;
-    for (let i = 0; i < Math.max(oldLines.length, newLines.length); i++) {
-      if (oldLines[i] !== newLines[i]) {
-        firstChangedLine = i + 1;
-        break;
-      }
+  function generateDiffString(oldContent, newContent, contextLines = 4) {
+    const oldLines = normalizeToLF(stripBom(oldContent).text).split("\n");
+    const newLines = normalizeToLF(stripBom(newContent).text).split("\n");
+    let prefixLength = 0;
+    while (prefixLength < oldLines.length && prefixLength < newLines.length && oldLines[prefixLength] === newLines[prefixLength]) {
+      prefixLength++;
     }
-    const diff = `--- old
-+++ new
-@@ -1,${oldLines.length} +1,${newLines.length} @@
-[Diff: ${oldLines.length} lines -> ${newLines.length} lines]`;
-    return { diff, firstChangedLine };
+    if (prefixLength === oldLines.length && prefixLength === newLines.length) {
+      return { diff: "--- old\n+++ new\n", firstChangedLine: void 0 };
+    }
+    let oldSuffixIndex = oldLines.length - 1;
+    let newSuffixIndex = newLines.length - 1;
+    while (oldSuffixIndex >= prefixLength && newSuffixIndex >= prefixLength && oldLines[oldSuffixIndex] === newLines[newSuffixIndex]) {
+      oldSuffixIndex--;
+      newSuffixIndex--;
+    }
+    const beforeContext = Math.min(contextLines, prefixLength);
+    const removedCount = Math.max(0, oldSuffixIndex - prefixLength + 1);
+    const addedCount = Math.max(0, newSuffixIndex - prefixLength + 1);
+    const afterContext = Math.min(contextLines, oldLines.length - oldSuffixIndex - 1, newLines.length - newSuffixIndex - 1);
+    const hunkOldStart = Math.max(0, prefixLength - beforeContext);
+    const hunkNewStart = Math.max(0, prefixLength - beforeContext);
+    const hunkOldCount = beforeContext + removedCount + afterContext;
+    const hunkNewCount = beforeContext + addedCount + afterContext;
+    const lines = ["--- old", "+++ new", `@@ -${hunkOldStart + 1},${hunkOldCount} +${hunkNewStart + 1},${hunkNewCount} @@`];
+    for (let index = prefixLength - beforeContext; index < prefixLength; index++) {
+      lines.push(` ${oldLines[index] ?? ""}`);
+    }
+    for (let index = prefixLength; index <= oldSuffixIndex; index++) {
+      lines.push(`-${oldLines[index] ?? ""}`);
+    }
+    for (let index = prefixLength; index <= newSuffixIndex; index++) {
+      lines.push(`+${newLines[index] ?? ""}`);
+    }
+    for (let offset = 1; offset <= afterContext; offset++) {
+      lines.push(` ${oldLines[oldSuffixIndex + offset] ?? ""}`);
+    }
+    return { diff: lines.join("\n"), firstChangedLine: prefixLength + 1 };
   }
 
   // ../../packages/shared-headless-capabilities/src/builtin/fs/edit.ts
-  function validateEditArgs(path, oldText, newText) {
+  function validateEditArgs(path, oldText, newText, replaceAll) {
     const filePath = typeof path === "string" ? path.trim() : "";
     if (!filePath) {
       throw new Error("Invalid edit_file arguments: path cannot be empty. Pass the file path in path and the exact text to replace in oldText.");
@@ -19693,6 +21247,9 @@ Base directory: ${dirname(absolutePath)}
     }
     if (oldText === newText) {
       throw new Error("Invalid edit_file arguments: oldText and newText are identical, so the edit would make no change.");
+    }
+    if (replaceAll !== void 0 && typeof replaceAll !== "boolean") {
+      throw new Error("Invalid edit_file arguments: replaceAll must be a boolean when provided.");
     }
     if (filePath.includes("<|tool") || oldText.includes("<|tool") || newText.includes("<|tool")) {
       throw new Error("Invalid edit_file arguments: path, oldText, and newText must be real edit values, not tool-call markup.");
@@ -19710,14 +21267,41 @@ Base directory: ${dirname(absolutePath)}
     }
     return count;
   }
+  function createEditErrorResult(params) {
+    const detailLines = [
+      params.message,
+      params.recoveryHint,
+      params.alreadyAppliedCandidate ? "Diagnostic: newText already appears in the current file, but edit_file did not treat that as success because it may be an unrelated occurrence." : ""
+    ].filter(Boolean);
+    return {
+      content: [{ type: "text", text: detailLines.join("\n") }],
+      details: {
+        status: "error",
+        matchKind: params.matchKind,
+        changed: false,
+        diff: "",
+        oldTextOccurrences: params.oldTextOccurrences,
+        newTextOccurrences: params.newTextOccurrences,
+        replaceAll: params.replaceAll,
+        replacedOccurrences: 0,
+        errorReason: params.errorReason,
+        recoveryHint: params.recoveryHint,
+        staleBaseLikely: params.staleBaseLikely,
+        alreadyAppliedCandidate: params.alreadyAppliedCandidate
+      },
+      isError: true
+    };
+  }
   function createEditTool(cwd, options) {
     const fs = getFileSystem();
+    const fileObservationState = options?.fileObservationState ?? createFileObservationState();
     const rootSchema = buildRootParameterSchema(cwd, options);
     const editSchema = Type.Object({
       path: Type.String({ description: "Path to the file to edit." }),
       ...rootSchema ? { root: rootSchema } : {},
       oldText: Type.String({ description: "Exact text to find and replace (must match exactly)" }),
-      newText: Type.String({ description: "New text to replace the old text with" })
+      newText: Type.String({ description: "New text to replace the old text with" }),
+      replaceAll: Type.Optional(Type.Boolean({ description: "Replace every occurrence of oldText. Only set this to true when every matching occurrence should be replaced." }))
     });
     const pathResolutionDescription = buildPathResolutionDescription(cwd, options);
     return {
@@ -19726,8 +21310,9 @@ Base directory: ${dirname(absolutePath)}
       description: `Edit a file by replacing exact text. The oldText must match exactly (including whitespace). Use this for precise, surgical edits. ${pathResolutionDescription}`,
       parameters: editSchema,
       execute: async (_toolCallId, params, signal) => {
-        const { path, root, oldText, newText } = params;
-        validateEditArgs(path, oldText, newText);
+        const { path, root, oldText, newText, replaceAll } = params;
+        validateEditArgs(path, oldText, newText, replaceAll);
+        const shouldReplaceAll = replaceAll === true;
         const absolutePath = resolveToCwd(path, cwd, options, root);
         return new Promise((resolve2, reject) => {
           if (signal?.aborted) {
@@ -19759,56 +21344,90 @@ Base directory: ${dirname(absolutePath)}
               const normalizedContent = normalizeToLF(content);
               const normalizedOldText = normalizeToLF(oldText);
               const normalizedNewText = normalizeToLF(newText);
+              const newTextOccurrences = countOccurrences(normalizedContent, normalizedNewText);
               const matchResult = fuzzyFindText(normalizedContent, normalizedOldText);
               if (!matchResult.found) {
                 if (signal) signal.removeEventListener("abort", onAbort);
-                reject(
-                  new Error(
-                    `Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`
-                  )
+                resolve2(
+                  createEditErrorResult({
+                    message: `Could not find oldText in ${path}.`,
+                    matchKind: "none",
+                    errorReason: "old_text_not_found",
+                    oldTextOccurrences: 0,
+                    newTextOccurrences,
+                    replaceAll: shouldReplaceAll,
+                    staleBaseLikely: newTextOccurrences > 0,
+                    alreadyAppliedCandidate: newTextOccurrences > 0,
+                    recoveryHint: newTextOccurrences > 0 ? "The replacement text already appears in the current file. Read the current file before retrying; this may be a stale oldText from an earlier edit in the same turn." : "Read the current file and retry with exact text copied from the latest file contents."
+                  })
                 );
                 return;
               }
-              const fuzzyContent = normalizeForFuzzyMatch(normalizedContent);
-              const fuzzyOldText = normalizeForFuzzyMatch(normalizedOldText);
-              const occurrences = countOccurrences(fuzzyContent, fuzzyOldText);
-              if (occurrences > 1) {
+              if (matchResult.occurrences > 1 && !shouldReplaceAll) {
                 if (signal) signal.removeEventListener("abort", onAbort);
-                reject(
-                  new Error(
-                    `Found ${occurrences} occurrences of the text in ${path}. The text must be unique. Please provide more context to make it unique.`
-                  )
+                resolve2(
+                  createEditErrorResult({
+                    message: `Found ${matchResult.occurrences} occurrences of oldText in ${path}. The text must be unique.`,
+                    matchKind: matchResult.matchKind,
+                    errorReason: "old_text_not_unique",
+                    oldTextOccurrences: matchResult.occurrences,
+                    newTextOccurrences,
+                    replaceAll: shouldReplaceAll,
+                    recoveryHint: "Read the current file and retry with a larger exact block copied from the latest file contents, or set replaceAll to true if every occurrence should be replaced."
+                  })
                 );
                 return;
               }
               if (aborted) return;
               const baseContent = matchResult.contentForReplacement;
-              const newContent = baseContent.substring(0, matchResult.index) + normalizedNewText + baseContent.substring(matchResult.index + matchResult.matchLength);
+              const matchesToReplace = shouldReplaceAll ? matchResult.matches : matchResult.matches.slice(0, 1);
+              let newContent = baseContent;
+              for (const match of [...matchesToReplace].sort((left, right) => right.index - left.index)) {
+                newContent = newContent.substring(0, match.index) + normalizedNewText + newContent.substring(match.index + match.matchLength);
+              }
               if (baseContent === newContent) {
                 if (signal) signal.removeEventListener("abort", onAbort);
-                reject(
-                  new Error(
-                    `No changes made to ${path}. The replacement produced identical content.`
-                  )
+                resolve2(
+                  createEditErrorResult({
+                    message: `No changes made to ${path}. The replacement produced identical content.`,
+                    matchKind: matchResult.matchKind,
+                    errorReason: "replacement_no_change",
+                    oldTextOccurrences: matchResult.occurrences,
+                    newTextOccurrences,
+                    replaceAll: shouldReplaceAll,
+                    recoveryHint: "Read the current file and verify whether the intended edit is already present or whether oldText/newText need a larger exact block.",
+                    alreadyAppliedCandidate: newTextOccurrences > 0
+                  })
                 );
                 return;
               }
               const finalContent = bom + restoreLineEndings(newContent, originalEnding);
               await fs.writeFile(absolutePath, finalContent, "utf-8");
+              fileObservationState.invalidate(absolutePath);
               if (aborted) return;
               if (signal) {
                 signal.removeEventListener("abort", onAbort);
               }
-              const diffResult = generateDiffString(content, finalContent);
+              const diffResult = generateDiffString(content, restoreLineEndings(newContent, originalEnding));
               resolve2({
                 content: [
                   {
                     type: "text",
-                    text: `Successfully replaced text in ${path}.`
+                    text: `Successfully replaced text in ${path} using ${matchResult.matchKind} match (${matchesToReplace.length} occurrence${matchesToReplace.length === 1 ? "" : "s"}).`
                   },
                   { type: "text", text: diffResult.diff }
                 ],
-                details: { diff: diffResult.diff, firstChangedLine: diffResult.firstChangedLine }
+                details: {
+                  status: "success",
+                  matchKind: matchResult.matchKind,
+                  changed: true,
+                  diff: diffResult.diff,
+                  firstChangedLine: diffResult.firstChangedLine,
+                  oldTextOccurrences: matchResult.occurrences,
+                  newTextOccurrences,
+                  replaceAll: shouldReplaceAll,
+                  replacedOccurrences: matchesToReplace.length
+                }
               });
             } catch (error) {
               if (signal) {
@@ -20059,14 +21678,14 @@ ${tools.map((tool) => buildToolLine(tool, mode)).filter(Boolean).join("\n")}
         results.push(makeTextSegment(block.text));
       }
       if (block?.type === "server_tool_use") {
-        const input = isRecord2(block.input) ? block.input : void 0;
+        const input = isRecord3(block.input) ? block.input : void 0;
         if (typeof input?.query === "string" && input.query.trim()) {
           actualQueries.push(input.query.trim());
         }
       }
       if (block?.type === "web_search_tool_result") {
         if (!Array.isArray(block.content)) {
-          const errorCode = isRecord2(block.content) && typeof block.content.error_code === "string" ? block.content.error_code : "unknown";
+          const errorCode = isRecord3(block.content) && typeof block.content.error_code === "string" ? block.content.error_code : "unknown";
           results.push({
             type: "error",
             toolUseId: typeof block.tool_use_id === "string" ? block.tool_use_id : void 0,
@@ -20110,7 +21729,7 @@ ${tools.map((tool) => buildToolLine(tool, mode)).filter(Boolean).join("\n")}
   function resolveResponsesEndpoint(baseUrl) {
     return `${baseUrl.replace(/\/+$/, "")}/responses`;
   }
-  function isRecord2(value) {
+  function isRecord3(value) {
     return typeof value === "object" && value !== null;
   }
   function collectUrlCitations(value, sources) {
@@ -20118,7 +21737,7 @@ ${tools.map((tool) => buildToolLine(tool, mode)).filter(Boolean).join("\n")}
       for (const item of value) collectUrlCitations(item, sources);
       return;
     }
-    if (!isRecord2(value)) return;
+    if (!isRecord3(value)) return;
     if (value.type === "url_citation" && typeof value.url === "string") {
       sources.push(sourceFromUrl(value.url, typeof value.title === "string" ? value.title : void 0));
     }
@@ -20137,7 +21756,7 @@ ${tools.map((tool) => buildToolLine(tool, mode)).filter(Boolean).join("\n")}
       for (const item of value) collectOutputText(item, chunks);
       return;
     }
-    if (!isRecord2(value)) return;
+    if (!isRecord3(value)) return;
     if (value.type === "output_text" && typeof value.text === "string") {
       chunks.push(value.text);
       return;
@@ -20151,7 +21770,7 @@ ${tools.map((tool) => buildToolLine(tool, mode)).filter(Boolean).join("\n")}
     }
   }
   function extractOpenAIResponsesContent(response, originalQuery) {
-    const body = isRecord2(response) ? response : {};
+    const body = isRecord3(response) ? response : {};
     const sources = [];
     collectUrlCitations(body.output, sources);
     if (typeof body.output_text === "string" && body.output_text.trim()) {
@@ -20168,12 +21787,12 @@ ${tools.map((tool) => buildToolLine(tool, mode)).filter(Boolean).join("\n")}
     return { text, sources: uniqueSources(sources), results: text ? [makeTextSegment(text)] : [], actualQueries: [originalQuery] };
   }
   function extractChatCompletionsContent(response, originalQuery) {
-    const body = isRecord2(response) ? response : {};
+    const body = isRecord3(response) ? response : {};
     const sources = [];
     collectUrlCitations(body, sources);
     const choices = Array.isArray(body.choices) ? body.choices : [];
-    const firstChoice = isRecord2(choices[0]) ? choices[0] : {};
-    const message = isRecord2(firstChoice.message) ? firstChoice.message : {};
+    const firstChoice = isRecord3(choices[0]) ? choices[0] : {};
+    const message = isRecord3(firstChoice.message) ? firstChoice.message : {};
     const content = typeof message.content === "string" ? message.content : "";
     if (content) {
       collectUrlStrings(content, sources);
@@ -20985,7 +22604,7 @@ Perform a web search for the query: ${params.input.query}`
   var DEFAULT_WEB_RESEARCH_SEARCH_ATTEMPT_TIMEOUT_MS = 45e3;
   var DEFAULT_WEB_RESEARCH_FETCH_ATTEMPT_TIMEOUT_MS = 3e4;
   var DEFAULT_WEB_RESEARCH_BROWSER_ATTEMPT_TIMEOUT_MS = 45e3;
-  function isRecord3(value) {
+  function isRecord4(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function textFromResult(result) {
@@ -21199,7 +22818,7 @@ Perform a web search for the query: ${params.input.query}`
     return [...byKey.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 20);
   }
   function contentDetails(result) {
-    return isRecord3(result.details) ? result.details : {};
+    return isRecord4(result.details) ? result.details : {};
   }
   function excerpt(text, max = 1400) {
     const clean = text.replace(/\s+/g, " ").trim();
@@ -22573,6 +24192,19 @@ Actions: create, read, complete_current, clear.`;
 
   // src/tools/native-grep-text.ts
   var DEFAULT_LIMIT3 = 100;
+  function normalizeOutputMode(value) {
+    if (value === void 0 || value === null || value === "content") return "content";
+    if (value === "files_with_matches" || value === "count") return value;
+    throw new Error("Invalid grep_text arguments: outputMode must be one of content, files_with_matches, or count.");
+  }
+  function normalizeOffset(value) {
+    if (value === void 0 || value === null) return 0;
+    const numberValue = Number(value);
+    if (!Number.isInteger(numberValue) || numberValue < 0) {
+      throw new Error("Invalid grep_text arguments: offset must be a non-negative integer.");
+    }
+    return numberValue;
+  }
   function awaitTask2(task) {
     if (!puer?.$promise) {
       throw new Error("puer.$promise is not available");
@@ -22589,19 +24221,27 @@ Actions: create, read, complete_current, clear.`;
       ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search (default: false)" })),
       literal: Type.Optional(Type.Boolean({ description: "Treat pattern as plain text instead of regex (default: false). Use literal=true for normal substring searches like 'MonoBehaviour'." })),
       context: Type.Optional(Type.Number({ description: "Number of lines to show before and after each match (default: 0)" })),
+      outputMode: Type.Optional(Type.Union([
+        Type.Literal("content"),
+        Type.Literal("files_with_matches"),
+        Type.Literal("count")
+      ], { description: "Result mode: content returns matching lines, files_with_matches returns matching file paths, count returns per-file match counts." })),
+      offset: Type.Optional(Type.Number({ description: "Number of results to skip before returning output (default: 0)." })),
       limit: Type.Optional(Type.Number({ description: "Maximum number of matches to return (default: 100)" }))
     });
     const pathResolutionDescription = buildPathResolutionDescription(cwd, options);
     return {
       name: "grep_text",
       label: "grep_text",
-      description: `Search inside file contents. Use this when you know some text that should appear in the file. Common usage: pattern='MonoBehaviour', glob='*.cs', literal=true. Prefer targeted folders like 'Scripts' or 'Data' over scanning the whole project. ${pathResolutionDescription} Returns matching lines with file paths and line numbers. Output is truncated to ${DEFAULT_LIMIT3} matches or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Long lines are truncated to ${GREP_MAX_LINE_LENGTH} chars.`,
+      description: `Search inside file contents. Use this when you know some text that should appear in the file. Common usage: pattern='MonoBehaviour', glob='*.cs', literal=true. Prefer targeted folders like 'Scripts' or 'Data' over scanning the whole project. ${pathResolutionDescription} outputMode='content' returns matching lines, outputMode='files_with_matches' returns matching file paths, and outputMode='count' returns per-file match counts. Output is truncated to ${DEFAULT_LIMIT3} results or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Long lines are truncated to ${GREP_MAX_LINE_LENGTH} chars.`,
       parameters: grepSchema,
       execute: async (_toolCallId, params) => {
-        const { pattern, path: searchDir, root, glob, ignoreCase, literal, context, limit } = params ?? {};
+        const { pattern, path: searchDir, root, glob, ignoreCase, literal, context, outputMode: rawOutputMode, offset: rawOffset, limit } = params ?? {};
         const searchPath = resolveToCwd(searchDir || ".", cwd, options, root);
         const effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT3);
         const ctx = context && context > 0 ? context : 0;
+        const outputMode = normalizeOutputMode(rawOutputMode);
+        const offset = normalizeOffset(rawOffset);
         const pieGlobal = globalThis;
         if (pieGlobal.__pieVerboseLogs) {
           pieGlobal.pieBridge?.log?.(
@@ -22617,12 +24257,15 @@ Actions: create, read, complete_current, clear.`;
             !!ignoreCase,
             !!literal,
             ctx,
-            effectiveLimit
+            effectiveLimit,
+            outputMode,
+            offset
           )
         );
         const nativeResult = json ? JSON.parse(json) : {};
         const outputLines = nativeResult.Lines ?? [];
-        const matchCount = nativeResult.MatchCount ?? 0;
+        const matchCount = nativeResult.TotalMatches ?? nativeResult.MatchCount ?? 0;
+        const totalFilesWithMatches = nativeResult.TotalFilesWithMatches ?? 0;
         if (pieGlobal.__pieVerboseLogs) {
           pieGlobal.pieBridge?.log?.(
             "info",
@@ -22634,7 +24277,13 @@ Actions: create, read, complete_current, clear.`;
             content: [{ type: "text", text: "No matches found" }],
             details: {
               noMatches: true,
+              outputMode,
+              totalMatches: 0,
+              totalFilesWithMatches: 0,
               filesScanned: nativeResult.FilesScanned ?? 0,
+              offset,
+              limit: effectiveLimit,
+              resultLimitReached: false,
               effectivePattern: nativeResult.Pattern ?? pattern,
               searchPath: nativeResult.SearchPath ?? searchPath,
               glob: nativeResult.Glob ?? glob,
@@ -22647,16 +24296,22 @@ Actions: create, read, complete_current, clear.`;
         const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
         let output = truncation.content;
         const details = {
+          outputMode,
+          totalMatches: matchCount,
+          totalFilesWithMatches,
           filesScanned: nativeResult.FilesScanned,
+          offset,
+          limit: effectiveLimit,
           effectivePattern: nativeResult.Pattern ?? pattern,
           searchPath: nativeResult.SearchPath ?? searchPath,
           glob: nativeResult.Glob ?? glob,
           literal: nativeResult.Literal ?? !!literal,
-          ignoreCase: nativeResult.IgnoreCase ?? !!ignoreCase
+          ignoreCase: nativeResult.IgnoreCase ?? !!ignoreCase,
+          resultLimitReached: !!(nativeResult.ResultLimitReached || nativeResult.MatchLimitReached)
         };
         const notices = [];
-        if (nativeResult.MatchLimitReached) {
-          notices.push(`${effectiveLimit} matches limit reached`);
+        if (nativeResult.MatchLimitReached || nativeResult.ResultLimitReached) {
+          notices.push(outputMode === "content" ? `${effectiveLimit} matches limit reached. Use offset=${offset + effectiveLimit} for more, increase limit, or refine pattern` : `${effectiveLimit} results limit reached. Use offset=${offset + effectiveLimit} for more, increase limit, or refine pattern`);
           details.matchLimitReached = effectiveLimit;
         }
         if (truncation.truncated) {
@@ -22738,7 +24393,7 @@ Actions: create, read, complete_current, clear.`;
     }
     return String(value);
   }
-  function isRecord4(value) {
+  function isRecord5(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function createScriptHostError(code, message) {
@@ -22747,7 +24402,7 @@ Actions: create, read, complete_current, clear.`;
     return error;
   }
   function extractRefs(value) {
-    if (!isRecord4(value)) return [];
+    if (!isRecord5(value)) return [];
     if (Array.isArray(value.results)) return value.results;
     if (Array.isArray(value.createdRefs)) return value.createdRefs;
     if (value.target) return [value.target];
@@ -22760,7 +24415,7 @@ Actions: create, read, complete_current, clear.`;
     return String(source || "").replace(/\b(for|while)\s*\(([^)]*)\)\s*\{/g, (_match, keyword, header) => `${keyword} (${header}) { __pieStepGuard(); `).replace(/\bdo\s*\{/g, "do { __pieStepGuard(); ").replace(/\b(for|while)\s*\(([^)]*)\)\s*([^\s{][\s\S]*?;)/g, (_match, keyword, header, statement) => `${keyword} (${header}) { __pieStepGuard(); ${statement} }`).replace(/\bdo\s*([^\s{][\s\S]*?;)\s*while\s*\(([^)]*)\)/g, (_match, statement, header) => `do { __pieStepGuard(); ${statement} } while (${header})`);
   }
   function isStepTimeoutError(error) {
-    return isRecord4(error) && (error.code === STEP_TIMEOUT_ERROR_CODE || error.name === "PieStepTimeoutError");
+    return isRecord5(error) && (error.code === STEP_TIMEOUT_ERROR_CODE || error.name === "PieStepTimeoutError");
   }
   function buildStatus(task) {
     const done = task.status === "completed" || task.status === "failed" || task.status === "cancelled";
@@ -23043,7 +24698,7 @@ Actions: create, read, complete_current, clear.`;
           }
           return safeSerializeRuntimeValue(result);
         } catch (error) {
-          if (isRecord4(error) && typeof error.code === "string") {
+          if (isRecord5(error) && typeof error.code === "string") {
             throw error;
           }
           throw createScriptHostError("RUNTIME_CALL_FAILED", error instanceof Error ? error.message : String(error));
@@ -23139,7 +24794,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       throw new Error(`Script must define export function* ${entryName}(ctx, args).`);
     }
     const iterator = entry(ctx, args);
-    if (!isRecord4(iterator) || typeof iterator.next !== "function") {
+    if (!isRecord5(iterator) || typeof iterator.next !== "function") {
       throw new Error(`Script entry ${entryName} must be a generator function. Use export function* ${entryName}(ctx, args) and yield ctx.nextFrame() for long work.`);
     }
     return iterator;
@@ -23147,7 +24802,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   function interpretYield(task, value) {
     task.waitFrames = 1;
     task.waitUntilMs = 0;
-    if (!isRecord4(value)) return;
+    if (!isRecord5(value)) return;
     if (value.type === "waitFrames") {
       task.waitFrames = Math.max(1, Math.floor(Number(value.frames) || 1));
       return;
@@ -23205,7 +24860,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       interpretYield(task, next?.value);
     } catch (error) {
       const stepTimeout = isStepTimeoutError(error);
-      const explicitCode = isRecord4(error) && typeof error.code === "string" ? String(error.code) : "";
+      const explicitCode = isRecord5(error) && typeof error.code === "string" ? String(error.code) : "";
       failTask(
         task,
         stepTimeout ? "STEP_TIMEOUT" : explicitCode || "SCRIPT_ERROR",
@@ -23244,7 +24899,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       pendingInput: null,
       waiters: []
     };
-    const args = isRecord4(payload.args) ? payload.args : {};
+    const args = isRecord5(payload.args) ? payload.args : {};
     const ctx = createTaskContext(bridge2, task, args);
     task.iterator = compileRunIterator(script, String(payload.entry || "run"), ctx, args, task);
     getRunStore().set(task.id, task);
@@ -23278,7 +24933,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     globalThis.__pieUnityScriptHost = {
       invoke(method, argsJson) {
         const parsedPayload = argsJson ? JSON.parse(String(argsJson)) : {};
-        const payload = isRecord4(parsedPayload) ? parsedPayload : {};
+        const payload = isRecord5(parsedPayload) ? parsedPayload : {};
         switch (String(method || "")) {
           case "run_start": {
             if (!installedBridge) throw new Error("Unity script host bridge is not installed.");
@@ -23835,22 +25490,27 @@ ${extensionSection.join("\n\n---\n\n")}
         ...skillAccessRoots
       ]
     };
+    const fileObservationState = createFileObservationState();
+    const observedFileToolPathOptions = {
+      ...fileToolPathOptions2,
+      fileObservationState
+    };
     const builtinFileTools = [
       aliasTool(
         createReadTool(fileToolRoot, {
-          ...fileToolPathOptions2,
+          ...observedFileToolPathOptions,
           understandFile: params.understandFile
         }),
         "read_file",
         "read_file"
       ),
       aliasTool(
-        createWriteTool(fileToolRoot, fileToolPathOptions2),
+        createWriteTool(fileToolRoot, observedFileToolPathOptions),
         "write_file",
         "write_file"
       ),
       aliasTool(
-        createEditTool(fileToolRoot, fileToolPathOptions2),
+        createEditTool(fileToolRoot, observedFileToolPathOptions),
         "edit_file",
         "edit_file",
         "Edit an existing file by replacing exact oldText with newText. Read the file first so oldText matches exactly."
@@ -24991,11 +26651,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   function assistantEventField(event, field) {
     return event && typeof event === "object" && field in event ? String(event[field] ?? "") : "";
   }
-  function isRecord5(value) {
+  function isRecord6(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function routeMetaFromToolResult(toolName, result) {
-    const details = isRecord5(result) && isRecord5(result.details) ? result.details : void 0;
+    const details = isRecord6(result) && isRecord6(result.details) ? result.details : void 0;
     if (!details) return null;
     if (toolName === "web_search") {
       return {
@@ -25010,7 +26670,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         attempts: Array.isArray(details.attempts) ? details.attempts.length : void 0
       };
     }
-    if (toolName === "read_file" && isRecord5(details.understanding)) {
+    if (toolName === "read_file" && isRecord6(details.understanding)) {
       const understanding = details.understanding;
       return {
         toolName,
@@ -25222,11 +26882,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   }
 
   // src/unity-public-api.ts
-  function isRecord6(value) {
+  function isRecord7(value) {
     return typeof value === "object" && value !== null;
   }
   function stringField(value, key) {
-    return isRecord6(value) && typeof value[key] === "string" ? value[key] : void 0;
+    return isRecord7(value) && typeof value[key] === "string" ? value[key] : void 0;
   }
   function installUnityPublicApi(host) {
     globalThis.pie = {
@@ -25262,8 +26922,8 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               const provider = stringField(data, "provider") || "";
               const model = stringField(data, "model") || "";
               const baseUrl = stringField(data, "baseUrl");
-              const verboseLogs = isRecord6(data) && data.verboseLogs === true;
-              if (isRecord6(data) && data.verboseLogs !== void 0) host.setVerboseLogs(verboseLogs);
+              const verboseLogs = isRecord7(data) && data.verboseLogs === true;
+              if (isRecord7(data) && data.verboseLogs !== void 0) host.setVerboseLogs(verboseLogs);
               host.setModelSelection(provider, model, apiKey, baseUrl);
               host.applyModelSelectionSync(provider, model);
               host.bridge.sendToUnity("config_applied", host.getModelStatus());
@@ -25284,7 +26944,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               host.bridge.log("info", `[pie/index] resume_session ${sessionId}`);
               const loaded = await host.loadSession(host.projectRoot, sessionId);
               if (loaded) {
-                const recoverInterrupted = isRecord6(data) && data.recoverInterrupted === true;
+                const recoverInterrupted = isRecord7(data) && data.recoverInterrupted === true;
                 const lastUserText = stringField(data, "lastUserText") || "";
                 host.restoreSessionRecord(recoverInterrupted ? host.trimInterruptedTail(loaded, lastUserText) : loaded);
               } else {
@@ -25382,7 +27042,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   }
 
   // src/unity-local-commands.ts
-  function isRecord7(value) {
+  function isRecord8(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function tryExplainExternalSessionId(host, sessionId) {
@@ -25398,7 +27058,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }
     try {
       const registry2 = JSON.parse(String(CS.System.IO.File.ReadAllText(registryPath) || "{}"));
-      const entries = Object.values(isRecord7(registry2) ? registry2 : {});
+      const entries = Object.values(isRecord8(registry2) ? registry2 : {});
       const matched = entries.find((entry) => String(entry.id || "") === trimmed);
       if (!matched) {
         return null;
@@ -25410,7 +27070,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         for (let index = 0; index < Math.min(files.Length, 8); index += 1) {
           try {
             const parsed = JSON.parse(String(CS.System.IO.File.ReadAllText(files[index]) || "{}"));
-            const metadata = isRecord7(parsed) && isRecord7(parsed.metadata) ? parsed.metadata : parsed;
+            const metadata = isRecord8(parsed) && isRecord8(parsed.metadata) ? parsed.metadata : parsed;
             const id = String(metadata.id || "").trim();
             if (!id) continue;
             const title = String(metadata.name || metadata.title || "Untitled Session");
@@ -25967,11 +27627,11 @@ ${initialAgentsFile}`);
   }
 
   // src/session-message-utils.ts
-  function isRecord8(value) {
+  function isRecord9(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function hasRealUsage(usage) {
-    if (!isRecord8(usage)) return false;
+    if (!isRecord9(usage)) return false;
     return Number(usage.input || 0) > 0 || Number(usage.output || 0) > 0 || Number(usage.cacheRead || 0) > 0 || Number(usage.cacheWrite || 0) > 0 || Number(usage.totalTokens || 0) > 0;
   }
   function estimateTokensFromText(text) {
@@ -25981,12 +27641,12 @@ ${initialAgentsFile}`);
   }
   function collectMessageText(message) {
     if (!message) return "";
-    if (!isRecord8(message)) return "";
+    if (!isRecord9(message)) return "";
     const content = message.content;
     if (typeof content === "string") return content;
     if (!Array.isArray(content)) return "";
     return content.map((block) => {
-      if (!isRecord8(block)) return "";
+      if (!isRecord9(block)) return "";
       if (block.type === "text") return typeof block.text === "string" ? block.text : "";
       if (block.type === "thinking") return typeof block.thinking === "string" ? block.thinking : "";
       if (block.type === "toolCall") {
@@ -25998,9 +27658,9 @@ ${initialAgentsFile}`);
     }).join("");
   }
   function buildUsagePayload(messages, message, fallbackIndex) {
-    const messageRecord = isRecord8(message) ? message : {};
+    const messageRecord = isRecord9(message) ? message : {};
     const usage = messageRecord.usage;
-    if (hasRealUsage(usage) && isRecord8(usage)) {
+    if (hasRealUsage(usage) && isRecord9(usage)) {
       return {
         input: Number(usage.input || 0),
         output: Number(usage.output || 0),
@@ -26265,7 +27925,7 @@ ${initialAgentsFile}`);
     todoTool.restore(record.todoState || []);
     refreshTodoLoopState();
   }
-  function isRecord9(value) {
+  function isRecord10(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function cloneMessage(message) {
@@ -26361,10 +28021,10 @@ ${initialAgentsFile}`);
     const sourceRecord = record || _currentSession;
     const stateMessages = Array.isArray(sourceRecord?.messages) ? sourceRecord.messages : agent.state.messages || [];
     const messages = stateMessages.map((message, index) => {
-      const messageRecord = isRecord9(message) ? message : {};
+      const messageRecord = isRecord10(message) ? message : {};
       return {
         role: String(messageRecord.role || "assistant"),
-        content: Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord9(block)).map((block) => ({
+        content: Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord10(block)).map((block) => ({
           type: String(block.type || "text"),
           text: typeof block.text === "string" ? block.text : ""
         })) : [],
@@ -26413,14 +28073,14 @@ ${initialAgentsFile}`);
   function extractToolText(result) {
     if (!result) return "";
     if (typeof result === "string") return result;
-    if (isRecord9(result) && Array.isArray(result.content)) {
-      return result.content.filter((item) => isRecord9(item) && item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
+    if (isRecord10(result) && Array.isArray(result.content)) {
+      return result.content.filter((item) => isRecord10(item) && item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
     }
     return "";
   }
   function extractEffectiveArgs(toolName, args, details) {
-    const argRecord = isRecord9(args) ? args : {};
-    const detailRecord = isRecord9(details) ? details : {};
+    const argRecord = isRecord10(args) ? args : {};
+    const detailRecord = isRecord10(details) ? details : {};
     if (toolName === "find_files") {
       return {
         rawPattern: detailRecord.rawPattern ?? argRecord.pattern ?? argRecord.query ?? argRecord.name ?? argRecord.file_name ?? "",

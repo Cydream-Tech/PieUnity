@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Threading;
@@ -46,6 +47,12 @@ namespace Pie
             public bool MatchLimitReached;
             public bool LinesTruncated;
             public int FilesScanned;
+            public int TotalMatches;
+            public int TotalFilesWithMatches;
+            public bool ResultLimitReached;
+            public string OutputMode;
+            public int Offset;
+            public int Limit;
             public string Pattern;
             public string SearchPath;
             public string Glob;
@@ -61,6 +68,26 @@ namespace Pie
             public bool IsFile;
             public long Size;
             public long LastWriteTicksUtc;
+        }
+
+        [Serializable]
+        public sealed class TextRangeReadResult
+        {
+            public string Content;
+            public string ContentHash;
+            public string SelectedContentHash;
+            public int TotalLines;
+            public long TotalBytes;
+            public int SelectedLines;
+            public long SelectedBytes;
+            public long FirstLineBytes;
+            public int OutputLines;
+            public long OutputBytes;
+            public bool Truncated;
+            public string TruncatedBy;
+            public bool FirstLineExceedsLimit;
+            public long LastWriteTicksUtc;
+            public long Size;
         }
 
         private static readonly ConcurrentDictionary<int, RequestState> _requests =
@@ -89,6 +116,11 @@ namespace Pie
         public static Task<string> ReadAllTextAsync(string path)
         {
             return Task.Run(() => File.ReadAllText(path));
+        }
+
+        public static Task<string> ReadTextRangeAsync(string path, int offsetLine, int limitLines, int maxOutputLines, int maxOutputBytes)
+        {
+            return Task.Run(() => JsonUtility.ToJson(ExecuteReadTextRange(path, offsetLine, limitLines, maxOutputLines, maxOutputBytes)));
         }
 
         public static Task<string> ReadAllBytesBase64Async(string path)
@@ -167,6 +199,253 @@ namespace Pie
             return Task.Run(() => File.Delete(path));
         }
 
+        private static TextRangeReadResult ExecuteReadTextRange(string path, int offsetLine, int limitLines, int maxOutputLines, int maxOutputBytes)
+        {
+            var info = new FileInfo(path);
+            var startLine = Math.Max(0, offsetLine);
+            var endLine = limitLines < 0 ? int.MaxValue : startLine + Math.Max(0, limitLines);
+            var outputLineLimit = maxOutputLines < 0 ? int.MaxValue : Math.Max(0, maxOutputLines);
+            var outputByteLimit = maxOutputBytes < 0 ? int.MaxValue : Math.Max(0, maxOutputBytes);
+            var fullHash = new FnvaTextHash();
+            var selectedHash = new FnvaTextHash();
+            var outputLines = new List<string>();
+            var currentOutputLine = new StringBuilder();
+            var buffer = new char[8192];
+            bool lineStarted = false;
+            bool currentLineSelected = false;
+            bool currentLineCanOutput = false;
+            long currentLineBytes = 0;
+            long currentOutputLineBytes = 0;
+            long currentOutputPrefixBytes = 0;
+            int lineIndex = 0;
+            int selectedLines = 0;
+            long selectedBytes = 0;
+            long firstLineBytes = 0;
+            long outputBytes = 0;
+            bool truncated = false;
+            string truncatedBy = null;
+            bool firstLineExceedsLimit = false;
+
+            void StartLine()
+            {
+                if (lineStarted)
+                    return;
+
+                currentLineSelected = lineIndex >= startLine && lineIndex < endLine;
+                currentLineCanOutput = false;
+                currentLineBytes = 0;
+                currentOutputLineBytes = 0;
+                currentOutputPrefixBytes = outputLines.Count > 0 ? 1 : 0;
+                currentOutputLine.Length = 0;
+                lineStarted = true;
+
+                if (!currentLineSelected)
+                    return;
+
+                if (selectedLines > 0)
+                {
+                    selectedHash.Update("\n");
+                    selectedBytes += 1;
+                }
+
+                if (!truncated && !firstLineExceedsLimit)
+                {
+                    if (outputLines.Count >= outputLineLimit)
+                    {
+                        truncated = true;
+                        truncatedBy = "lines";
+                    }
+                    else
+                    {
+                        currentLineCanOutput = true;
+                    }
+                }
+            }
+
+            void ScanLineText(string textElement)
+            {
+                StartLine();
+                if (!currentLineSelected)
+                    return;
+
+                selectedHash.Update(textElement);
+                var elementBytes = Encoding.UTF8.GetByteCount(textElement);
+                currentLineBytes += elementBytes;
+                selectedBytes += elementBytes;
+
+                if (selectedLines == 0 && currentLineBytes > outputByteLimit)
+                {
+                    firstLineExceedsLimit = true;
+                    truncated = true;
+                    truncatedBy = "bytes";
+                    currentLineCanOutput = false;
+                    currentOutputLine.Length = 0;
+                    currentOutputLineBytes = 0;
+                    return;
+                }
+
+                if (!currentLineCanOutput)
+                    return;
+
+                var candidateBytes = outputBytes + currentOutputPrefixBytes + currentOutputLineBytes + elementBytes;
+                if (candidateBytes > outputByteLimit)
+                {
+                    truncated = true;
+                    truncatedBy = "bytes";
+                    currentLineCanOutput = false;
+                    currentOutputLine.Length = 0;
+                    currentOutputLineBytes = 0;
+                    return;
+                }
+
+                currentOutputLine.Append(textElement);
+                currentOutputLineBytes += elementBytes;
+            }
+
+            void FinishLine()
+            {
+                StartLine();
+                if (currentLineSelected)
+                {
+                    if (selectedLines == 0)
+                        firstLineBytes = currentLineBytes;
+                    if (currentLineCanOutput)
+                    {
+                        var candidateBytes = outputBytes + currentOutputPrefixBytes + currentOutputLineBytes;
+                        if (candidateBytes > outputByteLimit)
+                        {
+                            truncated = true;
+                            truncatedBy = "bytes";
+                            currentLineCanOutput = false;
+                        }
+                        else
+                        {
+                            outputLines.Add(currentOutputLine.ToString());
+                            outputBytes = candidateBytes;
+                        }
+                    }
+                    selectedLines++;
+                }
+                lineStarted = false;
+                lineIndex++;
+            }
+
+            char? pendingHighSurrogate = null;
+
+            void FlushPendingHighSurrogate()
+            {
+                if (!pendingHighSurrogate.HasValue)
+                    return;
+
+                ScanLineText(pendingHighSurrogate.Value.ToString());
+                pendingHighSurrogate = null;
+            }
+
+            using (var reader = new StreamReader(path, Encoding.UTF8, true))
+            {
+                int read;
+                while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
+                {
+                    for (int i = 0; i < read; i++)
+                    {
+                        var ch = buffer[i];
+                        fullHash.Update(ch);
+                        if (pendingHighSurrogate.HasValue)
+                        {
+                            if (char.IsLowSurrogate(ch))
+                            {
+                                ScanLineText(new string(new[] { pendingHighSurrogate.Value, ch }));
+                                pendingHighSurrogate = null;
+                                continue;
+                            }
+                            FlushPendingHighSurrogate();
+                        }
+
+                        if (ch == '\n')
+                        {
+                            FinishLine();
+                        }
+                        else if (char.IsHighSurrogate(ch))
+                        {
+                            pendingHighSurrogate = ch;
+                        }
+                        else
+                        {
+                            ScanLineText(ch.ToString());
+                        }
+                    }
+                }
+            }
+
+            FlushPendingHighSurrogate();
+            FinishLine();
+
+            return new TextRangeReadResult
+            {
+                Content = string.Join("\n", outputLines),
+                ContentHash = fullHash.Digest(),
+                SelectedContentHash = selectedHash.Digest(),
+                TotalLines = lineIndex,
+                TotalBytes = info.Length,
+                SelectedLines = selectedLines,
+                SelectedBytes = selectedBytes,
+                FirstLineBytes = firstLineBytes,
+                OutputLines = outputLines.Count,
+                OutputBytes = outputBytes,
+                Truncated = truncated,
+                TruncatedBy = truncatedBy,
+                FirstLineExceedsLimit = firstLineExceedsLimit,
+                LastWriteTicksUtc = info.LastWriteTimeUtc.Ticks,
+                Size = info.Length,
+            };
+        }
+
+        private struct FnvaTextHash
+        {
+            private uint _hash;
+            private bool _initialized;
+
+            private void EnsureInitialized()
+            {
+                if (!_initialized)
+                {
+                    _hash = 0x811c9dc5;
+                    _initialized = true;
+                }
+            }
+
+            public void Update(char ch)
+            {
+                EnsureInitialized();
+                unchecked
+                {
+                    _hash ^= ch;
+                    _hash *= 0x01000193;
+                }
+            }
+
+            public void Update(string text)
+            {
+                EnsureInitialized();
+                if (text == null)
+                    return;
+                for (int i = 0; i < text.Length; i++)
+                {
+                    unchecked
+                    {
+                        _hash ^= text[i];
+                        _hash *= 0x01000193;
+                    }
+                }
+            }
+
+            public string Digest()
+            {
+                EnsureInitialized();
+                return _hash.ToString("x8");
+            }
+        }
+
         public static Task<string> FindAsync(string rootPath, string pattern, int limit)
         {
             return Task.Run(() =>
@@ -183,13 +462,13 @@ namespace Pie
             });
         }
 
-        public static Task<string> GrepAsync(string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit)
+        public static Task<string> GrepAsync(string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset)
         {
             return Task.Run(() =>
             {
                 try
                 {
-                    var payload = ExecuteGrep(searchPath, pattern, globPattern, ignoreCase, literal, contextLines, limit, CancellationToken.None);
+                    var payload = ExecuteGrep(searchPath, pattern, globPattern, ignoreCase, literal, contextLines, limit, outputMode, offset, CancellationToken.None);
                     return JsonUtility.ToJson(payload);
                 }
                 catch (RegexMatchTimeoutException ex)
@@ -210,14 +489,14 @@ namespace Pie
             return id;
         }
 
-        public static int StartGrep(string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit)
+        public static int StartGrep(string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset)
         {
             int id = Interlocked.Increment(ref _nextRequestId);
             var state = new RequestState(id);
             _requests[id] = state;
 
             PieDiagnostics.Verbose($"[PieFileBridge] grep_text start path={searchPath} pattern={pattern} glob={globPattern} limit={limit}");
-            Task.Run(() => RunGrep(state, searchPath, pattern, globPattern, ignoreCase, literal, contextLines, limit));
+            Task.Run(() => RunGrep(state, searchPath, pattern, globPattern, ignoreCase, literal, contextLines, limit, outputMode, offset));
             return id;
         }
 
@@ -315,11 +594,11 @@ namespace Pie
             }
         }
 
-        private static void RunGrep(RequestState state, string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit)
+        private static void RunGrep(RequestState state, string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset)
         {
             try
             {
-                var payload = ExecuteGrep(searchPath, pattern, globPattern, ignoreCase, literal, contextLines, limit, state.Cts.Token);
+                var payload = ExecuteGrep(searchPath, pattern, globPattern, ignoreCase, literal, contextLines, limit, outputMode, offset, state.Cts.Token);
                 state.ResultJson = JsonUtility.ToJson(payload);
                 PieDiagnostics.Verbose($"[PieFileBridge] grep_text done pattern={pattern} matches={payload.MatchCount} files={payload.FilesScanned}");
             }
@@ -408,8 +687,11 @@ namespace Pie
                     var relativePath = MakeRelativePath(rootPath, entryPath);
                     if (MatchesFindPattern(relativePath, entryName, pattern))
                     {
-                        results.Add(relativePath);
-                        if (results.Count >= limit)
+                        if (results.Count < limit)
+                        {
+                            results.Add(relativePath);
+                        }
+                        else
                         {
                             limitReached = true;
                             break;
@@ -432,7 +714,21 @@ namespace Pie
             };
         }
 
-        private static GrepRequestResult ExecuteGrep(string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit, CancellationToken token)
+        private sealed class GrepMatchRecord
+        {
+            public string RelativePath;
+            public int LineIndex;
+            public string[] Lines;
+        }
+
+        private sealed class GrepFileSummary
+        {
+            public string RelativePath;
+            public int MatchCount;
+            public long LastWriteTicksUtc;
+        }
+
+        private static GrepRequestResult ExecuteGrep(string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset, CancellationToken token)
         {
             if (string.IsNullOrWhiteSpace(searchPath))
                 throw new ArgumentException("Search path must not be empty");
@@ -445,9 +741,14 @@ namespace Pie
             var regex = BuildRegex(pattern, ignoreCase, literal);
             var files = isDirectory ? CollectSearchFiles(searchPath, globPattern, token) : new List<string> { searchPath };
             files.Sort(StringComparer.OrdinalIgnoreCase);
+            var mode = NormalizeGrepOutputMode(outputMode);
+            var effectiveOffset = Math.Max(0, offset);
+            var effectiveLimit = Math.Max(1, limit);
 
             var outputLines = new List<string>();
-            int matchCount = 0;
+            var contentMatches = new List<GrepMatchRecord>();
+            var fileSummaries = new List<GrepFileSummary>();
+            int totalMatches = 0;
             bool matchLimitReached = false;
             bool linesTruncated = false;
             int filesScanned = 0;
@@ -455,12 +756,6 @@ namespace Pie
             foreach (var filePath in files)
             {
                 token.ThrowIfCancellationRequested();
-
-                if (matchCount >= limit)
-                {
-                    matchLimitReached = true;
-                    break;
-                }
 
                 string content;
                 try
@@ -475,25 +770,48 @@ namespace Pie
                 filesScanned++;
                 var lines = content.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
                 var relativePath = isDirectory ? MakeRelativePath(searchPath, filePath) : Path.GetFileName(filePath);
+                int fileMatchCount = 0;
 
                 for (int lineIdx = 0; lineIdx < lines.Length; lineIdx++)
                 {
-                    if (matchCount >= limit)
-                    {
-                        matchLimitReached = true;
-                        break;
-                    }
-
                     if (!regex.IsMatch(lines[lineIdx]))
                         continue;
 
-                    matchCount++;
-                    int start = contextLines > 0 ? Math.Max(0, lineIdx - contextLines) : lineIdx;
-                    int end = contextLines > 0 ? Math.Min(lines.Length - 1, lineIdx + contextLines) : lineIdx;
+                    totalMatches++;
+                    fileMatchCount++;
+                    if (mode == "content" && totalMatches > effectiveOffset && totalMatches <= effectiveOffset + effectiveLimit)
+                    {
+                        contentMatches.Add(new GrepMatchRecord
+                        {
+                            RelativePath = relativePath,
+                            LineIndex = lineIdx,
+                            Lines = lines,
+                        });
+                    }
+                }
+
+                if (fileMatchCount > 0)
+                {
+                    fileSummaries.Add(new GrepFileSummary
+                    {
+                        RelativePath = relativePath,
+                        MatchCount = fileMatchCount,
+                        LastWriteTicksUtc = File.GetLastWriteTimeUtc(filePath).Ticks,
+                    });
+                }
+            }
+
+            if (mode == "content")
+            {
+                matchLimitReached = totalMatches > effectiveOffset + effectiveLimit;
+                foreach (var match in contentMatches.Take(effectiveLimit))
+                {
+                    int start = contextLines > 0 ? Math.Max(0, match.LineIndex - contextLines) : match.LineIndex;
+                    int end = contextLines > 0 ? Math.Min(match.Lines.Length - 1, match.LineIndex + contextLines) : match.LineIndex;
 
                     for (int c = start; c <= end; c++)
                     {
-                        string lineText = lines[c];
+                        string lineText = match.Lines[c];
                         if (lineText.Length > GrepMaxLineLength)
                         {
                             lineText = lineText.Substring(0, GrepMaxLineLength) + "...";
@@ -501,21 +819,47 @@ namespace Pie
                         }
 
                         int currentLineNum = c + 1;
-                        if (c == lineIdx)
-                            outputLines.Add(relativePath + ":" + currentLineNum + ": " + lineText);
+                        if (c == match.LineIndex)
+                            outputLines.Add(match.RelativePath + ":" + currentLineNum + ": " + lineText);
                         else
-                            outputLines.Add(relativePath + "-" + currentLineNum + "- " + lineText);
+                            outputLines.Add(match.RelativePath + "-" + currentLineNum + "- " + lineText);
                     }
+                }
+            }
+            else
+            {
+                var sortedSummaries = fileSummaries
+                    .OrderByDescending(summary => summary.LastWriteTicksUtc)
+                    .ThenBy(summary => summary.RelativePath, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                var page = sortedSummaries.Skip(effectiveOffset).Take(effectiveLimit).ToList();
+                matchLimitReached = effectiveOffset + effectiveLimit < sortedSummaries.Count;
+
+                if (mode == "files_with_matches")
+                {
+                    outputLines.AddRange(page.Select(summary => summary.RelativePath));
+                }
+                else
+                {
+                    outputLines.Add("Total matches: " + totalMatches);
+                    outputLines.Add("Files with matches: " + sortedSummaries.Count);
+                    outputLines.AddRange(page.Select(summary => summary.RelativePath + ": " + summary.MatchCount));
                 }
             }
 
             return new GrepRequestResult
             {
                 Lines = outputLines.ToArray(),
-                MatchCount = matchCount,
+                MatchCount = totalMatches,
                 MatchLimitReached = matchLimitReached,
                 LinesTruncated = linesTruncated,
                 FilesScanned = filesScanned,
+                TotalMatches = totalMatches,
+                TotalFilesWithMatches = fileSummaries.Count,
+                ResultLimitReached = matchLimitReached,
+                OutputMode = mode,
+                Offset = effectiveOffset,
+                Limit = effectiveLimit,
                 Pattern = pattern,
                 SearchPath = searchPath,
                 Glob = globPattern,
@@ -596,6 +940,15 @@ namespace Pie
                 options |= RegexOptions.IgnoreCase;
 
             return new Regex(pattern, options, TimeSpan.FromMilliseconds(RegexTimeoutMs));
+        }
+
+        private static string NormalizeGrepOutputMode(string outputMode)
+        {
+            if (string.IsNullOrWhiteSpace(outputMode) || outputMode == "content")
+                return "content";
+            if (outputMode == "files_with_matches" || outputMode == "count")
+                return outputMode;
+            throw new ArgumentException("Invalid grep_text arguments: outputMode must be one of content, files_with_matches, or count.");
         }
 
         private static bool MatchesSimpleGlob(string entryName, string globPattern)
