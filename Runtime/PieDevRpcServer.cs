@@ -182,7 +182,6 @@ namespace Pie
                         healthJson = BuildHealthJson(false, ex.Message);
                     }
                     WriteJson(context.Response, 200, healthJson);
-                    PieUnityCapabilitiesBootstrap.Heartbeat();
                     return;
                 }
 
@@ -204,7 +203,6 @@ namespace Pie
                     {
                         instances = PieUnityInstanceRegistry.ReadAll(),
                     }, true));
-                    PieUnityCapabilitiesBootstrap.Heartbeat();
                     return;
                 }
 
@@ -214,7 +212,6 @@ namespace Pie
                     query.TryGetValue("namespace", out var filterNamespace);
                     query.TryGetValue("name", out var filterName);
                     WriteJson(context.Response, 200, PieUnityCapabilityRegistry.BuildManifestJson(filterNamespace, filterName));
-                    PieUnityCapabilitiesBootstrap.Heartbeat();
                     return;
                 }
 
@@ -226,7 +223,6 @@ namespace Pie
                         ? HandleUnityScriptRunTool(toolBody, _cts != null ? _cts.Token : CancellationToken.None)
                         : PieDevRpcDispatcher.InvokeSync(() => BuildCapabilityEnvelope("tool", toolName, toolBody));
                     WriteJson(context.Response, 200, toolResponse);
-                    PieUnityCapabilitiesBootstrap.Heartbeat();
                     return;
                 }
 
@@ -240,7 +236,6 @@ namespace Pie
                 var body = ReadRequestBody(request);
                 var responseJson = PieDevRpcDispatcher.InvokeSync(() => BuildCapabilityEnvelope("rpc", method, body));
                 WriteJson(context.Response, 200, responseJson);
-                PieUnityCapabilitiesBootstrap.Heartbeat();
             }
             catch (ThreadAbortException)
             {
@@ -273,6 +268,9 @@ namespace Pie
             var hostDiagnostics = PieUnityCapabilityRegistry.GetRuntimeHostDiagnostics();
             var snapshot = PieUnityInstanceRegistry.GetCurrentProcessSnapshot(PieUnityCapabilityRegistry.ProjectPath);
             var owner = snapshot != null ? snapshot.discoverableOwner : null;
+            var playModeActive = mainThreadResponsive && IsPlayModeActive();
+            var isPlayingOrWillChangePlaymode = mainThreadResponsive && IsPlayingOrWillChangePlaymode();
+            var behaviorTreeActiveCount = mainThreadResponsive ? PieBehaviorTreeRuntime.GetActiveTreeCount() : 0;
             return JsonUtility.ToJson(new PieUnityHealthPayload
             {
                 instanceId = owner != null ? (owner.instanceId ?? "") : PieUnityCapabilityRegistry.InstanceId,
@@ -296,6 +294,9 @@ namespace Pie
                 runtimeActive = snapshot != null && snapshot.runtimeActive,
                 editorActive = snapshot != null && snapshot.editorActive,
                 editorSuppressedByRuntime = snapshot != null && snapshot.editorSuppressedByRuntime,
+                playModeActive = playModeActive,
+                isPlayingOrWillChangePlaymode = isPlayingOrWillChangePlaymode,
+                behaviorTreeActiveCount = behaviorTreeActiveCount,
                 registeredHostCount = registeredHostNamespaces.Length,
                 registeredHostNamespaces = registeredHostNamespaces,
                 hostCapabilityCount = PieUnityCapabilityRegistry.GetRuntimeHostCapabilityCount(),
@@ -308,6 +309,24 @@ namespace Pie
                     ? availability
                     : $"{{\"status\":\"temporarily_unavailable\",\"reason\":\"main_thread_timeout\",\"message\":\"Timed out waiting for Unity main thread: {EscapeJson(mainThreadError)}\"}}",
             });
+        }
+
+        private static bool IsPlayModeActive()
+        {
+#if UNITY_EDITOR
+            return UnityEditor.EditorApplication.isPlaying;
+#else
+            return Application.isPlaying;
+#endif
+        }
+
+        private static bool IsPlayingOrWillChangePlaymode()
+        {
+#if UNITY_EDITOR
+            return UnityEditor.EditorApplication.isPlayingOrWillChangePlaymode;
+#else
+            return Application.isPlaying;
+#endif
         }
 
         private static string BuildBridgeDiagnostic(bool bridgeReady, string bridgeLastError)

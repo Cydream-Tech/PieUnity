@@ -125,6 +125,9 @@ namespace Pie
         public bool runtimeActive = false;
         public bool editorActive = false;
         public bool editorSuppressedByRuntime = false;
+        public bool playModeActive = false;
+        public bool isPlayingOrWillChangePlaymode = false;
+        public int behaviorTreeActiveCount = 0;
         public int registeredHostCount = 0;
         public string[] registeredHostNamespaces = new string[0];
         public int hostCapabilityCount = 0;

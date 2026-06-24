@@ -13,6 +13,7 @@ namespace Pie
             public ManualResetEventSlim done;
             public string result;
             public Exception error;
+            public int state;
         }
 
         private static readonly ConcurrentQueue<WorkItem> Queue = new ConcurrentQueue<WorkItem>();
@@ -42,7 +43,10 @@ namespace Pie
 
             Queue.Enqueue(item);
             if (!item.done.Wait(timeoutMs))
+            {
+                Interlocked.CompareExchange(ref item.state, 2, 0);
                 throw new TimeoutException("Timed out waiting for Unity main thread.");
+            }
 
             if (item.error != null)
                 throw item.error;
@@ -54,6 +58,11 @@ namespace Pie
         {
             while (Queue.TryDequeue(out var item))
             {
+                if (Interlocked.CompareExchange(ref item.state, 1, 0) != 0)
+                {
+                    item.done.Set();
+                    continue;
+                }
                 try
                 {
                     item.result = item.action();

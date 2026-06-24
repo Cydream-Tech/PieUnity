@@ -225,7 +225,7 @@ namespace Pie
                 throw new InvalidOperationException("Cannot register a Unity instance without a valid identity.");
 
             Directory.CreateDirectory(PieUnityCapabilitiesConstants.InstancesDirectory);
-            var targetPath = BuildInstanceFilePath(instance.instanceId);
+            var targetPath = BuildInstanceFilePath(instance);
             var json = JsonUtility.ToJson(instance, true);
             var tempPath = targetPath + "." + System.Diagnostics.Process.GetCurrentProcess().Id + "." + Guid.NewGuid().ToString("N") + ".tmp";
 
@@ -299,9 +299,12 @@ namespace Pie
             return null;
         }
 
-        private static string BuildInstanceFilePath(string instanceId)
+        private static string BuildInstanceFilePath(PieUnityInstance instance)
         {
-            return Path.Combine(PieUnityCapabilitiesConstants.InstancesDirectory, instanceId + ".json");
+            var instanceId = instance != null ? (instance.instanceId ?? "") : "";
+            var pid = instance != null ? instance.pid : 0;
+            var port = instance != null ? instance.port : 0;
+            return Path.Combine(PieUnityCapabilitiesConstants.InstancesDirectory, instanceId + "_" + pid + "_" + port + ".json");
         }
 
         private static bool IsExpired(PieUnityInstance item, long now)
@@ -341,7 +344,12 @@ namespace Pie
         {
             if (string.IsNullOrWhiteSpace(instanceId))
                 return;
-            TryDeleteStaleFile(BuildInstanceFilePath(instanceId));
+            if (!Directory.Exists(PieUnityCapabilitiesConstants.InstancesDirectory))
+                return;
+            var pattern = instanceId + "*.json";
+            var filePaths = Directory.GetFiles(PieUnityCapabilitiesConstants.InstancesDirectory, pattern);
+            for (var i = 0; i < filePaths.Length; i++)
+                TryDeleteStaleFile(filePaths[i]);
         }
 
         private static void TryDeleteStaleFile(string filePath)

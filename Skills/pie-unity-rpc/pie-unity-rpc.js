@@ -63,7 +63,7 @@ export function loadRegistry(directoryPath = REGISTRY_DIR) {
 	} catch {
 		return [];
 	}
-	return filterDiscoverableInstances(dedupeInstances(items.filter(Boolean)));
+	return dedupeInstances(items.filter(Boolean));
 }
 
 export function getActiveInstances(instances, nowUnix = Math.floor(Date.now() / 1000)) {
@@ -97,6 +97,7 @@ function computeProjectMatchScore(requestedProject, candidateProject) {
 }
 
 function formatCandidate(item) {
+	const health = item?.__health || {};
 	return {
 		instanceId: String(item?.instanceId || ""),
 		projectPath: normalizePath(item?.projectPath || ""),
@@ -106,8 +107,19 @@ function formatCandidate(item) {
 		applicationIdentifier: String(item?.applicationIdentifier || ""),
 		mode: String(item?.mode || ""),
 		port: Number(item?.port || 0),
+		pid: Number(item?.pid || 0),
 		lastSeenUnix: Number(item?.lastSeenUnix || 0),
 		version: String(item?.version || item?.packageVersion || ""),
+		ready: health.ready === true,
+		mainThreadResponsive: health.mainThreadResponsive === true,
+		bridgeReady: health.bridgeReady === true,
+		scriptHostReady: health.scriptHostReady === true,
+		runtimeActive: health.runtimeActive === true,
+		editorActive: health.editorActive === true,
+		editorSuppressedByRuntime: health.editorSuppressedByRuntime === true,
+		playModeActive: health.playModeActive === true,
+		isPlayingOrWillChangePlaymode: health.isPlayingOrWillChangePlaymode === true,
+		behaviorTreeActiveCount: Number(health.behaviorTreeActiveCount || 0),
 	};
 }
 
@@ -129,6 +141,14 @@ export function selectInstance(instances, flags) {
 	const explicitPort = Number(flags.port || 0);
 
 	if (explicitPort > 0) {
+		const portMatches = activeInstances
+			.filter((item) => Number(item?.port || 0) === explicitPort)
+			.filter((item) => !instanceId || String(item?.instanceId || "") === instanceId)
+			.filter((item) => !project || computeProjectMatchScore(project, item?.projectPath || "") > 0)
+			.sort((left, right) => Number(right?.lastSeenUnix || 0) - Number(left?.lastSeenUnix || 0));
+		if (portMatches[0]) {
+			return portMatches[0];
+		}
 		return {
 			instanceId: instanceId || `port_${explicitPort}`,
 			projectPath: project,
@@ -196,11 +216,113 @@ export function selectInstance(instances, flags) {
 	);
 }
 
+export async function selectReadyInstance(instances, flags) {
+	const candidates = getSelectionCandidates(instances, flags);
+	const probed = await probeCandidateHealth(candidates, flags);
+	const ranked = rankInstancesByHealth(probed);
+	const healthy = ranked.filter((item) => item?.__health?.ready === true && item?.__health?.mainThreadResponsive === true);
+	if (healthy.length === 1) return healthy[0];
+	if (ranked.length === 1) return ranked[0];
+	return selectInstance(instances, flags);
+}
+
+function getSelectionCandidates(instances, flags) {
+	const activeInstances = getActiveInstances(instances);
+	const project = normalizePath(flags.project || "");
+	const instanceId = String(flags.instance || "").trim();
+	const explicitPort = Number(flags.port || 0);
+
+	if (explicitPort > 0) {
+		const portMatches = activeInstances
+			.filter((item) => Number(item?.port || 0) === explicitPort)
+			.filter((item) => !instanceId || String(item?.instanceId || "") === instanceId)
+			.filter((item) => !project || computeProjectMatchScore(project, item?.projectPath || "") > 0)
+			.sort((left, right) => Number(right?.lastSeenUnix || 0) - Number(left?.lastSeenUnix || 0));
+		return portMatches.length > 0 ? portMatches : [{
+			instanceId: instanceId || `port_${explicitPort}`,
+			projectPath: project,
+			port: explicitPort,
+			mode: "unknown",
+		}];
+	}
+
+	if (instanceId) {
+		const matches = activeInstances
+			.filter((item) => String(item.instanceId || "") === instanceId)
+			.filter((item) => !project || computeProjectMatchScore(project, item?.projectPath || "") > 0);
+		if (matches.length > 0) return matches;
+		throw buildSelectionError(
+			"PIE_UNITY_INSTANCE_NOT_FOUND",
+			`No pie-unity instance found for --instance ${instanceId}.`,
+			flags,
+			activeInstances,
+		);
+	}
+
+	if (project && activeInstances.length > 0) {
+		const scored = activeInstances
+			.map((item) => ({ item, score: computeProjectMatchScore(project, item.projectPath || "") }))
+			.filter((entry) => entry.score > 0)
+			.sort((left, right) => right.score - left.score || Number(right.item.lastSeenUnix || 0) - Number(left.item.lastSeenUnix || 0));
+		if (scored.length > 0) {
+			const bestScore = scored[0].score;
+			return scored.filter((entry) => entry.score === bestScore).map((entry) => entry.item);
+		}
+	}
+
+	return activeInstances;
+}
+
+async function probeCandidateHealth(candidates, flags) {
+	const next = [];
+	for (const instance of candidates) {
+		const health = await probeInstanceHealth(instance, flags);
+		next.push({ ...instance, __health: health });
+	}
+	return next;
+}
+
+async function probeInstanceHealth(instance, flags) {
+	const port = Number(instance?.port || 0);
+	if (port <= 0) return { ready: false, mainThreadResponsive: false };
+	try {
+		return normalizeEnvelope(await requestJson(`http://127.0.0.1:${port}/health`, {}, {
+			...flags,
+			retries: 1,
+			waitMs: 100,
+			token: "",
+		}));
+	} catch (error) {
+		return {
+			ready: false,
+			mainThreadResponsive: false,
+			error: error?.message || String(error || ""),
+		};
+	}
+}
+
+function rankInstancesByHealth(instances) {
+	return [...instances].sort((left, right) => {
+		const leftHealth = left?.__health || {};
+		const rightHealth = right?.__health || {};
+		const leftReady = leftHealth.ready === true && leftHealth.mainThreadResponsive === true ? 1 : 0;
+		const rightReady = rightHealth.ready === true && rightHealth.mainThreadResponsive === true ? 1 : 0;
+		if (leftReady !== rightReady) return rightReady - leftReady;
+		const leftBridge = leftHealth.bridgeReady === true && leftHealth.scriptHostReady === true ? 1 : 0;
+		const rightBridge = rightHealth.bridgeReady === true && rightHealth.scriptHostReady === true ? 1 : 0;
+		if (leftBridge !== rightBridge) return rightBridge - leftBridge;
+		const leftRuntime = String(left?.mode || "").toLowerCase() === "runtime" ? 1 : 0;
+		const rightRuntime = String(right?.mode || "").toLowerCase() === "runtime" ? 1 : 0;
+		if (leftRuntime !== rightRuntime) return rightRuntime - leftRuntime;
+		return Number(right?.lastSeenUnix || 0) - Number(left?.lastSeenUnix || 0);
+	});
+}
+
 export async function selectInstanceForCapability(instances, flags, kind, name) {
 	const activeInstances = getActiveInstances(instances);
 	const hasExplicitSelector = Boolean(flags.project || flags.instance || flags.port);
 	if (hasExplicitSelector) {
-		const instance = selectInstance(activeInstances, flags);
+		const instance = await selectReadyInstance(activeInstances, flags);
 		const manifest = await fetchManifestForInstance(instance, flags, { name, retries: 1 });
 		if (name && !manifestHasCapability(manifest, kind, name)) {
 			throw buildSelectionError(
@@ -267,16 +389,33 @@ export async function selectInstanceForCapability(instances, flags, kind, name) 
 
 export async function requestJson(url, init = {}, options = {}) {
 	const waitMs = Number(options.waitMs || DEFAULT_WAIT_MS);
-	const retries = Number(options.retries || DEFAULT_RETRIES);
-	const requestInit = withPieToken(init, options.token || "");
+	let retries = Number(options.retries || DEFAULT_RETRIES);
+	let token = String(options.token || "");
+	let tokenRefreshAttempted = false;
 	let lastError;
 	for (let attempt = 0; attempt < retries; attempt += 1) {
 		try {
+			const requestInit = withPieToken(init, token);
 			const response = await fetch(url, requestInit);
 			const text = await response.text();
 			const json = text ? JSON.parse(text) : {};
 
 			if (!response.ok) {
+				if (isRpcUnauthorized(response, json)
+					&& !tokenRefreshAttempted
+					&& typeof options.refreshToken === "function") {
+					tokenRefreshAttempted = true;
+					const nextToken = String(options.refreshToken(token) || "");
+					if (nextToken && nextToken !== token) {
+						token = nextToken;
+						options.token = nextToken;
+						lastError = new Error(`HTTP ${response.status}: ${text}`);
+						if (attempt >= retries - 1) {
+							retries += 1;
+						}
+						continue;
+					}
+				}
 				throw new Error(`HTTP ${response.status}: ${text}`);
 			}
 
@@ -299,10 +438,35 @@ export async function requestJson(url, init = {}, options = {}) {
 	throw lastError || new Error("Request failed");
 }
 
+function isRpcUnauthorized(response, json) {
+	return response?.status === 401 || String(json?.errorCode || "") === "RPC_UNAUTHORIZED";
+}
+
+function buildTokenRefresh(flags, instance) {
+	return (currentToken) => {
+		const latest = findMatchingInstance(loadRegistry(), flags, instance);
+		const nextToken = String(latest?.token || "");
+		return nextToken && nextToken !== currentToken ? nextToken : "";
+	};
+}
+
+function findMatchingInstance(instances, flags, instance) {
+	const instanceId = String(instance?.instanceId || "").trim();
+	const port = Number(instance?.port || 0);
+	const project = normalizePath(instance?.projectPath || flags?.project || "");
+	const matches = instances.filter((item) => {
+		if (port > 0 && Number(item?.port || 0) !== port) return false;
+		if (project && normalizePath(item?.projectPath || "") !== project) return false;
+		if (instanceId && String(item?.instanceId || "") !== instanceId) return false;
+		return true;
+	});
+	return matches.sort((left, right) => Number(right?.lastSeenUnix || 0) - Number(left?.lastSeenUnix || 0))[0] || null;
+}
+
 export async function runCli(argv = process.argv) {
 	const { command, flags } = parseArgs(argv);
 	if (command === "instances") {
-		const instances = getActiveInstances(loadRegistry());
+		const instances = await probeCandidateHealth(getActiveInstances(loadRegistry()), flags);
 		const filtered = flags.project
 			? instances.filter((item) => computeProjectMatchScore(flags.project, item.projectPath || "") > 0)
 			: instances;
@@ -312,7 +476,7 @@ export async function runCli(argv = process.argv) {
 
 	switch (command) {
 		case "health": {
-			const instance = selectInstance(loadRegistry(), flags);
+			const instance = await selectReadyInstance(loadRegistry(), flags);
 			const baseUrl = `http://127.0.0.1:${instance.port}`;
 			writeJson(normalizeEnvelope(await requestJson(`${baseUrl}/health`, {}, flags)));
 			return;
@@ -321,7 +485,7 @@ export async function runCli(argv = process.argv) {
 			const instances = loadRegistry();
 			const hasExplicitSelector = Boolean(flags.project || flags.instance || flags.port);
 			if (hasExplicitSelector || getActiveInstances(instances).length === 1) {
-				const instance = selectInstance(instances, flags);
+				const instance = await selectReadyInstance(instances, flags);
 				const manifest = await fetchManifestForInstance(instance, flags, {
 					namespace: flags.namespace,
 					name: flags.name,
@@ -374,7 +538,7 @@ export async function runCli(argv = process.argv) {
 			if (!name) throw new Error("--method is required");
 			const { instance, manifest } = await selectInstanceForCapability(loadRegistry(), flags, "rpc", name);
 			const baseUrl = `http://127.0.0.1:${instance.port}`;
-			const requestOptions = { ...flags, token: String(flags.token || instance.token || "") };
+			const requestOptions = { ...flags, token: String(flags.token || instance.token || ""), refreshToken: buildTokenRefresh(flags, instance) };
 			requireToken(requestOptions, instance);
 			const response = attachProtocolWarning(
 				normalizeEnvelope(await requestJson(`${baseUrl}/rpc/${encodeURIComponent(name)}`, postJson(parseData(flags.data)), requestOptions)),
@@ -394,7 +558,7 @@ export async function runCli(argv = process.argv) {
 async function runToolCommand(flags, name) {
 	const { instance, manifest } = await selectInstanceForCapability(loadRegistry(), flags, "tool", name);
 	const baseUrl = `http://127.0.0.1:${instance.port}`;
-	const requestOptions = { ...flags, token: String(flags.token || instance.token || "") };
+	const requestOptions = { ...flags, token: String(flags.token || instance.token || ""), refreshToken: buildTokenRefresh(flags, instance) };
 	requireToken(requestOptions, instance);
 	const response = attachProtocolWarning(
 		normalizeEnvelope(await requestJson(`${baseUrl}/tool/${encodeURIComponent(name)}`, postJson(parseData(flags.data)), requestOptions)),
@@ -470,7 +634,12 @@ function attachProtocolWarning(json, manifest) {
 }
 
 async function fetchManifestForInstance(instance, flags, filters = {}) {
-	const requestOptions = { ...flags, token: String(flags.token || instance.token || ""), retries: filters.retries || flags.retries };
+	const requestOptions = {
+		...flags,
+		token: String(flags.token || instance.token || ""),
+		retries: filters.retries || flags.retries,
+		refreshToken: buildTokenRefresh(flags, instance),
+	};
 	requireToken(requestOptions, instance);
 	const query = new URLSearchParams();
 	if (filters.namespace) query.set("namespace", filters.namespace);
@@ -610,6 +779,8 @@ function dedupeInstances(items) {
 			String(item?.instanceId || ""),
 			normalizePath(item?.projectPath || ""),
 			String(item?.mode || ""),
+			Number(item?.pid || 0),
+			Number(item?.port || 0),
 		].join("|");
 		if (seen.has(key)) continue;
 		seen.add(key);
@@ -641,6 +812,11 @@ function filterDiscoverableInstances(items) {
 
 	return next.sort((left, right) => Number(right?.lastSeenUnix || 0) - Number(left?.lastSeenUnix || 0));
 }
+
+export const __testOnly = {
+	findMatchingInstance,
+	formatCandidate,
+};
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
 	runCli().catch((error) => {

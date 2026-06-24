@@ -151,6 +151,30 @@ The shipped runtime bridge is a tracked Unity `TextAsset` contract, not an ad-ho
 
 Runtime debugging is zero-registration by default. When a PlayMode/runtime host is alive, discoverability prefers the runtime owner, and `unity_script_run` exposes `ctx.runtime` for controlled same-`JsEnv` inspection and path-based calls such as `ctx.runtime.call("IJsEnvironment.Environment.ReloadAllMods", [])`. Prefer `ctx.runtime` over assuming raw globals like `VX`, `CS`, or `puer` are part of the public contract.
 
+## Behavior Trees
+
+`com.pie.agent` includes a runtime behavior-tree capability backed by a vendored source copy of NPBehave. Agents create controlled JSON behavior-tree specs, games write runtime context into typed blackboard entries, and leaf `action` nodes execute only game-side receivers registered through `PieBehaviorTreeActionRegistry`.
+
+Manifest namespace:
+
+- `behavior_tree`
+
+Stable tools:
+
+- `behavior_tree_create`
+- `behavior_tree_start`
+- `behavior_tree_stop`
+- `behavior_tree_destroy`
+- `behavior_tree_status`
+- `behavior_tree_set_blackboard`
+- `behavior_tree_get_blackboard`
+
+Use the packaged `pie-unity-behavior-tree` skill for agent workflow guidance. In PieChat, call these tools through `unity_tool_call` after inspecting the manifest. For smoke tests, the built-in action receiver `pie.debug.record_action` records execution in status/log output and updates the tree blackboard key `lastDebugAction`.
+
+Long-running strategies should use the JSON `repeat` node with an explicit `intervalSeconds`, and fast leaf actions can set `minIntervalSeconds` to prevent accidental action spam. `condition.stopsOnChange` defaults to `none`; set `immediate_restart` only for branches that must interrupt lower-priority work.
+
+Runtime health exposes both `runtimeActive` and `playModeActive`. `runtimeActive` means a Pie runtime owner is registered; it is not the same as Unity Play Mode. Use `playModeActive` and `behaviorTreeActiveCount` when validating Play Mode behavior-tree dogfood. External scripts should call through the packaged RPC helper, or implement the same one-shot token refresh on `RPC_UNAUTHORIZED` after domain reload or Play Mode transitions.
+
 ## Installation
 
 Install through Unity Package Manager:

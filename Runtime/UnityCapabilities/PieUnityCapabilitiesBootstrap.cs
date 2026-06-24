@@ -145,6 +145,7 @@ namespace Pie
 
         public static void ShutdownRuntime()
         {
+            PieBehaviorTreeRuntime.StopAll();
             if (string.IsNullOrWhiteSpace(_runtimeInstanceId))
                 return;
 
@@ -289,6 +290,7 @@ namespace Pie
                 capabilityKind: "host");
 
             RegisterScriptCapabilities();
+            PieBehaviorTreeBootstrap.RegisterCapabilities(isEditor);
         }
 
         private static void RegisterRuntimeCapabilities(PieRunner runner, string projectPath)

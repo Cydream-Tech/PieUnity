@@ -203,6 +203,7 @@ namespace Pie
                 public ManualResetEventSlim done;
                 public string result;
                 public Exception error;
+                public int state;
             }
 
             private static readonly ConcurrentQueue<WorkItem> Queue = new ConcurrentQueue<WorkItem>();
@@ -232,7 +233,10 @@ namespace Pie
 
                 Queue.Enqueue(item);
                 if (!item.done.Wait(timeoutMs))
+                {
+                    Interlocked.CompareExchange(ref item.state, 2, 0);
                     throw new TimeoutException("Timed out waiting for Unity main thread.");
+                }
 
                 if (item.error != null)
                     throw item.error;
@@ -244,6 +248,11 @@ namespace Pie
             {
                 while (Queue.TryDequeue(out var item))
                 {
+                    if (Interlocked.CompareExchange(ref item.state, 1, 0) != 0)
+                    {
+                        item.done.Set();
+                        continue;
+                    }
                     try
                     {
                         item.result = item.action();
@@ -445,7 +454,6 @@ namespace Pie
                             healthJson = BuildHealthJson(false, ex.Message);
                         }
                         WriteJson(context.Response, 200, healthJson);
-                        PieUnityCapabilitiesBootstrap.Heartbeat();
                         return;
                     }
 
@@ -467,7 +475,6 @@ namespace Pie
                         {
                             instances = PieUnityInstanceRegistry.ReadAll(),
                         }, true));
-                        PieUnityCapabilitiesBootstrap.Heartbeat();
                         return;
                     }
 
@@ -477,7 +484,6 @@ namespace Pie
                         query.TryGetValue("namespace", out var filterNamespace);
                         query.TryGetValue("name", out var filterName);
                         WriteJson(context.Response, 200, PieUnityCapabilityRegistry.BuildManifestJson(filterNamespace, filterName));
-                        PieUnityCapabilitiesBootstrap.Heartbeat();
                         return;
                     }
 
@@ -489,7 +495,6 @@ namespace Pie
                             ? HandleUnityScriptRunTool(toolBody, _cts != null ? _cts.Token : CancellationToken.None)
                             : PieDevRpcDispatcher.InvokeSync(() => BuildCapabilityEnvelope("tool", toolName, toolBody));
                         WriteJson(context.Response, 200, toolResponse);
-                        PieUnityCapabilitiesBootstrap.Heartbeat();
                         return;
                     }
 
@@ -503,7 +508,6 @@ namespace Pie
                     var body = ReadRequestBody(request);
                     var responseJson = PieDevRpcDispatcher.InvokeSync(() => BuildCapabilityEnvelope("rpc", method, body));
                     WriteJson(context.Response, 200, responseJson);
-                    PieUnityCapabilitiesBootstrap.Heartbeat();
                 }
                 catch (ThreadAbortException)
                 {
@@ -536,6 +540,9 @@ namespace Pie
                 var hostDiagnostics = PieUnityCapabilityRegistry.GetRuntimeHostDiagnostics();
                 var snapshot = PieUnityInstanceRegistry.GetCurrentProcessSnapshot(PieUnityCapabilityRegistry.ProjectPath);
                 var owner = snapshot != null ? snapshot.discoverableOwner : null;
+                var playModeActive = mainThreadResponsive && IsPlayModeActive();
+                var isPlayingOrWillChangePlaymode = mainThreadResponsive && IsPlayingOrWillChangePlaymode();
+                var behaviorTreeActiveCount = mainThreadResponsive ? PieBehaviorTreeRuntime.GetActiveTreeCount() : 0;
                 return JsonUtility.ToJson(new PieUnityHealthPayload
                 {
                     instanceId = owner != null ? (owner.instanceId ?? "") : PieUnityCapabilityRegistry.InstanceId,
@@ -559,6 +566,9 @@ namespace Pie
                     runtimeActive = snapshot != null && snapshot.runtimeActive,
                     editorActive = snapshot != null && snapshot.editorActive,
                     editorSuppressedByRuntime = snapshot != null && snapshot.editorSuppressedByRuntime,
+                    playModeActive = playModeActive,
+                    isPlayingOrWillChangePlaymode = isPlayingOrWillChangePlaymode,
+                    behaviorTreeActiveCount = behaviorTreeActiveCount,
                     registeredHostCount = registeredHostNamespaces.Length,
                     registeredHostNamespaces = registeredHostNamespaces,
                     hostCapabilityCount = PieUnityCapabilityRegistry.GetRuntimeHostCapabilityCount(),
@@ -571,6 +581,24 @@ namespace Pie
                         ? availability
                         : $"{{\"status\":\"temporarily_unavailable\",\"reason\":\"main_thread_timeout\",\"message\":\"Timed out waiting for Unity main thread: {EscapeJson(mainThreadError)}\"}}",
                 });
+            }
+
+            private static bool IsPlayModeActive()
+            {
+#if UNITY_EDITOR
+                return UnityEditor.EditorApplication.isPlaying;
+#else
+                return Application.isPlaying;
+#endif
+            }
+
+            private static bool IsPlayingOrWillChangePlaymode()
+            {
+#if UNITY_EDITOR
+                return UnityEditor.EditorApplication.isPlayingOrWillChangePlaymode;
+#else
+                return Application.isPlaying;
+#endif
             }
 
             private static string BuildBridgeDiagnostic(bool bridgeReady, string bridgeLastError)
@@ -1066,6 +1094,7 @@ namespace Pie
 
             public static void ShutdownRuntime()
             {
+                PieBehaviorTreeRuntime.StopAll();
                 if (string.IsNullOrWhiteSpace(_runtimeInstanceId))
                     return;
 
@@ -1210,6 +1239,7 @@ namespace Pie
                     capabilityKind: "host");
 
                 RegisterScriptCapabilities();
+                PieBehaviorTreeBootstrap.RegisterCapabilities(isEditor);
             }
 
             private static void RegisterRuntimeCapabilities(PieRunner runner, string projectPath)
@@ -1690,7 +1720,7 @@ namespace Pie
     // Merged from Runtime/UnityCapabilities/PieUnityCapabilitiesConstants.cs
     public static class PieUnityCapabilitiesConstants
         {
-            public const string Version = "0.1.24";
+            public const string Version = "0.1.25";
             public const string ManifestSchemaVersion = "2";
             public const string SkillProtocolVersion = "pie-unity-rpc/2";
             public const int DefaultPort = 8091;
@@ -1839,6 +1869,9 @@ namespace Pie
         public bool runtimeActive = false;
         public bool editorActive = false;
         public bool editorSuppressedByRuntime = false;
+        public bool playModeActive = false;
+        public bool isPlayingOrWillChangePlaymode = false;
+        public int behaviorTreeActiveCount = 0;
         public int registeredHostCount = 0;
         public string[] registeredHostNamespaces = new string[0];
         public int hostCapabilityCount = 0;
@@ -3977,7 +4010,7 @@ namespace Pie
                     throw new InvalidOperationException("Cannot register a Unity instance without a valid identity.");
 
                 Directory.CreateDirectory(PieUnityCapabilitiesConstants.InstancesDirectory);
-                var targetPath = BuildInstanceFilePath(instance.instanceId);
+                var targetPath = BuildInstanceFilePath(instance);
                 var json = JsonUtility.ToJson(instance, true);
                 var tempPath = targetPath + "." + System.Diagnostics.Process.GetCurrentProcess().Id + "." + Guid.NewGuid().ToString("N") + ".tmp";
 
@@ -4051,9 +4084,12 @@ namespace Pie
                 return null;
             }
 
-            private static string BuildInstanceFilePath(string instanceId)
+            private static string BuildInstanceFilePath(PieUnityInstance instance)
             {
-                return Path.Combine(PieUnityCapabilitiesConstants.InstancesDirectory, instanceId + ".json");
+                var instanceId = instance != null ? (instance.instanceId ?? "") : "";
+                var pid = instance != null ? instance.pid : 0;
+                var port = instance != null ? instance.port : 0;
+                return Path.Combine(PieUnityCapabilitiesConstants.InstancesDirectory, instanceId + "_" + pid + "_" + port + ".json");
             }
 
             private static bool IsExpired(PieUnityInstance item, long now)
@@ -4093,7 +4129,12 @@ namespace Pie
             {
                 if (string.IsNullOrWhiteSpace(instanceId))
                     return;
-                TryDeleteStaleFile(BuildInstanceFilePath(instanceId));
+                if (!Directory.Exists(PieUnityCapabilitiesConstants.InstancesDirectory))
+                    return;
+                var pattern = instanceId + "*.json";
+                var filePaths = Directory.GetFiles(PieUnityCapabilitiesConstants.InstancesDirectory, pattern);
+                for (var i = 0; i < filePaths.Length; i++)
+                    TryDeleteStaleFile(filePaths[i]);
             }
 
             private static void TryDeleteStaleFile(string filePath)
