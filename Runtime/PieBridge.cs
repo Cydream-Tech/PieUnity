@@ -28,6 +28,7 @@ namespace Pie
         private bool _isUnityScriptHostReady = false;
         private bool _isRuntimeHostBridgeReady = false;
         private bool _isRuntimeBridgeReady = false;
+        private bool _isTypeScriptCompilerReady = false;
 
         /// <summary>Fired when JS calls pieBridge.sendToUnity(event, jsonData).</summary>
         public event Action<string, string> OnJsEvent;
@@ -36,6 +37,7 @@ namespace Pie
         public bool IsUnityScriptHostReady => IsInitialized && _isUnityScriptHostReady;
         public bool IsRuntimeHostBridgeReady => IsInitialized && _isRuntimeHostBridgeReady;
         public bool IsRuntimeBridgeReady => IsInitialized && _isRuntimeBridgeReady;
+        public bool IsTypeScriptCompilerReady => IsInitialized && _isTypeScriptCompilerReady;
         public string LastError => _lastError;
         // PuerTS 2.2.2 uses the stable JsEnv + BackendType.V8 path here.
         // pie-unity relies on cooperative script step guards instead of native
@@ -140,6 +142,16 @@ namespace Pie
             return _jsEnv.Eval<string>(script);
         }
 
+        public string InvokeTypeScriptCompiler(string requestJson)
+        {
+            if (_jsEnv == null || _isDisposed)
+                throw new InvalidOperationException("PieBridge is not initialized.");
+
+            EnsureTypeScriptCompilerLoaded();
+            var script = $"(function(){{var compiler=globalThis.__pieTypeScriptCompiler;if(!compiler||typeof compiler.compileJson!=='function') throw new Error('Runtime TypeScript compiler is not ready.'); return compiler.compileJson({JsonString(requestJson ?? "{}")});}})()";
+            return _jsEnv.Eval<string>(script);
+        }
+
         public void Dispose()
         {
             if (_isDisposed) return;
@@ -224,6 +236,7 @@ namespace Pie
             _isUnityScriptHostReady = false;
             _isRuntimeHostBridgeReady = false;
             _isRuntimeBridgeReady = false;
+            _isTypeScriptCompilerReady = false;
             PieUnityCapabilityRegistry.ResetRuntimeHosts();
         }
 
@@ -291,6 +304,101 @@ namespace Pie
 #endif
             PieDiagnostics.Warning("Bundled Pie runtime TextAsset was not found at Resources/pie/core.bytes.");
             return null;
+        }
+
+        public static string LoadResourceText(string resourcePath)
+        {
+            var normalizedResourcePath = NormalizeResourcePath(resourcePath);
+            if (string.IsNullOrEmpty(normalizedResourcePath))
+                return "";
+
+            var textAsset = Resources.Load<TextAsset>(normalizedResourcePath);
+            if (textAsset != null)
+                return textAsset.text;
+
+#if UNITY_EDITOR
+            var projectRoot = Directory.GetParent(Application.dataPath)?.FullName ?? "";
+            var packageInfo = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(PieBridge).Assembly);
+            var resolvedPackagePath = packageInfo != null ? packageInfo.resolvedPath : "";
+            var relativeBytesPath = Path.Combine("Resources", normalizedResourcePath + ".bytes");
+
+            string[] candidates = {
+                string.IsNullOrEmpty(resolvedPackagePath) ? "" : Path.Combine(resolvedPackagePath, relativeBytesPath),
+                Path.Combine(projectRoot, "Packages", "com.pie.agent", relativeBytesPath),
+                Path.Combine(projectRoot, "Packages", "pie-unity", relativeBytesPath),
+            };
+
+            foreach (var path in candidates)
+            {
+                if (string.IsNullOrEmpty(path))
+                    continue;
+
+                if (File.Exists(path))
+                {
+                    try
+                    {
+                        return File.ReadAllText(path);
+                    }
+                    catch (Exception ex)
+                    {
+                        PieDiagnostics.Warning($"Failed to read {path}: {ex.Message}");
+                    }
+                }
+            }
+
+            var cacheDir = Path.Combine(projectRoot, "Library", "PackageCache");
+            if (Directory.Exists(cacheDir))
+            {
+                foreach (var dir in Directory.GetDirectories(cacheDir, "com.pie.agent@*"))
+                {
+                    var path = Path.Combine(dir, relativeBytesPath);
+                    if (!File.Exists(path))
+                        continue;
+                    try
+                    {
+                        return File.ReadAllText(path);
+                    }
+                    catch (Exception ex)
+                    {
+                        PieDiagnostics.Warning($"Failed to read PackageCache resource {path}: {ex.Message}");
+                    }
+                }
+            }
+#endif
+
+            return "";
+        }
+
+        private static string NormalizeResourcePath(string resourcePath)
+        {
+            var normalized = (resourcePath ?? "").Replace("\\", "/").Trim();
+            if (normalized.EndsWith(".bytes", StringComparison.OrdinalIgnoreCase))
+                normalized = normalized.Substring(0, normalized.Length - ".bytes".Length);
+            return normalized.Trim('/');
+        }
+
+        private void EnsureTypeScriptCompilerLoaded()
+        {
+            if (_isTypeScriptCompilerReady)
+                return;
+
+            var alreadyLoaded = _jsEnv.Eval<bool>("(function(){return !!(globalThis.__pieTypeScriptCompiler&&typeof globalThis.__pieTypeScriptCompiler.compileJson==='function');})()");
+            if (alreadyLoaded)
+            {
+                _isTypeScriptCompilerReady = true;
+                return;
+            }
+
+            var compilerJs = LoadResourceText("pie/typescript-compiler");
+            if (string.IsNullOrEmpty(compilerJs))
+                throw new Exception("Failed to load bundled TypeScript compiler from Resources/pie/typescript-compiler.bytes.");
+
+            _jsEnv.Eval(compilerJs);
+            alreadyLoaded = _jsEnv.Eval<bool>("(function(){return !!(globalThis.__pieTypeScriptCompiler&&typeof globalThis.__pieTypeScriptCompiler.compileJson==='function');})()");
+            if (!alreadyLoaded)
+                throw new Exception("Runtime TypeScript compiler did not register globalThis.__pieTypeScriptCompiler.");
+
+            _isTypeScriptCompilerReady = true;
         }
 
         private void InjectPieBridge(string projectRoot, PieSettings settings)

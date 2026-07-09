@@ -19547,44 +19547,6 @@ ${compactSummary}`;
     return new RuntimeExtensionRegistry();
   }
 
-  // ../../packages/agent-framework/src/extensions/runtime-discovery.ts
-  function normalizePath(path) {
-    return String(path ?? "").replace(/\\/g, "/");
-  }
-  function collectScriptFiles(gateway, root, out) {
-    if (!gateway.exists(root) || !gateway.isDirectory(root)) {
-      return;
-    }
-    for (const entry of gateway.readdir(root)) {
-      const fullPath = gateway.join(root, entry);
-      if (gateway.isDirectory(fullPath)) {
-        collectScriptFiles(gateway, fullPath, out);
-        continue;
-      }
-      if (gateway.isFile(fullPath) && gateway.extname(fullPath).toLowerCase() === ".js") {
-        out.push(normalizePath(fullPath));
-      }
-    }
-  }
-  function discoverRuntimeScriptExtensions(searchRoots) {
-    const roots = searchRoots.map((root) => normalizePath(root)).filter((root) => root.length > 0);
-    const gateway = new FileSystemGateway({
-      allowedRoots: roots,
-      allowWrites: false
-    });
-    const byName = /* @__PURE__ */ new Map();
-    for (const root of roots) {
-      const files = [];
-      collectScriptFiles(gateway, root, files);
-      for (const filePath of files) {
-        const fileName = gateway.basename(filePath, gateway.extname(filePath)).toLowerCase();
-        byName.delete(fileName);
-        byName.set(fileName, filePath);
-      }
-    }
-    return Array.from(byName.values());
-  }
-
   // ../../packages/agent-framework/src/interaction.ts
   var InteractionUnavailableError = class extends Error {
     request;
@@ -23237,7 +23199,7 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
       }));
     }
   };
-  function normalizePath2(projectRoot2, inputPath) {
+  function normalizePath(projectRoot2, inputPath) {
     if (!inputPath) return void 0;
     if (!isAbsolute(inputPath)) {
       const normalizedRelative = normalize(inputPath);
@@ -23390,7 +23352,7 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
         try {
           const result = await provider.run(input, {
             projectRoot: projectRoot2,
-            resolvePath: (inputPath) => normalizePath2(projectRoot2, inputPath)
+            resolvePath: (inputPath) => normalizePath(projectRoot2, inputPath)
           });
           return {
             content: [{ type: "text", text: truncate(result.text, maxOutputChars) }],
@@ -25156,7 +25118,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
 
   // src/skills.ts
   var hasLoggedEmptySkillScan = false;
-  function normalizePath3(path) {
+  function normalizePath2(path) {
     return String(path ?? "").replace(/\\/g, "/");
   }
   function parseBridgePathArray(methodName) {
@@ -25167,7 +25129,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     }
     try {
       const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.map((entry) => normalizePath3(String(entry ?? ""))).filter((entry) => entry.length > 0) : [];
+      return Array.isArray(parsed) ? parsed.map((entry) => normalizePath2(String(entry ?? ""))).filter((entry) => entry.length > 0) : [];
     } catch {
       return [];
     }
@@ -25185,14 +25147,14 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       const diagnostics = skillDirs.length === 0 ? ["(no skill search paths configured)"] : skillDirs.map((skillsDir) => {
         const exists = CS.System.IO.Directory.Exists(skillsDir);
         if (!exists) {
-          return `${normalizePath3(String(skillsDir))} [missing]`;
+          return `${normalizePath2(String(skillsDir))} [missing]`;
         }
         const directories = CS.System.IO.Directory.GetDirectories(skillsDir);
         const files = CS.System.IO.Directory.GetFiles(skillsDir, "*.md");
-        return `${normalizePath3(String(skillsDir))} [dirs=${directories.Length}, md=${files.Length}]`;
+        return `${normalizePath2(String(skillsDir))} [dirs=${directories.Length}, md=${files.Length}]`;
       });
       CS.Pie.PieDiagnostics.Verbose(
-        `[pie/skills] No project skills found. projectRoot=${normalizePath3(projectRoot2)} searchPaths=${diagnostics.join("; ")}`
+        `[pie/skills] No project skills found. projectRoot=${normalizePath2(projectRoot2)} searchPaths=${diagnostics.join("; ")}`
       );
     } catch {
     }
@@ -25203,11 +25165,11 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     }
     try {
       const content = String(CS.System.IO.File.ReadAllText(skillPath) ?? "");
-      const parsed = parseSkill(content, fileName, normalizePath3(skillPath));
+      const parsed = parseSkill(content, fileName, normalizePath2(skillPath));
       loader.registerSkill({
         ...parsed,
         source: "project",
-        baseDir: normalizePath3(baseDir)
+        baseDir: normalizePath2(baseDir)
       });
     } catch {
     }
@@ -25244,9 +25206,9 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       description: skill.description,
       source: "project",
       content: skill.prompt,
-      filePath: skill.filePath ? normalizePath3(skill.filePath) : void 0,
-      path: skill.filePath ? normalizePath3(skill.filePath) : void 0,
-      baseDir: skill.baseDir ? normalizePath3(skill.baseDir) : void 0
+      filePath: skill.filePath ? normalizePath2(skill.filePath) : void 0,
+      path: skill.filePath ? normalizePath2(skill.filePath) : void 0,
+      baseDir: skill.baseDir ? normalizePath2(skill.baseDir) : void 0
     };
   }
   function getAvailableSkills(projectRoot2) {
@@ -26046,6 +26008,49 @@ ${extensionSection.join("\n\n---\n\n")}
     });
   }
 
+  // src/typescript-runtime.ts
+  function compilerGlobal() {
+    return globalThis.__pieTypeScriptCompiler;
+  }
+  function loadCompilerBundle() {
+    const loadResource = typeof CS !== "undefined" ? CS?.Pie?.PieBridge?.LoadResourceText : void 0;
+    if (typeof loadResource !== "function") {
+      throw new Error("PieBridge.LoadResourceText is required for runtime TypeScript compilation.");
+    }
+    const source = String(loadResource("pie/typescript-compiler") || "");
+    if (!source) {
+      throw new Error("Missing Resources/pie/typescript-compiler.bytes. Rebuild pie-unity.");
+    }
+    const install = new Function(`${source}
+//# sourceURL=pie/typescript-compiler.bytes`);
+    install();
+  }
+  function ensureTypeScriptCompiler() {
+    let compiler = compilerGlobal();
+    if (!compiler) {
+      loadCompilerBundle();
+      compiler = compilerGlobal();
+    }
+    if (!compiler || typeof compiler.compile !== "function") {
+      throw new Error("Runtime TypeScript compiler failed to initialize.");
+    }
+    return compiler;
+  }
+  function compileTypeScript(request) {
+    return ensureTypeScriptCompiler().compile({
+      ...request,
+      module: request.module || "ESNext",
+      target: request.target || "ES2022"
+    });
+  }
+  function formatTypeScriptDiagnostics(diagnostics) {
+    const entries = Array.isArray(diagnostics) ? diagnostics : [];
+    return entries.map((diagnostic) => {
+      const location = diagnostic.line > 0 ? `${diagnostic.fileName || "runtime.ts"}:${diagnostic.line}:${Math.max(1, diagnostic.character || 1)}` : diagnostic.fileName || "runtime.ts";
+      return `${location} TS${diagnostic.code} ${diagnostic.category}: ${diagnostic.message}`;
+    }).join("\n");
+  }
+
   // src/extensions/load-project-extensions.ts
   function getSystemIO2() {
     if (typeof CS === "undefined" || !CS?.System?.IO) {
@@ -26053,11 +26058,85 @@ ${extensionSection.join("\n\n---\n\n")}
     }
     return CS.System.IO;
   }
-  function normalizePath4(path) {
+  function normalizePath3(path) {
     return path.replace(/\\/g, "/");
   }
+  function toArray2(values) {
+    const results = [];
+    for (let i = 0; i < values.Length; i += 1) {
+      results.push(String(typeof values.get_Item === "function" ? values.get_Item(i) : values[i]));
+    }
+    return results;
+  }
+  function extensionName(filePath) {
+    const normalized = normalizePath3(filePath).toLowerCase();
+    const index = normalized.lastIndexOf(".");
+    return index >= 0 ? normalized.slice(index) : "";
+  }
+  function baseNameWithoutExtension(filePath) {
+    const normalized = normalizePath3(filePath);
+    const fileName = normalized.slice(normalized.lastIndexOf("/") + 1);
+    const extensionIndex = fileName.lastIndexOf(".");
+    return (extensionIndex >= 0 ? fileName.slice(0, extensionIndex) : fileName).toLowerCase();
+  }
+  function extensionPriority(filePath) {
+    switch (extensionName(filePath)) {
+      case ".ts":
+        return 2;
+      case ".mjs":
+        return 1;
+      default:
+        return 0;
+    }
+  }
+  function collectRuntimeExtensionFiles(IO, root, out) {
+    if (!IO.Directory.Exists(root)) return;
+    for (const filePath of toArray2(IO.Directory.GetFiles(root)).sort()) {
+      const ext = extensionName(filePath);
+      if (ext === ".js" || ext === ".mjs" || ext === ".ts") {
+        out.push(normalizePath3(filePath));
+      }
+    }
+    for (const dir of toArray2(IO.Directory.GetDirectories(root)).sort()) {
+      collectRuntimeExtensionFiles(IO, dir, out);
+    }
+  }
+  function discoverUnityRuntimeScriptExtensions(IO, searchRoots) {
+    const byName = /* @__PURE__ */ new Map();
+    for (const root of searchRoots.map(normalizePath3).filter((entry) => entry.length > 0)) {
+      const files = [];
+      collectRuntimeExtensionFiles(IO, root, files);
+      files.sort((a, b) => {
+        const nameCompare = baseNameWithoutExtension(a).localeCompare(baseNameWithoutExtension(b));
+        if (nameCompare !== 0) return nameCompare;
+        return extensionPriority(a) - extensionPriority(b);
+      });
+      for (const filePath of files) {
+        const key = baseNameWithoutExtension(filePath);
+        byName.delete(key);
+        byName.set(key, filePath);
+      }
+    }
+    return Array.from(byName.values());
+  }
+  function compileTypeScriptExtension(code, sourceUrl) {
+    const result = compileTypeScript({
+      source: code,
+      sourcePath: sourceUrl,
+      module: "ESNext",
+      target: "ES2022",
+      sourceMap: false,
+      inlineSourceMap: false
+    });
+    if (!result.ok) {
+      const diagnostics = formatTypeScriptDiagnostics(result.diagnostics);
+      throw new Error(diagnostics || result.errorMessage || "TypeScript extension compilation failed.");
+    }
+    return result.outputText;
+  }
   function compileExtensionModule(code, sourceUrl) {
-    const transformed = code.includes("export default") ? code.replace(/export\s+default\s+/, "module.exports = ") : code;
+    let transformed = code.includes("export default") ? code.replace(/export\s+default\s+/, "module.exports = ") : code.replace(/^\s*export\s*\{\s*\};?\s*$/gm, "");
+    transformed = transformed.replace(/^\s*export\s*\{\s*\};?\s*$/gm, "");
     const evaluator = new Function(
       "module",
       "exports",
@@ -26083,15 +26162,16 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         context.log(`[extension] search path not found: ${root}`);
       }
     }
-    const files = discoverRuntimeScriptExtensions(extensionRoots);
+    const files = discoverUnityRuntimeScriptExtensions(IO, extensionRoots);
     const loaded = [];
     const errors = [];
     for (const filePath of files) {
       try {
         const code = String(IO.File.ReadAllText(filePath) ?? "");
-        const sourceUrl = normalizePath4(filePath);
+        const sourceUrl = normalizePath3(filePath);
+        const executableCode = extensionName(sourceUrl) === ".ts" ? compileTypeScriptExtension(code, sourceUrl) : code;
         const api = createExtensionApi(context, sourceUrl);
-        const factory = compileExtensionModule(code, sourceUrl);
+        const factory = compileExtensionModule(executableCode, sourceUrl);
         const result = factory(api);
         if (result && typeof result.then === "function") {
           throw new Error("Async extension activation is not supported in the initial loader.");
@@ -26109,7 +26189,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   }
 
   // src/session-trace.ts
-  function normalizePath5(value) {
+  function normalizePath4(value) {
     return String(value || "").replace(/\\/g, "/");
   }
   var UnitySessionTraceWriter = class extends SessionTraceSnapshotWriter {
@@ -26117,7 +26197,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       super({
         getSessionId: () => getSessionId(),
         loadTrace: (sessionId) => {
-          const tracePath = normalizePath5(CS.System.IO.Path.Combine(getSessionsDir(projectRoot2), `${sessionId}.trace.json`));
+          const tracePath = normalizePath4(CS.System.IO.Path.Combine(getSessionsDir(projectRoot2), `${sessionId}.trace.json`));
           if (!CS.System.IO.File.Exists(tracePath)) return null;
           try {
             return JSON.parse(String(CS.System.IO.File.ReadAllText(tracePath) ?? ""));
@@ -26128,7 +26208,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         saveTrace: (trace) => {
           const sessionsDir = getSessionsDir(projectRoot2);
           CS.System.IO.Directory.CreateDirectory(sessionsDir);
-          const tracePath = normalizePath5(CS.System.IO.Path.Combine(sessionsDir, `${trace.sessionId}.trace.json`));
+          const tracePath = normalizePath4(CS.System.IO.Path.Combine(sessionsDir, `${trace.sessionId}.trace.json`));
           CS.System.IO.File.WriteAllText(tracePath, JSON.stringify(trace, null, 2));
         }
       });
@@ -26959,6 +27039,14 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               host.rebuildAgentSurface();
               host.emitSkillsList();
               break;
+            case "reload_extensions": {
+              const result = host.reloadProjectExtensions();
+              host.bridge.sendToUnity("extensions_reloaded", {
+                loaded: result.loaded || [],
+                errors: result.errors || []
+              });
+              break;
+            }
             case "abort":
               host.bridge.log("info", `[pie/index] abort reason=${stringField(data, "reason") || "user"}`);
               host.agentSessionController.abort();
@@ -28178,6 +28266,7 @@ ${initialAgentsFile}`);
     projectRoot,
     promptAgentWithRecovery,
     rebuildAgentSurface,
+    reloadProjectExtensions,
     restoreSessionRecord,
     startFreshSession,
     trimInterruptedTail,

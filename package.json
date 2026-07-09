@@ -1,6 +1,6 @@
 {
   "name": "com.pie.agent",
-  "version": "0.1.25",
+  "version": "0.1.26",
   "displayName": "Pie AI Agent",
   "description": "Platform for Intelligent Engineering - runtime-first AI agent framework for Unity.",
   "unity": "2022.3",
@@ -17,7 +17,8 @@
   },
   "dependencies": {
     "com.tencent.puerts.core": "2.2.2",
-    "com.unity.modules.ai": "1.0.0"
+    "com.unity.modules.ai": "1.0.0",
+    "com.unity.modules.audio": "1.0.0"
   },
   "samples": [
     {

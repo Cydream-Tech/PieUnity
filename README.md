@@ -240,7 +240,7 @@ Available local commands include:
 1. Add `PieRunner` to a GameObject
 2. Optionally assign `Settings Override`
 3. Call `SetConfig(...)`
-4. Call `SendMessage(...)`
+4. Call `SendChatMessage(...)`
 5. Listen to `OnAssistantMessage`, `OnAssistantDelta`, `OnToolStart`, `OnToolEnd`, and `OnError`
 
 Example:
@@ -258,10 +258,56 @@ public class Demo : MonoBehaviour
         runner.Reinitialize(Path.Combine(Application.persistentDataPath, "PieWorkspace"));
         runner.SetConfig("YOUR_API_KEY", "openai", "gpt-4.1-mini", "https://api.openai.com/v1");
         runner.OnAssistantMessage += msg => Debug.Log("AI: " + msg);
-        runner.SendMessage("Create a cube at (0,1,0).");
+        runner.SendChatMessage("Create a cube at (0,1,0).");
     }
 }
 ```
+
+Runtime voice input is exposed as a static Begin/End API. It does not require
+adding a voice component to the scene:
+
+```csharp
+Pie.PieVoice.RequestMicrophonePermission(granted =>
+{
+    if (!granted) return;
+
+    var recording = Pie.PieVoice.BeginRecording(new Pie.PieVoiceRequest
+    {
+        VirtualKey = voiceVirtualKey,
+        Mode = Pie.PieVoiceMode.Structure,
+        ContextHint = Pie.PieVoiceContextHint.Task,
+        Tone = Pie.PieVoiceTone.Concise,
+    }, result =>
+    {
+        if (result.Ok)
+            Pie.PieRunner.ActiveRunner?.SendChatMessage(result.PolishedText);
+    });
+
+    // Call recording.End() when the player releases the talk button.
+});
+```
+
+Runtime TypeScript generation is supported through a lazy compiler bundle. The
+first version is intentionally single-file: it transpiles TypeScript to
+JavaScript/MJS without Node.js, npm resolution, or runtime imports.
+
+```csharp
+var result = Pie.PieTypeScript.CompileFile(new Pie.PieTypeScriptCompileRequest
+{
+    SourcePath = Path.Combine(Application.dataPath, "Pie/Generated/demo.ts"),
+    OutputPath = Path.Combine(Application.dataPath, "Pie/Extensions/demo.mjs"),
+    Module = Pie.PieTypeScriptModule.ESNext,
+    Target = Pie.PieTypeScriptTarget.ES2022,
+});
+
+if (!result.Ok)
+    Debug.LogError(result.ErrorMessage);
+```
+
+Files under configured Pie extension paths may use `.js`, `.mjs`, or `.ts`.
+TypeScript extensions are compiled in memory before activation. Runtime imports
+such as `import lodash from "lodash"` are rejected; generate a single-file
+module or inline dependencies for now.
 
 `pie-unity` now reads models only from `~/.pie/models.json`. The file must use top-level `profiles`, not `providers`, and each profile must explicitly declare:
 

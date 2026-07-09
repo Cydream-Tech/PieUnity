@@ -222,6 +222,12 @@ namespace Pie
             return _bridge.SendToJs("new_session", "{}");
         }
 
+        public bool ReloadExtensions()
+        {
+            if (_bridge?.IsInitialized != true) return false;
+            return _bridge.SendToJs("reload_extensions", "{}");
+        }
+
         public bool Abort()
         {
             if (_bridge?.IsInitialized != true) return false;
