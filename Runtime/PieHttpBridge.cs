@@ -43,7 +43,8 @@ namespace Pie
 
         /// <summary>
         /// Start a provider SSE request. JS receives lines through
-        /// _pieSSEPush/_pieSSEStatus; ordinary text fetches must use FetchTextAsync.
+        /// _pieSSEPush/_pieSSEStatus and receives the final stream outcome through
+        /// _pieSSETerminal; ordinary text fetches must use FetchTextAsync.
         /// headersJson is optional JSON object of additional headers, e.g. {"Content-Type":"application/json"}.
         /// </summary>
         public static int StartStreamRequest(string method, string url, string body, string bearerToken, string headersJson = null)
@@ -301,8 +302,11 @@ namespace Pie
 
         /// <summary>
         /// Dequeue one line without the empty-string ambiguity of PollLine.
-        /// Returns true if a line was dequeued (line may be "" for empty SSE lines, or null for end-of-stream).
+        /// Returns true if a line was dequeued (line may be "" for empty SSE lines),
+        /// or when the request is complete and all lines have been drained (line is null).
         /// Returns false if the queue is empty (no data available yet).
+        /// Completed requests remain registered until MarkTerminalPushed so their
+        /// terminal error cannot be lost after an earlier successful HTTP status.
         /// </summary>
         public static bool TryPollLine(int requestId, out string line)
         {
@@ -317,7 +321,6 @@ namespace Pie
 
             if (state.IsComplete)
             {
-                _requests.TryRemove(requestId, out _);
                 line = null;
                 return true; // stream ended
             }
@@ -371,6 +374,39 @@ namespace Pie
         {
             if (_requests.TryGetValue(requestId, out var state))
                 state.StatusPushed = true;
+        }
+
+        /// <summary>
+        /// Return the terminal stream outcome once the worker has completed and
+        /// every queued line has been delivered. This is deliberately independent
+        /// from StatusPushed: a 200 response can still fail while reading its body.
+        /// </summary>
+        public static bool TryGetTerminal(int requestId, out string error)
+        {
+            error = null;
+            if (!_requests.TryGetValue(requestId, out var state)
+                || !state.IsComplete
+                || !state.Lines.IsEmpty
+                || state.TerminalPushed)
+            {
+                return false;
+            }
+
+            error = state.Error;
+            return true;
+        }
+
+        /// <summary>
+        /// Mark the terminal stream outcome as delivered exactly once, then release
+        /// the completed request. Cancellation may have already removed the state.
+        /// </summary>
+        public static void MarkTerminalPushed(int requestId)
+        {
+            if (_requests.TryGetValue(requestId, out var state))
+            {
+                state.TerminalPushed = true;
+                _requests.TryRemove(requestId, out _);
+            }
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -1450,6 +1486,7 @@ namespace Pie
             public volatile bool IsComplete = false;
             public volatile int StatusCode = -1;
             public volatile bool StatusPushed = false;
+            public volatile bool TerminalPushed = false;
             public string Error = null;
             public UnityWebRequest NativeRequest = null;
             public TcpClient NativeTcpClient = null;

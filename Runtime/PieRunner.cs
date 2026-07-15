@@ -16,6 +16,7 @@ namespace Pie
         private readonly List<DevRpcMessagePayload> _devRpcMessages = new List<DevRpcMessagePayload>();
         private string _runtimeStatusText = "Idle";
         private bool _runtimeIsStreaming;
+        private string _lastStructuredErrorMessage = "";
         [SerializeField] private string _projectRootOverride = "";
         [SerializeField] private PieSettings _settingsOverride;
 
@@ -23,6 +24,9 @@ namespace Pie
         public bool IsReady => _bridge?.IsInitialized == true;
         public string ProjectRootOverride => _projectRootOverride;
         public PieSettings SettingsOverride => _settingsOverride;
+        public string ActiveSessionId { get; private set; } = "";
+        public PieSessionSnapshot CurrentSession { get; private set; }
+        public PieAgentStatus CurrentStatus { get; private set; } = new PieAgentStatus();
 
         public event Action<string> OnAssistantMessage;
         public event Action<string> OnAssistantDelta;
@@ -31,6 +35,11 @@ namespace Pie
         public event Action<string> OnTurnEndDetailed;
         public event Action OnTurnEnd;
         public event Action<string> OnError;
+        public event Action<PieTimelineItem> OnTimelineItemChanged;
+        public event Action<PieSessionSnapshot> OnSessionChanged;
+        public event Action<PieAgentStatus> OnStatusChanged;
+        public event Action<PieTurnResult> OnTurnFinished;
+        public event Action<PieRuntimeError> OnRuntimeError;
 
         [Serializable]
         private class RunnerStatePayload
@@ -207,12 +216,37 @@ namespace Pie
 
         public bool SendChatMessage(string content)
         {
-            if (_bridge?.IsInitialized != true) return false;
-            var safeContent = EscapeJsonString(content ?? "");
-            var json = $"{{\"content\":\"{safeContent}\"}}";
-            AddDevRpcMessage("user", "", content ?? "", "", false, false);
+            return SendChatMessage(new PieChatRequest
+            {
+                content = content ?? "",
+                displayContent = content ?? "",
+            });
+        }
+
+        public bool SendChatMessage(PieChatRequest request)
+        {
+            if (_bridge?.IsInitialized != true || request == null) return false;
+            request.content = request.content ?? "";
+            request.displayContent = string.IsNullOrEmpty(request.displayContent)
+                ? request.content
+                : request.displayContent;
+            request.clientTurnId = request.clientTurnId ?? "";
+            AddDevRpcMessage("user", "", request.displayContent, "", false, false);
             _runtimeStatusText = "Sending message";
-            return _bridge.SendToJs("send_message", json);
+            _runtimeIsStreaming = true;
+            return _bridge.SendToJs("send_message", JsonUtility.ToJson(request));
+        }
+
+        public bool ResumeSession(string sessionId, bool recoverInterrupted = false)
+        {
+            if (_bridge?.IsInitialized != true || string.IsNullOrWhiteSpace(sessionId)) return false;
+            var payload = new ResumeSessionPayload
+            {
+                sessionId = sessionId.Trim(),
+                recoverInterrupted = recoverInterrupted,
+            };
+            _runtimeStatusText = "Loading session";
+            return _bridge.SendToJs("resume_session", JsonUtility.ToJson(payload));
         }
 
         public bool NewSession()
@@ -320,6 +354,73 @@ namespace Pie
                         _runtimeStatusText = detail;
                     break;
                 }
+                case "timeline_item":
+                {
+                    var item = JsonUtility.FromJson<PieTimelineItem>(json ?? "{}");
+                    if (item != null)
+                    {
+                        UpsertCurrentTimelineItem(item);
+                        OnTimelineItemChanged?.Invoke(item);
+                    }
+                    break;
+                }
+                case "session_sync":
+                {
+                    var snapshot = JsonUtility.FromJson<PieSessionSnapshot>(json ?? "{}");
+                    if (snapshot != null)
+                    {
+                        if (snapshot.messages == null)
+                            snapshot.messages = Array.Empty<PieSessionMessage>();
+                        if (snapshot.timelineItems == null)
+                            snapshot.timelineItems = Array.Empty<PieTimelineItem>();
+                        CurrentSession = snapshot;
+                        ActiveSessionId = snapshot.id ?? "";
+                        OnSessionChanged?.Invoke(snapshot);
+                    }
+                    break;
+                }
+                case "status_snapshot":
+                {
+                    var status = JsonUtility.FromJson<PieAgentStatus>(json ?? "{}");
+                    if (status != null)
+                    {
+                        CurrentStatus = status;
+                        _runtimeIsStreaming = string.Equals(status.phase, "responding", StringComparison.Ordinal)
+                            || string.Equals(status.phase, "running_tool", StringComparison.Ordinal)
+                            || string.Equals(status.turnState, "continuing", StringComparison.Ordinal);
+                        _runtimeStatusText = !string.IsNullOrEmpty(status.activeToolName)
+                            ? "Using " + status.activeToolName
+                            : status.phase ?? "";
+                        OnStatusChanged?.Invoke(status);
+                    }
+                    break;
+                }
+                case "runtime_error":
+                {
+                    var error = JsonUtility.FromJson<PieRuntimeError>(json ?? "{}");
+                    if (error != null)
+                    {
+                        _lastStructuredErrorMessage = error.message ?? "";
+                        _runtimeIsStreaming = false;
+                        _runtimeStatusText = "Error";
+                        OnRuntimeError?.Invoke(error);
+                    }
+                    break;
+                }
+                case "turn_finished":
+                {
+                    var result = JsonUtility.FromJson<PieTurnResult>(json ?? "{}");
+                    if (result != null)
+                    {
+                        _runtimeIsStreaming = false;
+                        _runtimeStatusText = string.Equals(result.outcome, "completed", StringComparison.Ordinal)
+                            ? "Idle"
+                            : result.outcome ?? "Idle";
+                        _lastAssistantText = "";
+                        OnTurnFinished?.Invoke(result);
+                    }
+                    break;
+                }
                 case "error":
                 {
                     var message = ExtractJsonString(json, "message") ?? json;
@@ -327,6 +428,18 @@ namespace Pie
                     _runtimeStatusText = "Error";
                     AddDevRpcMessage("system", "error", message ?? "", "", false, true);
                     OnError?.Invoke(message);
+                    if (!string.Equals(message, _lastStructuredErrorMessage, StringComparison.Ordinal))
+                    {
+                        OnRuntimeError?.Invoke(new PieRuntimeError
+                        {
+                            code = "LEGACY_ERROR",
+                            category = "agent",
+                            message = message ?? "",
+                            retryable = false,
+                            sessionId = ActiveSessionId,
+                        });
+                    }
+                    _lastStructuredErrorMessage = "";
                     break;
                 }
             }
@@ -428,6 +541,35 @@ namespace Pie
             if (_devRpcMessages.Count <= maxMessages)
                 return;
             _devRpcMessages.RemoveRange(0, _devRpcMessages.Count - maxMessages);
+        }
+
+        private void UpsertCurrentTimelineItem(PieTimelineItem item)
+        {
+            if (CurrentSession == null || item == null)
+                return;
+
+            var items = CurrentSession.timelineItems ?? Array.Empty<PieTimelineItem>();
+            for (var i = 0; i < items.Length; i++)
+            {
+                if (items[i] != null && string.Equals(items[i].itemId, item.itemId, StringComparison.Ordinal))
+                {
+                    items[i] = item;
+                    CurrentSession.timelineItems = items;
+                    return;
+                }
+            }
+
+            var expanded = new PieTimelineItem[items.Length + 1];
+            Array.Copy(items, expanded, items.Length);
+            expanded[items.Length] = item;
+            CurrentSession.timelineItems = expanded;
+        }
+
+        [Serializable]
+        private sealed class ResumeSessionPayload
+        {
+            public string sessionId;
+            public bool recoverInterrupted;
         }
 
         private static string EscapeJsonString(string value)

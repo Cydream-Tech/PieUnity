@@ -243,6 +243,32 @@ Available local commands include:
 4. Call `SendChatMessage(...)`
 5. Listen to `OnAssistantMessage`, `OnAssistantDelta`, `OnToolStart`, `OnToolEnd`, and `OnError`
 
+Runtime chat UIs can use the additive structured API without parsing those
+legacy string events:
+
+```csharp
+runner.OnTimelineItemChanged += item => Debug.Log($"{item.kind}: {item.summary}");
+runner.OnSessionChanged += snapshot => Debug.Log($"Session: {snapshot.id}");
+runner.OnStatusChanged += status => Debug.Log(status.phase);
+runner.OnTurnFinished += result => Debug.Log(result.outcome);
+runner.OnRuntimeError += error => Debug.LogError($"{error.code}: {error.message}");
+
+runner.SendChatMessage(new Pie.PieChatRequest
+{
+    content = "Full model-facing runtime contract and prompt",
+    displayContent = "Create a voxel item",
+    clientTurnId = "operation-42",
+});
+
+// Restores the persisted messages and emits a complete PieSessionSnapshot.
+runner.ResumeSession("sess_xxx");
+```
+
+`displayContent` is persisted with the user message and is used for the
+player-facing timeline and session title. `content` remains the model input.
+One session snapshot contains at most the latest 50 turns / 500 timeline
+items; thinking blocks are never projected into the runtime timeline.
+
 Example:
 
 ```csharp

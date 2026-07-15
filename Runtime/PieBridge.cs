@@ -595,7 +595,13 @@ namespace Pie
                 if (status != -1 && !PieHttpBridge.IsStatusPushed(reqId))
                 {
                     PieHttpBridge.MarkStatusPushed(reqId);
-                    var error = PieHttpBridge.GetError(reqId);
+                    // A successful response can complete (and fail) before this
+                    // frame pumps it. Do not smuggle that body-read failure through
+                    // the response-header event; the terminal event must follow all
+                    // queued SSE lines so protocol markers such as [DONE] win.
+                    var error = status >= 200 && status < 300
+                        ? null
+                        : PieHttpBridge.GetError(reqId);
                     var errorArg = error != null ? JsonString(error) : "null";
                     _jsEnv.Eval($"globalThis._pieSSEStatus({reqId},{status},{errorArg})");
                     return;
@@ -608,13 +614,20 @@ namespace Pie
                         break;
 
                     if (line == null)
-                    {
-                        _jsEnv.Eval($"globalThis._pieSSEPush({reqId},null)");
                         break;
-                    }
 
                     _jsEnv.Eval($"globalThis._pieSSEPush({reqId},{JsonString(line)})");
                     pushed++;
+                }
+
+                if (PieHttpBridge.TryGetTerminal(reqId, out var terminalError))
+                {
+                    var errorArg = terminalError != null ? JsonString(terminalError) : "null";
+                    _jsEnv.Eval(
+                        $"typeof globalThis._pieSSETerminal === 'function' " +
+                        $"? globalThis._pieSSETerminal({reqId},{errorArg}) " +
+                        $": globalThis._pieSSEPush({reqId},null)");
+                    PieHttpBridge.MarkTerminalPushed(reqId);
                 }
             }
         }

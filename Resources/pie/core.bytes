@@ -14339,12 +14339,12 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       "guardFindings",
       "timedOut"
     ];
-    const summary = {};
+    const summary2 = {};
     for (const key of keys) {
       if (!(key in details)) continue;
       const value = details[key];
       if (key === "attempts" && Array.isArray(value)) {
-        summary[key] = value.slice(-5).map((attempt) => {
+        summary2[key] = value.slice(-5).map((attempt) => {
           if (!isRecord(attempt)) return attempt;
           return {
             provider: attempt.provider,
@@ -14360,7 +14360,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
         continue;
       }
       if ((key === "sources" || key === "fetchedSources" || key === "browserRequiredSources") && Array.isArray(value)) {
-        summary[key] = {
+        summary2[key] = {
           count: value.length,
           items: value.slice(0, 5).map((entry) => {
             if (!isRecord(entry)) return entry;
@@ -14378,7 +14378,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
         continue;
       }
       if (key === "providerHealth" && Array.isArray(value)) {
-        summary[key] = value.slice(0, 5).map((entry) => {
+        summary2[key] = value.slice(0, 5).map((entry) => {
           if (!isRecord(entry)) return entry;
           return {
             routeKey: entry.routeKey,
@@ -14393,7 +14393,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
         continue;
       }
       if (key === "providerAttempts" && Array.isArray(value)) {
-        summary[key] = value.slice(-5).map((attempt) => {
+        summary2[key] = value.slice(-5).map((attempt) => {
           if (!isRecord(attempt)) return attempt;
           return {
             provider: attempt.provider,
@@ -14407,9 +14407,9 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
         });
         continue;
       }
-      summary[key] = typeof value === "string" && value.length > 300 ? `${value.slice(0, 300)}...` : value;
+      summary2[key] = typeof value === "string" && value.length > 300 ? `${value.slice(0, 300)}...` : value;
     }
-    return Object.keys(summary).length > 0 ? summary : void 0;
+    return Object.keys(summary2).length > 0 ? summary2 : void 0;
   }
   function createEmptyRuntimeSummary() {
     return {
@@ -14530,67 +14530,67 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
   }
   function summarizeRuntimeEvent(value) {
     if (!isRecord(value)) return typeof value;
-    const summary = {
+    const summary2 = {
       type: value.type
     };
-    if ("toolCallId" in value) summary.toolCallId = value.toolCallId;
-    if ("toolName" in value) summary.toolName = value.toolName;
-    if ("turnIndex" in value) summary.turnIndex = value.turnIndex;
-    if ("isError" in value) summary.isError = value.isError;
+    if ("toolCallId" in value) summary2.toolCallId = value.toolCallId;
+    if ("toolName" in value) summary2.toolName = value.toolName;
+    if ("turnIndex" in value) summary2.turnIndex = value.turnIndex;
+    if ("isError" in value) summary2.isError = value.isError;
     if ("errorMessage" in value && typeof value.errorMessage === "string") {
-      summary.errorMessage = summarizeString(value.errorMessage);
+      summary2.errorMessage = summarizeString(value.errorMessage);
     }
-    if ("message" in value) summary.message = summarizeMessage(value.message);
-    if ("toolResults" in value) summary.toolResults = summarizeToolResults(value.toolResults);
-    return summary;
+    if ("message" in value) summary2.message = summarizeMessage(value.message);
+    if ("toolResults" in value) summary2.toolResults = summarizeToolResults(value.toolResults);
+    return summary2;
   }
   function shouldRecordRuntimeEvent(type) {
     const normalizedType = type.startsWith("runtime:") ? type.slice("runtime:".length) : type;
     return normalizedType !== "agent_event" && normalizedType !== "semantic_event";
   }
   function recomputeRuntimeSummaryFromTimeline(events) {
-    const summary = createEmptyRuntimeSummary();
+    const summary2 = createEmptyRuntimeSummary();
     for (const event of events ?? []) {
-      if (/queue|queued_turn/.test(event.type)) summary.queuedTurnEvents++;
-      if (/retry/.test(event.type)) summary.retryEvents++;
-      if (/auto_compaction|auto_compact|compaction/.test(event.type)) summary.autoCompactionEvents++;
-      if (/runtime_guard|repeated_tool_error/.test(event.type)) summary.runtimeGuardEvents++;
-      if (/subagent/.test(event.type)) summary.subagentEvents++;
-      if (event.type === "tool_end" || event.type === "tool_error") summary.toolResults++;
-      if (event.type === "tool_error") summary.toolErrors++;
+      if (/queue|queued_turn/.test(event.type)) summary2.queuedTurnEvents++;
+      if (/retry/.test(event.type)) summary2.retryEvents++;
+      if (/auto_compaction|auto_compact|compaction/.test(event.type)) summary2.autoCompactionEvents++;
+      if (/runtime_guard|repeated_tool_error/.test(event.type)) summary2.runtimeGuardEvents++;
+      if (/subagent/.test(event.type)) summary2.subagentEvents++;
+      if (event.type === "tool_end" || event.type === "tool_error") summary2.toolResults++;
+      if (event.type === "tool_error") summary2.toolErrors++;
     }
-    return summary;
+    return summary2;
   }
   function summarizeMeta(meta) {
     if (!isRecord(meta)) return meta;
-    const summary = {};
+    const summary2 = {};
     for (const [key, value] of Object.entries(meta)) {
       if (key === "messages" || key === "queuedInputs" || key === "result") {
-        summary[key] = Array.isArray(value) ? { count: value.length } : typeof value;
+        summary2[key] = Array.isArray(value) ? { count: value.length } : typeof value;
         continue;
       }
       if (key === "addedMessages") {
-        summary[key] = summarizeMessages(value);
+        summary2[key] = summarizeMessages(value);
         continue;
       }
       if (key === "message") {
-        summary[key] = summarizeMessage(value);
+        summary2[key] = summarizeMessage(value);
         continue;
       }
       if (key === "toolResults") {
-        summary[key] = summarizeToolResults(value);
+        summary2[key] = summarizeToolResults(value);
         continue;
       }
       if (key === "failure") {
-        summary[key] = summarizeFailure(value);
+        summary2[key] = summarizeFailure(value);
         continue;
       }
       if (key === "event") {
-        summary[key] = summarizeRuntimeEvent(value);
+        summary2[key] = summarizeRuntimeEvent(value);
         continue;
       }
       if (key === "queuedInput" && isRecord(value)) {
-        summary[key] = {
+        summary2[key] = {
           mode: value.mode,
           source: value.source,
           visibility: value.visibility,
@@ -14598,9 +14598,9 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
         };
         continue;
       }
-      summary[key] = typeof value === "string" ? summarizeString(value) : value;
+      summary2[key] = typeof value === "string" ? summarizeString(value) : value;
     }
-    return summary;
+    return summary2;
   }
   function toStringArray(value) {
     if (!Array.isArray(value)) return void 0;
@@ -14930,12 +14930,12 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
           ...this.trace.subagentSummaries ?? [],
           ...subagentSummaries
         ].slice(-50);
-        for (const summary of subagentSummaries) {
+        for (const summary2 of subagentSummaries) {
           this.pushTimeline({
             type: "subagent_child_end",
-            summary: `subagent ${summary.name} ${summary.status}`,
-            details: summary,
-            failure: summary.status !== "completed"
+            summary: `subagent ${summary2.name} ${summary2.status}`,
+            details: summary2,
+            failure: summary2.status !== "completed"
           });
         }
         this.pushEvent("subagent_summary", { count: subagentSummaries.length });
@@ -16438,10 +16438,10 @@ ${compactSummary}`;
     }
     return -1;
   }
-  function createCompactionSummaryMessage(summary, timestamp) {
+  function createCompactionSummaryMessage(summary2, timestamp) {
     return {
       role: "user",
-      content: [{ type: "text", text: formatCompactSummaryText(summary) }],
+      content: [{ type: "text", text: formatCompactSummaryText(summary2) }],
       timestamp
     };
   }
@@ -17341,7 +17341,7 @@ ${compactSummary}`;
      * Append a compaction checkpoint to the current active path.
      * Full history remains in entries; active messages are reconstructed from this checkpoint onward.
      */
-    appendCompaction(summary, firstKeptEntryId, tokensBefore) {
+    appendCompaction(summary2, firstKeptEntryId, tokensBefore) {
       if (!this.activeSession) {
         throw new Error("No active session");
       }
@@ -17351,7 +17351,7 @@ ${compactSummary}`;
         type: "compaction",
         timestamp: Date.now(),
         compactionData: {
-          summary,
+          summary: summary2,
           firstKeptEntryId,
           tokensBefore
         }
@@ -18501,18 +18501,18 @@ ${compactSummary}`;
     return text || stableStringify(result);
   }
   function summarizeToolFailureSignature(result) {
-    const summary = summarizeToolResultForGuard(result).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
-    if (!summary) {
+    const summary2 = summarizeToolResultForGuard(result).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+    if (!summary2) {
       return "";
     }
-    const lines = summary.split("\n");
+    const lines = summary2.split("\n");
     for (let index = lines.length - 1; index >= 0; index--) {
       if (!FAILURE_DIAGNOSTIC_LINE_PATTERN.test(lines[index] ?? "")) {
         continue;
       }
       return lines.slice(index, Math.min(lines.length, index + TOOL_FAILURE_SIGNATURE_CONTEXT_LINES)).join("\n").slice(0, TOOL_FAILURE_SIGNATURE_CHARS);
     }
-    return summary.slice(-TOOL_FAILURE_SIGNATURE_CHARS);
+    return summary2.slice(-TOOL_FAILURE_SIGNATURE_CHARS);
   }
   var AgentSessionRuntimeGuard = class {
     constructor(trigger) {
@@ -19972,9 +19972,9 @@ ${compactSummary}`;
                 };
               }
             }
-            const summary = Object.entries(answers).map(([id, data]) => `${id}: ${data.answer}`).join("\n");
+            const summary2 = Object.entries(answers).map(([id, data]) => `${id}: ${data.answer}`).join("\n");
             return {
-              content: [{ type: "text", text: summary }],
+              content: [{ type: "text", text: summary2 }],
               details: { answers, cancelled: false }
             };
           } catch (error) {
@@ -23355,6 +23355,19 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
     return new Promise((resolve2) => setTimeout(resolve2, ms));
   }
   var sseBuffers = /* @__PURE__ */ new Map();
+  function isTruncatedStreamError(message) {
+    const normalized = message.toLowerCase();
+    return normalized.includes("expecting chunk trailer") || normalized.includes("premature eof") || normalized.includes("premature end") || normalized.includes("ended prematurely") || normalized.includes("unexpected eof") || normalized.includes("unexpected end") || normalized.includes("ended unexpectedly") || normalized.includes("response body was truncated");
+  }
+  function createSSETerminalError(message) {
+    const error = new Error(message);
+    if (isTruncatedStreamError(message)) {
+      error.code = "STREAM_TRUNCATED";
+      error.category = "transport";
+      error.retryable = true;
+    }
+    return error;
+  }
   globalThis._pieSSEPush = (requestId, line) => {
     let buf = sseBuffers.get(requestId);
     if (!buf) {
@@ -23380,10 +23393,28 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
     }
     buf.httpStatus = status;
     buf.httpError = error;
-    if (status >= 400) {
-      buf.error = new Error(error || `HTTP ${status}`);
+    if (error || status >= 400) {
+      buf.error = createSSETerminalError(error || `HTTP ${status}`);
       buf.done = true;
     }
+    if (buf.resolve) {
+      const r = buf.resolve;
+      buf.resolve = void 0;
+      r();
+    }
+  };
+  globalThis._pieSSETerminal = (requestId, error) => {
+    let buf = sseBuffers.get(requestId);
+    if (!buf) {
+      buf = { lines: [] };
+      sseBuffers.set(requestId, buf);
+    }
+    if (error) {
+      buf.error = createSSETerminalError(error);
+      buf.httpError = error;
+    }
+    if (buf.httpStatus === void 0) buf.httpStatus = 0;
+    buf.done = true;
     if (buf.resolve) {
       const r = buf.resolve;
       buf.resolve = void 0;
@@ -23476,10 +23507,11 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
           await sleep3(backoffMs);
           continue;
         }
+        const terminalError = sseBuffers.get(requestId)?.error;
         const errorBody = sseBuffers.get(requestId)?.httpError ?? `HTTP ${httpStatus}`;
         CS.Pie.PieHttpBridge.CancelRequest(requestId);
         sseBuffers.delete(requestId);
-        const err = new Error(errorBody);
+        const err = terminalError || new Error(errorBody);
         err.status = httpStatus;
         err.statusCode = httpStatus;
         throw err;
@@ -26015,15 +26047,23 @@ ${extensionSection.join("\n\n---\n\n")}
   function createSessionId() {
     return `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   }
-  function deriveTitle(messages) {
+  function deriveSessionTitle(messages) {
     const firstUser = messages.find((message) => {
       return typeof message === "object" && message !== null && "role" in message && message.role === "user";
     });
     if (!firstUser) return "New Session";
+    const displayContent = typeof firstUser === "object" && firstUser !== null && "displayContent" in firstUser ? firstUser.displayContent : void 0;
     const contentValue = typeof firstUser === "object" && firstUser !== null && "content" in firstUser ? firstUser.content : void 0;
-    const content = Array.isArray(contentValue) ? contentValue.filter((block) => {
-      return !!block && typeof block === "object" && block.type === "text" && typeof block.text === "string";
-    }).map((block) => block.text).join(" ") : "";
+    let content = "";
+    if (typeof displayContent === "string" && displayContent.trim().length > 0) {
+      content = displayContent;
+    } else if (typeof contentValue === "string") {
+      content = contentValue;
+    } else if (Array.isArray(contentValue)) {
+      content = contentValue.filter((block) => {
+        return !!block && typeof block === "object" && block.type === "text" && typeof block.text === "string";
+      }).map((block) => block.text).join(" ");
+    }
     const compact = String(content || "New Session").replace(/\s+/g, " ").trim();
     return compact.slice(0, 48) || "New Session";
   }
@@ -26060,7 +26100,7 @@ ${extensionSection.join("\n\n---\n\n")}
   function normalizeLegacySessionRecord(record) {
     const messages = Array.isArray(record.messages) ? record.messages : [];
     const todoState = normalizeTodoState(record.todoState);
-    const title = deriveTitle(messages);
+    const title = deriveSessionTitle(messages);
     return {
       id: record.id,
       title,
@@ -26077,7 +26117,7 @@ ${extensionSection.join("\n\n---\n\n")}
   function toSessionRecordFromFramework(data) {
     const metadata = data.metadata || {};
     const messages = data.messages || flattenTreeToMessages(data.entries || [], data.metadata.activeEntryId ?? null);
-    const title = typeof metadata.name === "string" && metadata.name.length > 0 ? metadata.name : deriveTitle(messages);
+    const title = typeof metadata.name === "string" && metadata.name.length > 0 ? metadata.name : deriveSessionTitle(messages);
     return {
       id: data.metadata.id,
       title,
@@ -26118,7 +26158,7 @@ ${extensionSection.join("\n\n---\n\n")}
     const now = isoNow();
     return {
       id: params.sessionId || createSessionId(),
-      title: deriveTitle(params.messages),
+      title: deriveSessionTitle(params.messages),
       createdAt: now,
       updatedAt: now,
       parentSessionId: params.parentSessionId,
@@ -26142,7 +26182,7 @@ ${extensionSection.join("\n\n---\n\n")}
       ...record,
       createdAt: existing?.createdAt || toIsoString(record.createdAt),
       updatedAt: isoNow(),
-      title: deriveTitle(record.messages || []),
+      title: deriveSessionTitle(record.messages || []),
       messageCount: Array.isArray(record.messages) ? record.messages.length : 0,
       todoState: normalizeTodoState(record.todoState)
     };
@@ -26255,8 +26295,445 @@ ${extensionSection.join("\n\n---\n\n")}
     return lines.join("\n");
   }
 
+  // src/runtime-chat-projection.ts
+  var MAX_ASSISTANT_TEXT = 12e3;
+  var MAX_SUMMARY = 512;
+  var MAX_TOOL_FIELD = 4e3;
+  var MAX_TIMELINE_ITEMS = 500;
+  var MAX_TURNS = 50;
+  function isRecord6(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  }
+  function truncate2(value, limit) {
+    if (value.length <= limit) return { value, truncated: false };
+    return { value: value.slice(0, limit), truncated: true };
+  }
+  function summary(value) {
+    return truncate2(value.replace(/\s+/g, " ").trim(), MAX_SUMMARY).value;
+  }
+  function jsonText(value) {
+    let encoded = "";
+    try {
+      encoded = JSON.stringify(value ?? {}) ?? "";
+    } catch {
+      encoded = "";
+    }
+    return truncate2(encoded, MAX_TOOL_FIELD);
+  }
+  function timestampOf(message, fallback) {
+    const timestamp = message?.timestamp;
+    return typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : fallback;
+  }
+  function messageText(message) {
+    const content = message?.content;
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content.filter((block) => isRecord6(block) && block.type === "text").map((block) => typeof block.text === "string" ? block.text : "").join("");
+  }
+  function displayText(message) {
+    const display = message?.displayContent;
+    return typeof display === "string" && display.length > 0 ? display : messageText(message);
+  }
+  function clientTurnIdOf(message) {
+    const id = message?.clientTurnId;
+    return typeof id === "string" ? id : "";
+  }
+  function toolResultText(message) {
+    return messageText(message);
+  }
+  function baseTimelineItem(params) {
+    return {
+      schemaVersion: 1,
+      sessionId: params.sessionId,
+      clientTurnId: params.clientTurnId,
+      itemId: params.itemId,
+      kind: params.kind,
+      status: params.status,
+      startedAt: params.timestamp,
+      updatedAt: params.timestamp,
+      completedAt: params.status === "running" ? 0 : params.timestamp,
+      text: "",
+      summary: "",
+      toolCallId: "",
+      toolName: "",
+      argsJson: "",
+      resultText: "",
+      detailsJson: "",
+      isError: params.status === "failed",
+      isTruncated: false
+    };
+  }
+  function normalizedTurnId(sessionId, timestamp, messageIndex, value) {
+    return value || `${sessionId}:turn:${timestamp}:${messageIndex}`;
+  }
+  function turnSlice(messages) {
+    const userIndices = [];
+    messages.forEach((message, index) => {
+      if (String(message?.role || "") === "user") userIndices.push(index);
+    });
+    const offset = userIndices.length > MAX_TURNS ? userIndices[userIndices.length - MAX_TURNS] : 0;
+    return { messages: messages.slice(offset), offset };
+  }
+  function buildRuntimeTimelineItems(sessionId, messages, createdAt) {
+    const source = Array.isArray(messages) ? messages : [];
+    const { messages: recent, offset } = turnSlice(source);
+    const baseTimestamp = Math.max(0, Date.parse(createdAt || "")) || 1;
+    const items = [];
+    const toolsByCallId = /* @__PURE__ */ new Map();
+    let activeClientTurnId = "";
+    let assistantIndex = -1;
+    recent.forEach((message, localIndex) => {
+      const messageIndex = offset + localIndex;
+      const metadata = message;
+      const role = String(metadata?.role || "assistant");
+      const timestamp = timestampOf(message, baseTimestamp + messageIndex);
+      if (role === "user") {
+        activeClientTurnId = normalizedTurnId(sessionId, timestamp, messageIndex, clientTurnIdOf(message));
+        assistantIndex = -1;
+        const textValue = truncate2(displayText(message), MAX_ASSISTANT_TEXT);
+        const item = baseTimelineItem({
+          sessionId,
+          clientTurnId: activeClientTurnId,
+          itemId: `${activeClientTurnId}:user`,
+          kind: "user",
+          status: "succeeded",
+          timestamp
+        });
+        item.text = textValue.value;
+        item.summary = summary(textValue.value);
+        item.isTruncated = textValue.truncated;
+        items.push(item);
+        return;
+      }
+      if (!activeClientTurnId) {
+        activeClientTurnId = normalizedTurnId(sessionId, timestamp, messageIndex, "");
+      }
+      if (role === "assistant") {
+        assistantIndex += 1;
+        const textValue = truncate2(messageText(message), MAX_ASSISTANT_TEXT);
+        const stopReason = typeof metadata.stopReason === "string" ? metadata.stopReason : "";
+        const errorMessage = typeof metadata.errorMessage === "string" ? metadata.errorMessage : "";
+        const status = stopReason === "aborted" ? "aborted" : stopReason === "error" || errorMessage ? "failed" : "succeeded";
+        if (textValue.value || errorMessage) {
+          const item = baseTimelineItem({
+            sessionId,
+            clientTurnId: activeClientTurnId,
+            itemId: `${activeClientTurnId}:assistant:${assistantIndex}`,
+            kind: "assistant",
+            status,
+            timestamp
+          });
+          item.text = textValue.value || errorMessage;
+          item.summary = summary(item.text);
+          item.isError = status === "failed";
+          item.isTruncated = textValue.truncated;
+          items.push(item);
+        }
+        const content = Array.isArray(metadata.content) ? metadata.content : [];
+        for (const block of content) {
+          if (!isRecord6(block) || block.type !== "toolCall") continue;
+          const callId = String(block.id || "");
+          const toolName = String(block.name || "tool");
+          const stableCallId = callId || `${messageIndex}:${toolName}`;
+          const encodedArgs = jsonText(block.arguments);
+          const item = baseTimelineItem({
+            sessionId,
+            clientTurnId: activeClientTurnId,
+            itemId: `${activeClientTurnId}:tool:${stableCallId}`,
+            kind: "tool",
+            status: "running",
+            timestamp
+          });
+          item.toolCallId = callId;
+          item.toolName = toolName;
+          item.summary = toolName;
+          item.argsJson = encodedArgs.value;
+          item.isTruncated = encodedArgs.truncated;
+          items.push(item);
+          if (callId) toolsByCallId.set(callId, item);
+        }
+        return;
+      }
+      if (role === "toolResult") {
+        const callId = typeof metadata.toolCallId === "string" ? metadata.toolCallId : "";
+        const toolName = typeof metadata.toolName === "string" ? metadata.toolName : "tool";
+        let item = callId ? toolsByCallId.get(callId) : void 0;
+        if (!item) {
+          const stableCallId = callId || `${messageIndex}:${toolName}`;
+          item = baseTimelineItem({
+            sessionId,
+            clientTurnId: activeClientTurnId,
+            itemId: `${activeClientTurnId}:tool:${stableCallId}`,
+            kind: "tool",
+            status: "running",
+            timestamp
+          });
+          item.toolCallId = callId;
+          item.toolName = toolName;
+          items.push(item);
+          if (callId) toolsByCallId.set(callId, item);
+        }
+        const result = truncate2(toolResultText(message), MAX_TOOL_FIELD);
+        const details = jsonText(metadata.details);
+        item.status = metadata.isError === true ? "failed" : "succeeded";
+        item.updatedAt = timestamp;
+        item.completedAt = timestamp;
+        item.resultText = result.value;
+        item.detailsJson = details.value;
+        item.summary = summary(result.value) || toolName;
+        item.isError = metadata.isError === true;
+        item.isTruncated = item.isTruncated || result.truncated || details.truncated;
+      }
+    });
+    return items.length > MAX_TIMELINE_ITEMS ? items.slice(items.length - MAX_TIMELINE_ITEMS) : items;
+  }
+  function createRuntimeUserMessage(content, displayContent, clientTurnId, timestamp = Date.now()) {
+    return {
+      role: "user",
+      content,
+      displayContent,
+      clientTurnId,
+      timestamp
+    };
+  }
+  function classifyRuntimeError(message) {
+    if (/expecting chunk trailer|premature (?:eof|end)|unexpected end|response ended prematurely/i.test(message)) {
+      return { code: "STREAM_TRUNCATED", category: "transport", retryable: true };
+    }
+    if (/abort(?:ed)?/i.test(message)) {
+      return { code: "ABORTED", category: "agent", retryable: false };
+    }
+    return { code: "AGENT_ERROR", category: "agent", retryable: false };
+  }
+  var UnityRuntimeChatProjection = class {
+    constructor(bridge2, getSessionId) {
+      this.bridge = bridge2;
+      this.getSessionId = getSessionId;
+    }
+    active = null;
+    get activeClientTurnId() {
+      return this.active?.clientTurnId || "";
+    }
+    get hadToolActivity() {
+      return this.active?.hadToolActivity === true;
+    }
+    beginTurn(displayContent, requestedClientTurnId) {
+      const startedAt = Date.now();
+      const sessionId = this.getSessionId();
+      const clientTurnId = String(requestedClientTurnId || "").trim() || `turn_${startedAt.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      this.active = {
+        sessionId,
+        clientTurnId,
+        displayContent,
+        startedAt,
+        assistantIndex: -1,
+        assistantItemId: "",
+        hadToolActivity: false,
+        terminalSent: false,
+        emittedErrorKeys: /* @__PURE__ */ new Set(),
+        toolSequence: 0,
+        toolsByCallId: /* @__PURE__ */ new Map(),
+        toolsByName: /* @__PURE__ */ new Map()
+      };
+      const value = truncate2(displayContent, MAX_ASSISTANT_TEXT);
+      const item = baseTimelineItem({
+        sessionId,
+        clientTurnId,
+        itemId: `${clientTurnId}:user`,
+        kind: "user",
+        status: "succeeded",
+        timestamp: startedAt
+      });
+      item.text = value.value;
+      item.summary = summary(value.value);
+      item.isTruncated = value.truncated;
+      this.emitTimeline(item);
+      return clientTurnId;
+    }
+    beginAssistant(timestamp = Date.now()) {
+      const active = this.active;
+      if (!active) return;
+      active.assistantIndex += 1;
+      active.assistantItemId = `${active.clientTurnId}:assistant:${active.assistantIndex}`;
+      void timestamp;
+    }
+    updateAssistant(text, timestamp = Date.now()) {
+      const active = this.active;
+      if (!active) return;
+      if (!active.assistantItemId) this.beginAssistant(timestamp);
+      const value = truncate2(text, MAX_ASSISTANT_TEXT);
+      const item = baseTimelineItem({
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        itemId: active.assistantItemId,
+        kind: "assistant",
+        status: "running",
+        timestamp: active.startedAt
+      });
+      item.updatedAt = timestamp;
+      item.text = value.value;
+      item.summary = summary(value.value);
+      item.isTruncated = value.truncated;
+      this.emitTimeline(item);
+    }
+    endAssistant(message, timestamp = Date.now()) {
+      const active = this.active;
+      if (!active || !active.assistantItemId) return;
+      const metadata = message;
+      const text = truncate2(messageText(message), MAX_ASSISTANT_TEXT);
+      const stopReason = typeof metadata.stopReason === "string" ? metadata.stopReason : "";
+      const errorText = typeof metadata.errorMessage === "string" ? metadata.errorMessage : "";
+      const status = stopReason === "aborted" ? "aborted" : stopReason === "error" || errorText ? "failed" : "succeeded";
+      if (!text.value && !errorText) {
+        active.assistantItemId = "";
+        return;
+      }
+      const item = baseTimelineItem({
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        itemId: active.assistantItemId,
+        kind: "assistant",
+        status,
+        timestamp: active.startedAt
+      });
+      item.updatedAt = timestamp;
+      item.completedAt = timestamp;
+      item.text = text.value || errorText;
+      item.summary = summary(item.text);
+      item.isError = status === "failed";
+      item.isTruncated = text.truncated;
+      this.emitTimeline(item);
+      active.assistantItemId = "";
+    }
+    startTool(toolCallId, toolName, args, timestamp = Date.now()) {
+      const active = this.active;
+      if (!active) return;
+      active.hadToolActivity = true;
+      const encodedArgs = jsonText(args);
+      active.toolSequence += 1;
+      const itemId = toolCallId ? `${active.clientTurnId}:tool:${toolCallId}` : `${active.clientTurnId}:tool:${toolName || "tool"}:${active.toolSequence}`;
+      const tracked = {
+        itemId,
+        startedAt: timestamp,
+        toolCallId,
+        toolName,
+        argsJson: encodedArgs.value,
+        argsTruncated: encodedArgs.truncated
+      };
+      if (toolCallId) active.toolsByCallId.set(toolCallId, tracked);
+      active.toolsByName.set(toolName || "tool", tracked);
+      const item = baseTimelineItem({
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        itemId,
+        kind: "tool",
+        status: "running",
+        timestamp
+      });
+      item.toolCallId = toolCallId;
+      item.toolName = toolName;
+      item.summary = toolName;
+      item.argsJson = encodedArgs.value;
+      item.isTruncated = encodedArgs.truncated;
+      this.emitTimeline(item);
+    }
+    endTool(params) {
+      const active = this.active;
+      if (!active) return;
+      active.hadToolActivity = true;
+      const timestamp = params.timestamp ?? Date.now();
+      const toolNameKey = params.toolName || "tool";
+      const tracked = (params.toolCallId ? active.toolsByCallId.get(params.toolCallId) : void 0) || active.toolsByName.get(toolNameKey);
+      const fallbackItemId = params.toolCallId ? `${active.clientTurnId}:tool:${params.toolCallId}` : `${active.clientTurnId}:tool:${toolNameKey}:unmatched`;
+      const args = tracked ? { value: tracked.argsJson, truncated: tracked.argsTruncated } : jsonText(params.args);
+      const resultText = truncate2(params.resultText, MAX_TOOL_FIELD);
+      const details = jsonText(params.result?.details);
+      const item = baseTimelineItem({
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        itemId: tracked?.itemId || fallbackItemId,
+        kind: "tool",
+        status: params.isError ? "failed" : "succeeded",
+        timestamp: tracked?.startedAt ?? timestamp
+      });
+      item.updatedAt = timestamp;
+      item.completedAt = timestamp;
+      item.toolCallId = params.toolCallId || tracked?.toolCallId || "";
+      item.toolName = params.toolName || tracked?.toolName || "tool";
+      item.summary = summary(resultText.value) || item.toolName;
+      item.argsJson = args.value;
+      item.resultText = resultText.value;
+      item.detailsJson = details.value;
+      item.isError = params.isError;
+      item.isTruncated = args.truncated || resultText.truncated || details.truncated;
+      this.emitTimeline(item);
+      if (tracked) {
+        if (tracked.toolCallId) active.toolsByCallId.delete(tracked.toolCallId);
+        if (active.toolsByName.get(tracked.toolName || "tool") === tracked) {
+          active.toolsByName.delete(tracked.toolName || "tool");
+        }
+      }
+    }
+    emitError(message, overrides = {}) {
+      const active = this.active;
+      const classified = classifyRuntimeError(message);
+      const payload = {
+        ...classified,
+        message,
+        sessionId: active?.sessionId || this.getSessionId(),
+        clientTurnId: active?.clientTurnId || "",
+        hadToolActivity: active?.hadToolActivity === true,
+        ...overrides
+      };
+      const errorKey = `${payload.code}:${payload.message}`;
+      if (!active || !active.emittedErrorKeys.has(errorKey)) {
+        active?.emittedErrorKeys.add(errorKey);
+        this.bridge.sendToUnity("runtime_error", payload);
+        const timestamp = Date.now();
+        const item = baseTimelineItem({
+          sessionId: payload.sessionId,
+          clientTurnId: payload.clientTurnId,
+          itemId: `${payload.clientTurnId || payload.sessionId}:error:${payload.code}:${timestamp}`,
+          kind: "error",
+          status: payload.code === "ABORTED" ? "aborted" : "failed",
+          timestamp
+        });
+        const value = truncate2(message, MAX_ASSISTANT_TEXT);
+        item.text = value.value;
+        item.summary = summary(value.value);
+        item.isError = payload.code !== "ABORTED";
+        item.isTruncated = value.truncated;
+        this.emitTimeline(item);
+      }
+      return payload;
+    }
+    finishTurn(outcome, stopReason) {
+      const active = this.active;
+      if (active?.terminalSent) return;
+      if (active) active.terminalSent = true;
+      const payload = {
+        sessionId: active?.sessionId || this.getSessionId(),
+        clientTurnId: active?.clientTurnId || "",
+        outcome,
+        stopReason
+      };
+      this.bridge.sendToUnity("turn_finished", payload);
+    }
+    resetForSessionSwitch() {
+      this.active = null;
+    }
+    emitTimeline(item) {
+      this.bridge.sendToUnity("timeline_item", item);
+    }
+  };
+
   // src/session-runtime.ts
   function createSessionRuntime(deps) {
+    function messagesForPersistence() {
+      const agentMessages = deps.agent.state.messages.slice();
+      const sessionMessages = (deps.getCurrentSession().messages || []).slice();
+      return sessionMessages.length > agentMessages.length ? sessionMessages : agentMessages;
+    }
     function syncSessionInfo() {
       deps.agent.sessionId = deps.getCurrentSession().id;
     }
@@ -26266,7 +26743,7 @@ ${extensionSection.join("\n\n---\n\n")}
         ...currentSession,
         provider: deps.getProvider(),
         modelId: deps.getModelId(),
-        messages: deps.agent.state.messages.slice(),
+        messages: messagesForPersistence(),
         todoState: deps.getTodoState()
       };
       if (isSessionEmpty(nextRecord)) {
@@ -26287,18 +26764,14 @@ ${extensionSection.join("\n\n---\n\n")}
         ...deps.getCurrentSession(),
         provider: deps.getProvider(),
         modelId: deps.getModelId(),
-        messages: deps.agent.state.messages.slice(),
+        messages: messagesForPersistence(),
         todoState: deps.getTodoState()
       };
       deps.setCurrentSession(await saveSession(deps.projectRoot, nextRecord));
       syncSessionInfo();
     }
-    async function persistCurrentSessionForRecoveryWithPendingUserMessage2(content) {
-      const pendingMessage = {
-        role: "user",
-        content: [{ type: "text", text: content }],
-        timestamp: Date.now()
-      };
+    async function persistCurrentSessionForRecoveryWithPendingUserMessage2(content, displayContent = content, clientTurnId = "") {
+      const pendingMessage = createRuntimeUserMessage(content, displayContent, clientTurnId);
       const nextRecord = {
         ...deps.getCurrentSession(),
         provider: deps.getProvider(),
@@ -27115,11 +27588,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   function assistantEventField(event, field) {
     return event && typeof event === "object" && field in event ? String(event[field] ?? "") : "";
   }
-  function isRecord6(value) {
+  function isRecord7(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function routeMetaFromToolResult(toolName, result) {
-    const details = isRecord6(result) && isRecord6(result.details) ? result.details : void 0;
+    const details = isRecord7(result) && isRecord7(result.details) ? result.details : void 0;
     if (!details) return null;
     if (toolName === "web_search") {
       return {
@@ -27134,7 +27607,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         attempts: Array.isArray(details.attempts) ? details.attempts.length : void 0
       };
     }
-    if (toolName === "read_file" && isRecord6(details.understanding)) {
+    if (toolName === "read_file" && isRecord7(details.understanding)) {
       const understanding = details.understanding;
       return {
         toolName,
@@ -27168,6 +27641,9 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
             bridge2.sendToUnity("state_event", { name: "turn_start", detail: "turn started" });
             break;
           case "message_start":
+            if (messageRole(event.message) === "assistant") {
+              host.runtimeChat.beginAssistant();
+            }
             bridge2.sendToUnity("state_event", { name: "message_start", detail: `role=${messageRole(event.message)}` });
             break;
           case "message_update": {
@@ -27190,7 +27666,10 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               name: "message_update",
               detail: `type=${event.assistantMessageEvent?.type ?? "text"} chars=${text.length}`
             });
-            if (text) bridge2.sendToUnity("message_update", { type: "text_full", text });
+            if (text) {
+              bridge2.sendToUnity("message_update", { type: "text_full", text });
+              host.runtimeChat.updateAssistant(text);
+            }
             break;
           }
           case "message_end":
@@ -27199,6 +27678,9 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 role: "assistant",
                 usage: host.buildUsagePayload(agent2.state.messages || [], event.message)
               });
+            }
+            if (messageRole(event.message) === "assistant") {
+              host.runtimeChat.endAssistant(event.message);
             }
             bridge2.sendToUnity("state_event", { name: "message_end", detail: `role=${messageRole(event.message)}` });
             break;
@@ -27213,6 +27695,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               callId: event.toolCallId,
               argsJson: JSON.stringify(event.args ?? {}).substring(0, 4e3)
             });
+            host.runtimeChat.startTool(event.toolCallId, event.toolName, event.args);
             break;
           case "tool_execution_end": {
             const effectiveArgs = host.extractEffectiveArgs(event.toolName, event.args, event.result?.details);
@@ -27236,6 +27719,14 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               resultJson: JSON.stringify(event.result ?? "").substring(0, 4e3),
               detailsJson: event.result?.details !== void 0 ? JSON.stringify(event.result.details).substring(0, 4e3) : "",
               error: event.isError ? resultText || "Tool returned an error result." : void 0
+            });
+            host.runtimeChat.endTool({
+              toolCallId: event.toolCallId,
+              toolName: event.toolName,
+              args: event.args,
+              result: event.result,
+              resultText,
+              isError: event.isError
             });
             break;
           }
@@ -27264,7 +27755,6 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
             });
             break;
           case "turn_completed": {
-            host.persistCurrentSessionSafely();
             host.refreshTodoLoopState();
             bridge2.sendToUnity("turn_end", {
               role: messageRole(event.message),
@@ -27274,6 +27764,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               name: "turn_completed",
               detail: `stopReason=${messageStopReason(event.message, "stop")}`
             });
+            let shouldFinalizeStructuredTurn = true;
             const executionState = todoTool2.getExecutionState();
             const todoLoopState2 = host.getTodoLoopState();
             if (executionState && todoLoopState2) {
@@ -27288,43 +27779,40 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               });
               host.setTodoLoopState(decision.loop);
               if (decision.action === "continue" && decision.followUpPrompt) {
+                shouldFinalizeStructuredTurn = false;
                 agent2.followUp({ role: "user", content: decision.followUpPrompt, timestamp: Date.now() });
                 bridge2.sendToUnity("state_event", { name: "todo_follow_up_queued", detail: "queued todo closure follow-up" });
               } else if (decision.action === "clear_completed") {
                 todoTool2.reset();
                 host.setTodoLoopState(null);
-                host.persistCurrentSessionSafely();
-                host.emitSessionSync();
               } else if (decision.action === "clear_failed" || decision.action === "clear_stalled") {
                 todoTool2.reset();
                 host.setTodoLoopState(null);
-                host.persistCurrentSessionSafely();
-                host.emitSessionSync();
                 bridge2.sendToUnity("error", {
                   message: decision.action === "clear_stalled" ? "Todo run stalled and was cleared." : "Todo run failed and was cleared."
                 });
               }
+            }
+            if (shouldFinalizeStructuredTurn) {
+              void host.finalizeRuntimeChatTurn("completed", messageStopReason(event.message, "stop"));
+            } else {
+              host.persistCurrentSessionSafely();
             }
             break;
           }
           case "turn_failed": {
             const stopReason = messageStopReason(event.message, "error");
             const errMsg = messageErrorText(event.message);
-            host.persistCurrentSessionSafely();
             const decision = evaluateTodoClosureAfterFailedTurn(host.getTodoLoopState());
             host.setTodoLoopState(decision.loop);
-            if (decision.action === "pause_failed") {
-              host.persistCurrentSessionSafely();
-              host.emitSessionSync();
-            }
             if (decision.action === "clear_failed") {
               todoTool2.reset();
               host.setTodoLoopState(null);
-              host.persistCurrentSessionSafely();
-              host.emitSessionSync();
             }
             bridge2.sendToUnity("turn_end", { role: messageRole(event.message), stopReason });
             bridge2.sendToUnity("state_event", { name: "turn_failed", detail: `stopReason=${stopReason}` });
+            const outcome = stopReason === "aborted" ? "aborted" : "failed";
+            void host.finalizeRuntimeChatTurn(outcome, stopReason, errMsg);
             bridge2.sendToUnity("error", { message: errMsg });
             break;
           }
@@ -27346,11 +27834,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   }
 
   // src/unity-public-api.ts
-  function isRecord7(value) {
+  function isRecord8(value) {
     return typeof value === "object" && value !== null;
   }
   function stringField(value, key) {
-    return isRecord7(value) && typeof value[key] === "string" ? value[key] : void 0;
+    return isRecord8(value) && typeof value[key] === "string" ? value[key] : void 0;
   }
   function installUnityPublicApi(host) {
     globalThis.pie = {
@@ -27358,24 +27846,38 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         try {
           switch (action) {
             case "send_message": {
+              const content = stringField(data, "content") ?? String(data);
+              const displayContent = stringField(data, "displayContent") ?? content;
+              const clientTurnId = host.beginRuntimeChatTurn(displayContent, stringField(data, "clientTurnId"));
               if (!host.hasConfiguredModelSelection()) {
-                host.bridge.sendToUnity("error", { message: host.getModelSelectionWarning() });
+                const message = host.getModelSelectionWarning();
+                host.emitRuntimeError(message, {
+                  code: "MODEL_NOT_CONFIGURED",
+                  category: "configuration",
+                  retryable: false
+                });
+                host.bridge.sendToUnity("error", { message });
+                await host.finalizeRuntimeChatTurn("failed", "error");
                 break;
               }
-              const content = stringField(data, "content") ?? String(data);
               host.sessionTrace.notePendingUserText(content);
               const reminder = host.todoTool.getReminder?.();
               const finalContent = reminder ? `${reminder}${content}` : content;
-              if (await host.handleLocalCommand(content)) break;
-              await host.persistCurrentSessionForRecoveryWithPendingUserMessage(content);
+              if (await host.handleLocalCommand(content)) {
+                await host.finalizeRuntimeChatTurn("completed", "stop");
+                break;
+              }
+              await host.persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId);
               host.emitSessionSync();
               host.sessionTrace.noteDispatchStart({ mode: "unity" });
-              host.promptAgentWithRecovery(finalContent).catch((err) => {
+              host.promptAgentWithRecovery(finalContent, displayContent, clientTurnId).catch(async (err) => {
                 const msg = err instanceof Error ? err.message : String(err);
                 host.bridge.log("error", `[pie/index] agent.prompt rejected: ${msg}`);
+                host.emitRuntimeError(msg);
                 host.bridge.sendToUnity("error", { message: msg });
                 host.sessionTrace.noteStalled(msg, { mode: "unity" });
                 host.sessionTrace.abortTurn(msg);
+                await host.finalizeRuntimeChatTurn("failed", "error");
               }).finally(() => {
                 host.sessionTrace.noteDispatchSettled({ mode: "unity" });
               });
@@ -27386,8 +27888,8 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               const provider = stringField(data, "provider") || "";
               const model = stringField(data, "model") || "";
               const baseUrl = stringField(data, "baseUrl");
-              const verboseLogs = isRecord7(data) && data.verboseLogs === true;
-              if (isRecord7(data) && data.verboseLogs !== void 0) host.setVerboseLogs(verboseLogs);
+              const verboseLogs = isRecord8(data) && data.verboseLogs === true;
+              if (isRecord8(data) && data.verboseLogs !== void 0) host.setVerboseLogs(verboseLogs);
               host.setModelSelection(provider, model, apiKey, baseUrl);
               host.applyModelSelectionSync(provider, model);
               host.bridge.sendToUnity("config_applied", host.getModelStatus());
@@ -27403,16 +27905,33 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               const sessionId = stringField(data, "sessionId")?.trim() || "";
               if (!sessionId) {
                 host.bridge.log("warn", "[pie/index] resume_session called without sessionId");
+                const message = "A session id is required.";
+                host.emitRuntimeError(message, {
+                  code: "SESSION_ID_REQUIRED",
+                  category: "session",
+                  retryable: false
+                });
+                host.bridge.sendToUnity("error", { message });
                 break;
               }
               host.bridge.log("info", `[pie/index] resume_session ${sessionId}`);
               const loaded = await host.loadSession(host.projectRoot, sessionId);
               if (loaded) {
-                const recoverInterrupted = isRecord7(data) && data.recoverInterrupted === true;
+                const recoverInterrupted = isRecord8(data) && data.recoverInterrupted === true;
                 const lastUserText = stringField(data, "lastUserText") || "";
                 host.restoreSessionRecord(recoverInterrupted ? host.trimInterruptedTail(loaded, lastUserText) : loaded);
               } else {
                 host.bridge.log("warn", `[pie/index] resume_session could not load ${sessionId}`);
+                const message = `Session not found: ${sessionId}`;
+                host.emitRuntimeError(message, {
+                  code: "SESSION_NOT_FOUND",
+                  category: "session",
+                  retryable: false,
+                  sessionId,
+                  clientTurnId: "",
+                  hadToolActivity: false
+                });
+                host.bridge.sendToUnity("error", { message });
               }
               break;
             }
@@ -27448,6 +27967,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           host.bridge.log("error", `[pie/index] Error in ${action}: ${msg}`);
+          host.emitRuntimeError(msg);
           host.bridge.sendToUnity("error", { message: msg });
         }
       }
@@ -27507,14 +28027,14 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     const routeSummaries = host.getToolRouteSummaries?.() || [];
     if (routeSummaries.length > 0) {
       lines.push("Tool model routes:");
-      for (const summary of routeSummaries) lines.push(`- ${summary}`);
+      for (const summary2 of routeSummaries) lines.push(`- ${summary2}`);
     }
     lines.push(`AGENTS.md: ${readProjectAgentsFile(host.projectRoot) ? "present" : "missing"}`);
     return lines.join("\n");
   }
 
   // src/unity-local-commands.ts
-  function isRecord8(value) {
+  function isRecord9(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function tryExplainExternalSessionId(host, sessionId) {
@@ -27530,7 +28050,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }
     try {
       const registry2 = JSON.parse(String(CS.System.IO.File.ReadAllText(registryPath) || "{}"));
-      const entries = Object.values(isRecord8(registry2) ? registry2 : {});
+      const entries = Object.values(isRecord9(registry2) ? registry2 : {});
       const matched = entries.find((entry) => String(entry.id || "") === trimmed);
       if (!matched) {
         return null;
@@ -27542,7 +28062,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         for (let index = 0; index < Math.min(files.Length, 8); index += 1) {
           try {
             const parsed = JSON.parse(String(CS.System.IO.File.ReadAllText(files[index]) || "{}"));
-            const metadata = isRecord8(parsed) && isRecord8(parsed.metadata) ? parsed.metadata : parsed;
+            const metadata = isRecord9(parsed) && isRecord9(parsed.metadata) ? parsed.metadata : parsed;
             const id = String(metadata.id || "").trim();
             if (!id) continue;
             const title = String(metadata.name || metadata.title || "Untitled Session");
@@ -28099,11 +28619,11 @@ ${initialAgentsFile}`);
   }
 
   // src/session-message-utils.ts
-  function isRecord9(value) {
+  function isRecord10(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function hasRealUsage(usage) {
-    if (!isRecord9(usage)) return false;
+    if (!isRecord10(usage)) return false;
     return Number(usage.input || 0) > 0 || Number(usage.output || 0) > 0 || Number(usage.cacheRead || 0) > 0 || Number(usage.cacheWrite || 0) > 0 || Number(usage.totalTokens || 0) > 0;
   }
   function estimateTokensFromText(text) {
@@ -28113,12 +28633,12 @@ ${initialAgentsFile}`);
   }
   function collectMessageText(message) {
     if (!message) return "";
-    if (!isRecord9(message)) return "";
+    if (!isRecord10(message)) return "";
     const content = message.content;
     if (typeof content === "string") return content;
     if (!Array.isArray(content)) return "";
     return content.map((block) => {
-      if (!isRecord9(block)) return "";
+      if (!isRecord10(block)) return "";
       if (block.type === "text") return typeof block.text === "string" ? block.text : "";
       if (block.type === "thinking") return typeof block.thinking === "string" ? block.thinking : "";
       if (block.type === "toolCall") {
@@ -28130,9 +28650,9 @@ ${initialAgentsFile}`);
     }).join("");
   }
   function buildUsagePayload(messages, message, fallbackIndex) {
-    const messageRecord = isRecord9(message) ? message : {};
+    const messageRecord = isRecord10(message) ? message : {};
     const usage = messageRecord.usage;
-    if (hasRealUsage(usage) && isRecord9(usage)) {
+    if (hasRealUsage(usage) && isRecord10(usage)) {
       return {
         input: Number(usage.input || 0),
         output: Number(usage.output || 0),
@@ -28190,7 +28710,9 @@ ${initialAgentsFile}`);
     messages: [],
     todoState: []
   });
+  var runtimeChat = new UnityRuntimeChatProjection(bridge, () => _currentSession.id);
   var sessionTrace = new UnitySessionTraceWriter(projectRoot, () => _currentSession?.id);
+  var sessionPersistenceTail = Promise.resolve();
   var todoTool = createManageTodoListTool();
   var todoLoopState = null;
   var fileToolPathOptions = buildFileToolPathOptions();
@@ -28337,14 +28859,19 @@ ${initialAgentsFile}`);
       todoTool
     });
   }
+  function serializeSessionPersistence(action) {
+    const run = sessionPersistenceTail.then(action, action);
+    sessionPersistenceTail = run.catch(() => void 0);
+    return run;
+  }
   async function persistCurrentSession() {
-    await sessionRuntime.persistCurrentSession();
+    await serializeSessionPersistence(() => sessionRuntime.persistCurrentSession());
   }
   async function persistCurrentSessionForRecovery() {
-    await sessionRuntime.persistCurrentSessionForRecovery();
+    await serializeSessionPersistence(() => sessionRuntime.persistCurrentSessionForRecovery());
   }
-  async function persistCurrentSessionForRecoveryWithPendingUserMessage(content) {
-    await sessionRuntime.persistCurrentSessionForRecoveryWithPendingUserMessage(content);
+  async function persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId) {
+    await serializeSessionPersistence(() => sessionRuntime.persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId));
   }
   function cancelActivePromptForSessionSwitch() {
     agent.abort();
@@ -28363,11 +28890,15 @@ ${initialAgentsFile}`);
     const message = error instanceof Error ? error.message : String(error || "");
     return /already processing a prompt/i.test(message) && !isAgentActivelyProcessing();
   }
-  async function promptAgentWithRecovery(input) {
+  async function promptAgentWithRecovery(input, displayContent, clientTurnId) {
     let recoveredStaleLock = false;
+    const promptInput = displayContent !== void 0 || clientTurnId !== void 0 ? createRuntimeUserMessage(input, displayContent ?? input, clientTurnId ?? runtimeChat.activeClientTurnId) : input;
     while (true) {
       try {
-        await agentSessionController.prompt(input, { source: "unity" });
+        await agentSessionController.prompt(promptInput, {
+          source: "unity",
+          displayText: displayContent ?? input
+        });
         return;
       } catch (error) {
         if (!recoveredStaleLock && isStalePromptLockError(error)) {
@@ -28382,12 +28913,14 @@ ${initialAgentsFile}`);
     }
   }
   function startFreshSession(parentSessionId) {
+    runtimeChat.resetForSessionSwitch();
     sessionRuntime.startFreshSession(parentSessionId);
     agentSessionController.syncFromActiveSession();
     todoTool.reset();
     todoLoopState = null;
   }
   function restoreSessionRecord(record) {
+    runtimeChat.resetForSessionSwitch();
     _provider = record.provider || "";
     _modelId = record.modelId || "";
     const resolved = getActiveResolvedModel();
@@ -28397,7 +28930,7 @@ ${initialAgentsFile}`);
     todoTool.restore(record.todoState || []);
     refreshTodoLoopState();
   }
-  function isRecord10(value) {
+  function isRecord11(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function cloneMessage(message) {
@@ -28493,23 +29026,34 @@ ${initialAgentsFile}`);
     const sourceRecord = record || _currentSession;
     const stateMessages = Array.isArray(sourceRecord?.messages) ? sourceRecord.messages : agent.state.messages || [];
     const messages = stateMessages.map((message, index) => {
-      const messageRecord = isRecord10(message) ? message : {};
+      const messageRecord = isRecord11(message) ? message : {};
+      const serializedContent = typeof messageRecord.content === "string" ? [{ type: "text", text: messageRecord.content }] : Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord11(block)).map((block) => ({
+        type: String(block.type || "text"),
+        text: typeof block.text === "string" ? block.text : ""
+      })) : [];
       return {
         role: String(messageRecord.role || "assistant"),
-        content: Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord10(block)).map((block) => ({
-          type: String(block.type || "text"),
-          text: typeof block.text === "string" ? block.text : ""
-        })) : [],
+        timestamp: typeof messageRecord.timestamp === "number" ? messageRecord.timestamp : 0,
+        displayContent: typeof messageRecord.displayContent === "string" ? messageRecord.displayContent : "",
+        clientTurnId: typeof messageRecord.clientTurnId === "string" ? messageRecord.clientTurnId : "",
+        toolCallId: typeof messageRecord.toolCallId === "string" ? messageRecord.toolCallId : "",
+        toolName: typeof messageRecord.toolName === "string" ? messageRecord.toolName : "",
+        isError: messageRecord.isError === true,
+        content: serializedContent,
         errorMessage: typeof messageRecord.errorMessage === "string" ? messageRecord.errorMessage : "",
         stopReason: typeof messageRecord.stopReason === "string" ? messageRecord.stopReason : "",
         usage: buildUsagePayload(stateMessages, message, index)
       };
     });
     bridge.sendToUnity("session_sync", {
+      schemaVersion: 1,
       id: sourceRecord.id,
       title: sourceRecord.title,
+      createdAt: sourceRecord.createdAt,
+      updatedAt: sourceRecord.updatedAt,
       messageCount: messages.length,
       messages,
+      timelineItems: buildRuntimeTimelineItems(sourceRecord.id, stateMessages, sourceRecord.createdAt),
       todoState: Array.isArray(sourceRecord.todoState) ? sourceRecord.todoState : todoTool.getState()
     });
   }
@@ -28526,6 +29070,28 @@ ${initialAgentsFile}`);
     persistCurrentSession().catch((err) => {
       bridge.log("error", `[pie/index] Failed to persist session: ${err instanceof Error ? err.message : String(err)}`);
     });
+  }
+  function beginRuntimeChatTurn(displayContent, clientTurnId) {
+    return runtimeChat.beginTurn(displayContent, clientTurnId);
+  }
+  function emitRuntimeError(message, overrides) {
+    return runtimeChat.emitError(message, overrides);
+  }
+  async function finalizeRuntimeChatTurn(outcome, stopReason, errorMessage) {
+    if (errorMessage) runtimeChat.emitError(errorMessage);
+    try {
+      await persistCurrentSession();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      bridge.log("error", `[pie/index] Failed to persist terminal session snapshot: ${message}`);
+      runtimeChat.emitError(message, {
+        code: "SESSION_PERSIST_FAILED",
+        category: "session",
+        retryable: false
+      });
+    }
+    emitSessionSync();
+    runtimeChat.finishTurn(outcome, stopReason);
   }
   async function applyModelSelection(provider, modelId) {
     const resolved = resolveModelWithRuntimeOverrides(provider, modelId);
@@ -28545,14 +29111,14 @@ ${initialAgentsFile}`);
   function extractToolText(result) {
     if (!result) return "";
     if (typeof result === "string") return result;
-    if (isRecord10(result) && Array.isArray(result.content)) {
-      return result.content.filter((item) => isRecord10(item) && item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
+    if (isRecord11(result) && Array.isArray(result.content)) {
+      return result.content.filter((item) => isRecord11(item) && item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
     }
     return "";
   }
   function extractEffectiveArgs(toolName, args, details) {
-    const argRecord = isRecord10(args) ? args : {};
-    const detailRecord = isRecord10(details) ? details : {};
+    const argRecord = isRecord11(args) ? args : {};
+    const detailRecord = isRecord11(details) ? details : {};
     if (toolName === "find_files") {
       return {
         rawPattern: detailRecord.rawPattern ?? argRecord.pattern ?? argRecord.query ?? argRecord.name ?? argRecord.file_name ?? "",
@@ -28618,6 +29184,8 @@ ${initialAgentsFile}`);
     emitSessionSync,
     persistCurrentSessionSafely,
     refreshTodoLoopState,
+    runtimeChat,
+    finalizeRuntimeChatTurn,
     verboseLog
   });
   installUnityPublicApi({
@@ -28627,6 +29195,8 @@ ${initialAgentsFile}`);
     sessionTrace,
     todoTool,
     applyModelSelectionSync,
+    beginRuntimeChatTurn,
+    emitRuntimeError,
     emitSessionSync,
     emitSkillsList,
     getModelStatus: () => {
@@ -28649,6 +29219,7 @@ ${initialAgentsFile}`);
     persistCurrentSessionSafely,
     projectRoot,
     promptAgentWithRecovery,
+    finalizeRuntimeChatTurn,
     rebuildAgentSurface,
     reloadProjectExtensions,
     restoreSessionRecord,
