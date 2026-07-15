@@ -274,6 +274,7 @@ namespace Pie
 {
     using System;
     using System.IO;
+    using UnityEngine;
     using System.Net;
     using System.Text;
     using System.Threading;
@@ -1743,7 +1744,7 @@ namespace Pie
     // Merged from Runtime/UnityCapabilities/PieUnityCapabilitiesConstants.cs
     public static class PieUnityCapabilitiesConstants
         {
-            public const string Version = "0.1.27";
+            public const string Version = "0.1.28";
             public const string ManifestSchemaVersion = "2";
             public const string SkillProtocolVersion = "pie-unity-rpc/2";
             public const int DefaultPort = 8091;
@@ -1751,14 +1752,29 @@ namespace Pie
             public const int RegistryTtlSeconds = 120;
             public const string ServiceName = "pie-unity";
 
+            private static string UserStateRoot
+            {
+                get
+                {
+#if UNITY_ANDROID && !UNITY_EDITOR
+                    // Environment.SpecialFolder.UserProfile resolves to a read-only
+                    // location in Android Players. Keep runtime discovery/log state
+                    // inside Unity's writable app-owned storage instead.
+                    return Application.persistentDataPath;
+#else
+                    return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+#endif
+                }
+            }
+
             public static string RegistryDirectory =>
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".pie-unity");
+                Path.Combine(UserStateRoot, ".pie-unity");
 
             public static string InstancesDirectory =>
                 Path.Combine(RegistryDirectory, "instances");
 
             public static string SharedLogsDirectory =>
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".pie", "logs");
+                Path.Combine(UserStateRoot, ".pie", "logs");
 
             public static string RuntimeLogFilePath =>
                 Path.Combine(SharedLogsDirectory, "pie-unity.log");

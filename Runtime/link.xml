@@ -1,0 +1,9 @@
+<linker>
+  <!--
+    Pie's embedded JavaScript reaches this assembly through PuerTS CS.*
+    bindings. Those calls are invisible to Unity's static linker, so an
+    IL2CPP Player can otherwise strip public members such as
+    PieProjectPaths.GetSessionsDirectory and PieBridge.ReceiveFromJs.
+  -->
+  <assembly fullname="Pie.Runtime" preserve="all" />
+</linker>

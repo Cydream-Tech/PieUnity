@@ -318,6 +318,8 @@ On desktop, `pie-unity` reads models from `~/.pie/models.json`. In an Android Pl
 
 If no valid profile is configured, Unity starts in an unconfigured model state and asks you to configure `~/.pie/models.json` before sending messages.
 
+Android runtime discovery and Pie logs are also stored below `Application.persistentDataPath`; Android's `UserProfile` location is not assumed to be writable. Keep the package's `Runtime/link.xml` in Player builds: it preserves the PuerTS-visible bridge surface that embedded JavaScript calls through `CS.Pie.*` on IL2CPP.
+
 ## Paths
 
 Project assets:
