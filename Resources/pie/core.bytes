@@ -3097,8 +3097,6 @@ var _PieAgent = (() => {
         this.resolveFinalResult = resolve2;
       });
     }
-    isComplete;
-    extractResult;
     queue = [];
     waiting = [];
     done = false;
@@ -3226,10 +3224,6 @@ var _PieAgent = (() => {
       this.baseContext = baseContext;
       this.minLevel = minLevel;
     }
-    mode;
-    sinks;
-    baseContext;
-    minLevel;
     log(level, message, context = {}) {
       if (LEVEL_ORDER[level] < LEVEL_ORDER[this.minLevel]) {
         return;
@@ -3271,7 +3265,6 @@ var _PieAgent = (() => {
     constructor(mode = "test") {
       this.mode = mode;
     }
-    mode;
     log() {
     }
     debug() {
@@ -14764,9 +14757,6 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       this.trace.recentTimeline = this.trace.recentTimeline.slice(-this.recentEventsLimit);
       this.trace.runtimeSummary = recomputeRuntimeSummaryFromTimeline(this.trace.recentTimeline);
     }
-    trace;
-    recentTurnsLimit;
-    recentEventsLimit;
     pendingUserText = null;
     pushEvent(type, meta) {
       this.trace.recentEvents.push({
@@ -15031,7 +15021,6 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       this.recentEventsLimit = options.recentEventsLimit ?? 100;
       this.debounceMs = options.debounceMs ?? 50;
     }
-    options;
     cachedSessionId = null;
     cachedController = null;
     flushTimer = null;
@@ -17741,7 +17730,6 @@ ${compactSummary}`;
     constructor(options) {
       this.options = options;
     }
-    options;
     autoCompactTimer;
     pendingAutoCompact;
     runningAutoCompact;
@@ -17827,7 +17815,6 @@ ${compactSummary}`;
     constructor(options) {
       this.options = options;
     }
-    options;
     autoContinueTimer;
     pendingAutoContinue;
     resolvePendingAutoContinue;
@@ -18229,7 +18216,6 @@ ${compactSummary}`;
     constructor(options) {
       this.options = options;
     }
-    options;
     dispatchTimer;
     pendingDispatch;
     resolvePendingDispatch;
@@ -18384,11 +18370,6 @@ ${compactSummary}`;
       this.continueTurn = continueTurn;
       this.setRecoveryState = setRecoveryState;
     }
-    retry;
-    emit;
-    removeTrailingAssistantError;
-    continueTurn;
-    setRecoveryState;
     retryAttempt = 0;
     retryTimer;
     pendingRetry;
@@ -18537,7 +18518,6 @@ ${compactSummary}`;
     constructor(trigger) {
       this.trigger = trigger;
     }
-    trigger;
     repeatedToolFailures = /* @__PURE__ */ new Map();
     streamGuard = {
       whitespaceToolCallDeltaChars: 0,
@@ -23784,7 +23764,6 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
     constructor(bridge2) {
       this.bridge = bridge2;
     }
-    bridge;
     log(entry) {
       const moduleName = String(entry.context?.module || "unity");
       const payload = entry.context ? ` ${JSON.stringify(entry.context)}` : "";
@@ -24297,12 +24276,56 @@ Actions: create, read, complete_current, clear.`;
     };
   }
 
+  // src/typescript-runtime.ts
+  function compilerGlobal() {
+    return globalThis.__pieTypeScriptCompiler;
+  }
+  function loadCompilerBundle() {
+    const loadResource = typeof CS !== "undefined" ? CS?.Pie?.PieBridge?.LoadResourceText : void 0;
+    if (typeof loadResource !== "function") {
+      throw new Error("PieBridge.LoadResourceText is required for runtime TypeScript compilation.");
+    }
+    const source = String(loadResource("pie/typescript-compiler") || "");
+    if (!source) {
+      throw new Error("Missing Resources/pie/typescript-compiler.bytes. Rebuild pie-unity.");
+    }
+    const install = new Function(`${source}
+//# sourceURL=pie/typescript-compiler.bytes`);
+    install();
+  }
+  function ensureTypeScriptCompiler() {
+    let compiler = compilerGlobal();
+    if (!compiler) {
+      loadCompilerBundle();
+      compiler = compilerGlobal();
+    }
+    if (!compiler || typeof compiler.compile !== "function") {
+      throw new Error("Runtime TypeScript compiler failed to initialize.");
+    }
+    return compiler;
+  }
+  function compileTypeScript(request) {
+    return ensureTypeScriptCompiler().compile({
+      ...request,
+      module: request.module || "ESNext",
+      target: request.target || "ES2022"
+    });
+  }
+  function formatTypeScriptDiagnostics(diagnostics) {
+    const entries = Array.isArray(diagnostics) ? diagnostics : [];
+    return entries.map((diagnostic) => {
+      const location = diagnostic.line > 0 ? `${diagnostic.fileName || "runtime.ts"}:${diagnostic.line}:${Math.max(1, diagnostic.character || 1)}` : diagnostic.fileName || "runtime.ts";
+      return `${location} TS${diagnostic.code} ${diagnostic.category}: ${diagnostic.message}`;
+    }).join("\n");
+  }
+
   // src/unity-script-host.ts
   var DEFAULT_TOTAL_TIMEOUT_MS = 3e4;
   var DEFAULT_PER_STEP_TIMEOUT_MS = 100;
   var DEFAULT_MAX_FRAMES = 1800;
   var MAX_LOG_LINES = 200;
   var STEP_TIMEOUT_ERROR_CODE = "STEP_TIMEOUT";
+  var TYPESCRIPT_COMPILE_ERROR_CODE = "TYPESCRIPT_COMPILE_ERROR";
   var installedBridge = null;
   var scriptScheduler = {
     now: () => Date.now(),
@@ -24331,6 +24354,66 @@ Actions: create, read, complete_current, clear.`;
   function toPositiveNumber(value, fallback) {
     const numeric = Number(value);
     return Number.isFinite(numeric) && numeric > 0 ? numeric : fallback;
+  }
+  function normalizeScriptLanguage(value) {
+    const normalized = String(value || "javascript").trim().toLowerCase();
+    if (normalized === "javascript" || normalized === "typescript") {
+      return normalized;
+    }
+    throw createScriptHostError(
+      "UNSUPPORTED_LANGUAGE",
+      `Unsupported unity_script_run language: ${normalized || "(empty)"}. Expected javascript or typescript.`
+    );
+  }
+  function typeScriptSourcePath(taskName) {
+    const normalized = String(taskName || "unity-script-run").trim() || "unity-script-run";
+    return /\.tsx?$/i.test(normalized) ? normalized : `${normalized}.ts`;
+  }
+  function normalizeTypeScriptDiagnostics(diagnostics, sourcePath) {
+    return (Array.isArray(diagnostics) ? diagnostics : []).map((diagnostic) => ({
+      category: String(diagnostic.category || "Error"),
+      code: Number(diagnostic.code || 0),
+      message: String(diagnostic.message || "TypeScript compilation failed."),
+      fileName: String(diagnostic.fileName || sourcePath),
+      line: Number(diagnostic.line || 0),
+      character: Number(diagnostic.character || 0)
+    }));
+  }
+  function compileTypeScriptScript(task, source) {
+    const sourcePath = typeScriptSourcePath(task.name);
+    try {
+      const result = compileTypeScript({
+        source,
+        sourcePath,
+        module: "ESNext",
+        target: "ES2022",
+        sourceMap: false,
+        inlineSourceMap: false
+      });
+      task.diagnostics = normalizeTypeScriptDiagnostics(result.diagnostics, sourcePath);
+      if (result.ok) {
+        return result.outputText;
+      }
+      const formatted = formatTypeScriptDiagnostics(task.diagnostics);
+      failTask(
+        task,
+        TYPESCRIPT_COMPILE_ERROR_CODE,
+        formatted || result.errorMessage || "TypeScript compilation failed."
+      );
+      return null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      task.diagnostics = [{
+        category: "Error",
+        code: 9e4,
+        message,
+        fileName: sourcePath,
+        line: 0,
+        character: 0
+      }];
+      failTask(task, TYPESCRIPT_COMPILE_ERROR_CODE, message || "TypeScript compilation failed.");
+      return null;
+    }
   }
   function summarizeValue(value) {
     if (value === null) return "null";
@@ -24373,8 +24456,297 @@ Actions: create, read, complete_current, clear.`;
   function normalizeModuleSource(source) {
     return String(source || "").replace(/\bexport\s+default\s+function\s*\*/g, "function* run").replace(/\bexport\s+default\s+function/g, "function run").replace(/\bexport\s+/g, "");
   }
+  function isIdentifierStart(character) {
+    return character === "$" || character === "_" || /[A-Za-z]/.test(character) || character.charCodeAt(0) > 127;
+  }
+  function isIdentifierPart(character) {
+    return isIdentifierStart(character) || /[0-9]/.test(character);
+  }
+  function scanQuotedLiteral(source, start, quote) {
+    let index = start + 1;
+    while (index < source.length) {
+      if (source[index] === "\\") {
+        index += 2;
+        continue;
+      }
+      if (source[index] === quote) return index + 1;
+      index += 1;
+    }
+    return source.length;
+  }
+  function scanRegularExpression(source, start) {
+    let index = start + 1;
+    let inCharacterClass = false;
+    while (index < source.length) {
+      const character = source[index];
+      if (character === "\\") {
+        index += 2;
+        continue;
+      }
+      if (character === "[") inCharacterClass = true;
+      if (character === "]") inCharacterClass = false;
+      if (character === "/" && !inCharacterClass) {
+        index += 1;
+        while (index < source.length && isIdentifierPart(source[index])) index += 1;
+        return index;
+      }
+      if (character === "\n" || character === "\r") return index;
+      index += 1;
+    }
+    return source.length;
+  }
+  function tokenCanEndExpression(token) {
+    if (!token) return false;
+    if (token.kind === "literal") return true;
+    if (token.kind === "identifier") {
+      return !(/* @__PURE__ */ new Set([
+        "await",
+        "case",
+        "delete",
+        "in",
+        "instanceof",
+        "new",
+        "of",
+        "return",
+        "throw",
+        "typeof",
+        "void",
+        "yield"
+      ])).has(token.value);
+    }
+    return token.value === ")" || token.value === "]" || token.value === "}" || token.value === "++" || token.value === "--";
+  }
+  function scanTemplateLiteral(source, start) {
+    let index = start + 1;
+    let expressionDepth = 0;
+    while (index < source.length) {
+      const character = source[index];
+      if (character === "\\") {
+        index += 2;
+        continue;
+      }
+      if (character === "`" && expressionDepth === 0) return index + 1;
+      if (character === "$" && source[index + 1] === "{") {
+        expressionDepth += 1;
+        index += 2;
+        continue;
+      }
+      if (expressionDepth > 0) {
+        if (character === "'" || character === '"') {
+          index = scanQuotedLiteral(source, index, character);
+          continue;
+        }
+        if (character === "`") {
+          index = scanTemplateLiteral(source, index);
+          continue;
+        }
+        if (character === "/" && source[index + 1] === "/") {
+          index += 2;
+          while (index < source.length && source[index] !== "\n" && source[index] !== "\r") index += 1;
+          continue;
+        }
+        if (character === "/" && source[index + 1] === "*") {
+          const close = source.indexOf("*/", index + 2);
+          index = close < 0 ? source.length : close + 2;
+          continue;
+        }
+        if (character === "{") expressionDepth += 1;
+        if (character === "}") expressionDepth -= 1;
+      }
+      index += 1;
+    }
+    return source.length;
+  }
+  function tokenizeForStepGuards(source) {
+    const tokens = [];
+    let index = 0;
+    while (index < source.length) {
+      const character = source[index];
+      if (/\s/.test(character)) {
+        index += 1;
+        continue;
+      }
+      if (character === "/" && source[index + 1] === "/") {
+        index += 2;
+        while (index < source.length && source[index] !== "\n" && source[index] !== "\r") index += 1;
+        continue;
+      }
+      if (character === "/" && source[index + 1] === "*") {
+        const close = source.indexOf("*/", index + 2);
+        index = close < 0 ? source.length : close + 2;
+        continue;
+      }
+      if (character === "'" || character === '"') {
+        const end = scanQuotedLiteral(source, index, character);
+        tokens.push({ value: source.slice(index, end), start: index, end, kind: "literal" });
+        index = end;
+        continue;
+      }
+      if (character === "`") {
+        const end = scanTemplateLiteral(source, index);
+        tokens.push({ value: source.slice(index, end), start: index, end, kind: "literal" });
+        index = end;
+        continue;
+      }
+      if (character === "/" && !tokenCanEndExpression(tokens[tokens.length - 1])) {
+        const end = scanRegularExpression(source, index);
+        tokens.push({ value: source.slice(index, end), start: index, end, kind: "literal" });
+        index = end;
+        continue;
+      }
+      if (isIdentifierStart(character)) {
+        let end = index + 1;
+        while (end < source.length && isIdentifierPart(source[end])) end += 1;
+        tokens.push({ value: source.slice(index, end), start: index, end, kind: "identifier" });
+        index = end;
+        continue;
+      }
+      if (/[0-9]/.test(character)) {
+        let end = index + 1;
+        while (end < source.length && /[0-9A-Fa-f_xXobOBn.eE]/.test(source[end])) end += 1;
+        tokens.push({ value: source.slice(index, end), start: index, end, kind: "literal" });
+        index = end;
+        continue;
+      }
+      const three = source.slice(index, index + 3);
+      const two = source.slice(index, index + 2);
+      const punctuator = ["===", "!==", ">>>", "**=", "&&=", "||=", "??=", "<<=", ">>="].includes(three) ? three : ["=>", "++", "--", "&&", "||", "??", "?.", "==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "%=", "**", "<<", ">>"].includes(two) ? two : character;
+      tokens.push({ value: punctuator, start: index, end: index + punctuator.length, kind: "punctuator" });
+      index += punctuator.length;
+    }
+    return tokens;
+  }
+  function buildStepGuardPairMap(tokens) {
+    const pairs = /* @__PURE__ */ new Map();
+    const stack = [];
+    const closingFor = { "(": ")", "[": "]", "{": "}" };
+    for (let index = 0; index < tokens.length; index += 1) {
+      const value = tokens[index].value;
+      if (closingFor[value]) {
+        stack.push({ index, value });
+        continue;
+      }
+      const top = stack[stack.length - 1];
+      if (top && closingFor[top.value] === value) {
+        stack.pop();
+        pairs.set(top.index, index);
+        pairs.set(index, top.index);
+      }
+    }
+    return pairs;
+  }
+  function stepGuardLoopHeaderOpen(tokens, loopIndex) {
+    const awaitOffset = tokens[loopIndex].value === "for" && tokens[loopIndex + 1]?.value === "await" ? 2 : 1;
+    const openIndex = loopIndex + awaitOffset;
+    return tokens[openIndex]?.value === "(" ? openIndex : -1;
+  }
+  function findStepGuardStatementEnd(tokens, pairs, start) {
+    if (start < 0 || start >= tokens.length) return -1;
+    const value = tokens[start].value;
+    if (value === "{") return pairs.get(start) ?? -1;
+    if (value === ";") return start;
+    if (value === "if") {
+      const open = start + 1;
+      const close = tokens[open]?.value === "(" ? pairs.get(open) : void 0;
+      if (close === void 0) return -1;
+      const consequentEnd = findStepGuardStatementEnd(tokens, pairs, close + 1);
+      if (consequentEnd < 0) return -1;
+      return tokens[consequentEnd + 1]?.value === "else" ? findStepGuardStatementEnd(tokens, pairs, consequentEnd + 2) : consequentEnd;
+    }
+    if (value === "for" || value === "while" || value === "with") {
+      const open = stepGuardLoopHeaderOpen(tokens, start);
+      const close = open >= 0 ? pairs.get(open) : void 0;
+      return close === void 0 ? -1 : findStepGuardStatementEnd(tokens, pairs, close + 1);
+    }
+    if (value === "do") {
+      const bodyEnd = findStepGuardStatementEnd(tokens, pairs, start + 1);
+      const whileIndex = bodyEnd + 1;
+      const open = tokens[whileIndex]?.value === "while" ? whileIndex + 1 : -1;
+      const close = open >= 0 && tokens[open]?.value === "(" ? pairs.get(open) : void 0;
+      if (close === void 0) return -1;
+      return tokens[close + 1]?.value === ";" ? close + 1 : close;
+    }
+    if (value === "switch" || value === "catch") {
+      const open = start + 1;
+      const close = tokens[open]?.value === "(" ? pairs.get(open) : void 0;
+      const bodyOpen = close === void 0 ? -1 : close + 1;
+      return bodyOpen >= 0 && tokens[bodyOpen]?.value === "{" ? pairs.get(bodyOpen) ?? -1 : -1;
+    }
+    if (value === "try") {
+      let end = findStepGuardStatementEnd(tokens, pairs, start + 1);
+      if (end < 0) return -1;
+      if (tokens[end + 1]?.value === "catch") {
+        const catchStart = end + 1;
+        const catchOpen = tokens[catchStart + 1]?.value === "(" ? catchStart + 1 : -1;
+        const catchClose = catchOpen >= 0 ? pairs.get(catchOpen) : catchStart;
+        const catchBody = catchClose === void 0 ? -1 : catchClose + 1;
+        end = catchBody >= 0 ? findStepGuardStatementEnd(tokens, pairs, catchBody) : -1;
+      }
+      if (end >= 0 && tokens[end + 1]?.value === "finally") {
+        end = findStepGuardStatementEnd(tokens, pairs, end + 2);
+      }
+      return end;
+    }
+    if (tokens[start + 1]?.value === ":") {
+      return findStepGuardStatementEnd(tokens, pairs, start + 2);
+    }
+    for (let index = start; index < tokens.length; index += 1) {
+      const token = tokens[index];
+      if (token.value === ";") return index;
+      if (token.value === "(" || token.value === "[" || token.value === "{") {
+        const close = pairs.get(index);
+        if (close === void 0) return -1;
+        index = close;
+        continue;
+      }
+      if (token.value === "}") return -1;
+    }
+    return -1;
+  }
+  function addStepGuardBodyEdits(tokens, pairs, bodyStart, edits) {
+    if (tokens[bodyStart]?.value === "{") {
+      edits.push({ position: tokens[bodyStart].end, text: " __pieStepGuard(); " });
+      return;
+    }
+    const bodyEnd = findStepGuardStatementEnd(tokens, pairs, bodyStart);
+    if (bodyEnd < 0) return;
+    edits.push({ position: tokens[bodyStart].start, text: "{ __pieStepGuard(); " });
+    edits.push({ position: tokens[bodyEnd].end, text: " }" });
+  }
   function injectStepGuards(source) {
-    return String(source || "").replace(/\b(for|while)\s*\(([^)]*)\)\s*\{/g, (_match, keyword, header) => `${keyword} (${header}) { __pieStepGuard(); `).replace(/\bdo\s*\{/g, "do { __pieStepGuard(); ").replace(/\b(for|while)\s*\(([^)]*)\)\s*([^\s{][\s\S]*?;)/g, (_match, keyword, header, statement) => `${keyword} (${header}) { __pieStepGuard(); ${statement} }`).replace(/\bdo\s*([^\s{][\s\S]*?;)\s*while\s*\(([^)]*)\)/g, (_match, statement, header) => `do { __pieStepGuard(); ${statement} } while (${header})`);
+    const original = String(source || "");
+    const tokens = tokenizeForStepGuards(original);
+    const pairs = buildStepGuardPairMap(tokens);
+    const edits = [];
+    const doWhileTails = /* @__PURE__ */ new Set();
+    for (let index = 0; index < tokens.length; index += 1) {
+      if (tokens[index].value !== "do") continue;
+      const bodyEnd = findStepGuardStatementEnd(tokens, pairs, index + 1);
+      const whileIndex = bodyEnd + 1;
+      const open = tokens[whileIndex]?.value === "while" ? whileIndex + 1 : -1;
+      if (open < 0 || tokens[open]?.value !== "(" || pairs.get(open) === void 0) continue;
+      doWhileTails.add(whileIndex);
+      addStepGuardBodyEdits(tokens, pairs, index + 1, edits);
+    }
+    for (let index = 0; index < tokens.length; index += 1) {
+      const value = tokens[index].value;
+      if (value !== "for" && value !== "while" || doWhileTails.has(index)) continue;
+      const open = stepGuardLoopHeaderOpen(tokens, index);
+      const close = open >= 0 ? pairs.get(open) : void 0;
+      if (close === void 0 || close + 1 >= tokens.length) continue;
+      addStepGuardBodyEdits(tokens, pairs, close + 1, edits);
+    }
+    let transformed = original;
+    edits.sort((left, right) => right.position - left.position);
+    for (const edit of edits) {
+      transformed = transformed.slice(0, edit.position) + edit.text + transformed.slice(edit.position);
+    }
+    try {
+      new Function(normalizeModuleSource(transformed));
+      return transformed;
+    } catch {
+      return original;
+    }
   }
   function isStepTimeoutError(error) {
     return isRecord5(error) && (error.code === STEP_TIMEOUT_ERROR_CODE || error.name === "PieStepTimeoutError");
@@ -24386,6 +24758,7 @@ Actions: create, read, complete_current, clear.`;
       taskId: task.id,
       name: task.name,
       mode: task.mode,
+      language: task.language,
       status: task.status,
       done,
       ok: task.status === "completed",
@@ -24393,6 +24766,7 @@ Actions: create, read, complete_current, clear.`;
       result: task.status === "completed" ? toSerializable(task.result) : null,
       errorCode: task.errorCode,
       errorMessage: task.errorMessage,
+      diagnostics: toSerializable(task.diagnostics),
       logs: task.logs.slice(-MAX_LOG_LINES),
       refs: toSerializable(task.createdRefs || []),
       frames: task.frames,
@@ -24780,6 +25154,10 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   }
   function stepTask(task) {
     if (task.status !== "running") return;
+    if (task.abortSignal?.aborted) {
+      cancelTask(task, abortSignalReason(task.abortSignal));
+      return;
+    }
     const now = nowMs();
     if (now - task.startMs > task.totalTimeoutMs) {
       failTask(task, "TOTAL_TIMEOUT", `Unity script run exceeded ${task.totalTimeoutMs}ms.`);
@@ -24837,15 +25215,18 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     if (!script.trim()) {
       throw new Error("script is required");
     }
+    const language = normalizeScriptLanguage(payload.language);
     const task = {
       id: createRunId(),
       mode: bridge2.isEditor ? "editor" : "runtime",
       name: String(payload.name || "unity-script-run"),
+      language,
       iterator: null,
       status: "running",
       result: null,
       errorCode: "",
       errorMessage: "",
+      diagnostics: [],
       logs: [],
       createdRefs: [],
       frames: 0,
@@ -24861,10 +25242,19 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       pendingInput: null,
       waiters: []
     };
+    getRunStore().set(task.id, task);
+    const executableScript = language === "typescript" ? compileTypeScriptScript(task, script) : script;
+    if (executableScript === null) {
+      return task;
+    }
     const args = isRecord5(payload.args) ? payload.args : {};
     const ctx = createTaskContext(bridge2, task, args);
-    task.iterator = compileRunIterator(script, String(payload.entry || "run"), ctx, args, task);
-    getRunStore().set(task.id, task);
+    try {
+      task.iterator = compileRunIterator(executableScript, String(payload.entry || "run"), ctx, args, task);
+    } catch (error) {
+      getRunStore().delete(task.id);
+      throw error;
+    }
     return task;
   }
   function getTaskOrThrow(taskId) {
@@ -24880,13 +25270,31 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       stepTask(task);
     }
   }
-  function runUnityScriptTask(bridge2, payload) {
+  function abortSignalReason(signal) {
+    const reason = signal.reason;
+    if (reason instanceof Error && reason.message) return reason.message;
+    if (typeof reason === "string" && reason.trim()) return reason;
+    return "Unity script run cancelled.";
+  }
+  function runUnityScriptTask(bridge2, payload, signal) {
     const task = createScriptRun(bridge2, payload);
     if (task.status !== "running") {
       return Promise.resolve(buildStatus(task));
     }
+    task.abortSignal = signal;
+    if (signal?.aborted) {
+      cancelTask(task, abortSignalReason(signal));
+      return Promise.resolve(buildStatus(task));
+    }
     return new Promise((resolve2) => {
-      task.waiters.push(resolve2);
+      const onAbort = () => cancelTask(task, abortSignalReason(signal));
+      const finish = (result) => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve2(result);
+      };
+      task.waiters.push(finish);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
     });
   }
   function installUnityScriptHost(bridge2) {
@@ -25062,9 +25470,13 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       {
         name: "unity_script_run",
         label: "unity_script_run",
-        description: 'Run a JavaScript Unity script task as a short-step generator inside the Unity script host. The script must define export function* run(ctx, args); use yield ctx.nextFrame(), ctx.waitFrames(n), or ctx.waitSeconds(s) for multi-frame work. Host-call helpers can be yielded, e.g. const result = yield ctx.edit({ action: "create_scene_object", name: "Player" });. Do not pass C#, shader source, or plain file contents to this tool, and do not use it to create project files. Long synchronous loops fail with STEP_TIMEOUT; this tool does not promise arbitrary synchronous JS preemption. It returns only after the task completes, fails, or times out.',
+        description: 'Run a JavaScript or single-file TypeScript Unity script task as a short-step generator inside the Unity script host. language defaults to javascript. TypeScript imports are not supported. The script must define export function* run(ctx, args); use yield ctx.nextFrame(), ctx.waitFrames(n), or ctx.waitSeconds(s) for multi-frame work. Host-call helpers can be yielded, e.g. const result = yield ctx.edit({ action: "create_scene_object", name: "Player" });. Do not pass C#, shader source, or plain file contents to this tool, and do not use it to create project files. Long synchronous loops fail with STEP_TIMEOUT; this tool does not promise arbitrary synchronous JS preemption. It returns only after the task completes, fails, is cancelled, or times out.',
         parameters: Type.Object({
           script: Type.String(),
+          language: Type.Optional(Type.Union([
+            Type.Literal("javascript"),
+            Type.Literal("typescript")
+          ])),
           name: Type.Optional(Type.String()),
           entry: Type.Optional(Type.String()),
           args: Type.Optional(Type.Record(Type.String(), Type.Any())),
@@ -25072,9 +25484,9 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
           perStepTimeoutMs: Type.Optional(Type.Number()),
           maxFrames: Type.Optional(Type.Number())
         }),
-        execute: async (_toolCallId, params) => {
+        execute: async (_toolCallId, params, signal) => {
           try {
-            const result = await runUnityScriptTask(requireBridge(), asRecord(params));
+            const result = await runUnityScriptTask(requireBridge(), asRecord(params), signal);
             return {
               content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
               details: result,
@@ -26008,49 +26420,6 @@ ${extensionSection.join("\n\n---\n\n")}
     });
   }
 
-  // src/typescript-runtime.ts
-  function compilerGlobal() {
-    return globalThis.__pieTypeScriptCompiler;
-  }
-  function loadCompilerBundle() {
-    const loadResource = typeof CS !== "undefined" ? CS?.Pie?.PieBridge?.LoadResourceText : void 0;
-    if (typeof loadResource !== "function") {
-      throw new Error("PieBridge.LoadResourceText is required for runtime TypeScript compilation.");
-    }
-    const source = String(loadResource("pie/typescript-compiler") || "");
-    if (!source) {
-      throw new Error("Missing Resources/pie/typescript-compiler.bytes. Rebuild pie-unity.");
-    }
-    const install = new Function(`${source}
-//# sourceURL=pie/typescript-compiler.bytes`);
-    install();
-  }
-  function ensureTypeScriptCompiler() {
-    let compiler = compilerGlobal();
-    if (!compiler) {
-      loadCompilerBundle();
-      compiler = compilerGlobal();
-    }
-    if (!compiler || typeof compiler.compile !== "function") {
-      throw new Error("Runtime TypeScript compiler failed to initialize.");
-    }
-    return compiler;
-  }
-  function compileTypeScript(request) {
-    return ensureTypeScriptCompiler().compile({
-      ...request,
-      module: request.module || "ESNext",
-      target: request.target || "ES2022"
-    });
-  }
-  function formatTypeScriptDiagnostics(diagnostics) {
-    const entries = Array.isArray(diagnostics) ? diagnostics : [];
-    return entries.map((diagnostic) => {
-      const location = diagnostic.line > 0 ? `${diagnostic.fileName || "runtime.ts"}:${diagnostic.line}:${Math.max(1, diagnostic.character || 1)}` : diagnostic.fileName || "runtime.ts";
-      return `${location} TS${diagnostic.code} ${diagnostic.category}: ${diagnostic.message}`;
-    }).join("\n");
-  }
-
   // src/extensions/load-project-extensions.ts
   function getSystemIO2() {
     if (typeof CS === "undefined" || !CS?.System?.IO) {
@@ -26215,8 +26584,6 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       this.projectRoot = projectRoot2;
       this.getSessionId = getSessionId;
     }
-    projectRoot;
-    getSessionId;
   };
 
   // src/pie-bridge.ts
@@ -26460,16 +26827,33 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }
     return null;
   }
-  function getModelsConfigPath() {
+  function getUserProfileModelsConfigPath() {
     return CS.System.IO.Path.Combine(
       CS.System.Environment.GetFolderPath(CS.System.Environment.SpecialFolder.UserProfile),
       ".pie",
       "models.json"
     );
   }
+  function isAndroidRuntime() {
+    const application = CS.UnityEngine?.Application;
+    const android = CS.UnityEngine?.RuntimePlatform?.Android;
+    if (!application || android === void 0) return false;
+    return application.platform === android || String(application.platform) === "Android";
+  }
+  function getModelsConfigPaths(bridge2) {
+    const paths = [];
+    if (isAndroidRuntime() && typeof bridge2.getPersistentDataPath === "function") {
+      const persistentDataPath2 = String(bridge2.getPersistentDataPath() || "").trim();
+      if (persistentDataPath2) {
+        paths.push(CS.System.IO.Path.Combine(persistentDataPath2, ".pie", "models.json"));
+      }
+    }
+    paths.push(getUserProfileModelsConfigPath());
+    return [...new Set(paths)];
+  }
   function readModelsConfig(bridge2) {
-    const modelsPath = getModelsConfigPath();
-    if (!CS.System.IO.File.Exists(modelsPath)) return null;
+    const modelsPath = getModelsConfigPaths(bridge2).find((path) => CS.System.IO.File.Exists(path));
+    if (!modelsPath) return null;
     try {
       const raw = String(CS.System.IO.File.ReadAllText(modelsPath) || "");
       const parsed = JSON.parse(raw);

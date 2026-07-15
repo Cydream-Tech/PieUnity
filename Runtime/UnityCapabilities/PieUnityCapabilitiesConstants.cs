@@ -6,7 +6,7 @@ namespace Pie
 {
     public static class PieUnityCapabilitiesConstants
     {
-        public const string Version = "0.1.26";
+        public const string Version = "0.1.27";
         public const int DefaultPort = 8091;
         public const int MaxPort = 8100;
         public const int RegistryTtlSeconds = 120;

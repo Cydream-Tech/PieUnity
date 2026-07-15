@@ -448,7 +448,13 @@ namespace Pie
                     {
                         var ok = string.Equals(status.status, "completed", StringComparison.Ordinal);
                         var error = ok ? "" : (status.errorMessage ?? status.status ?? "Unity script run failed.");
-                        return BuildEnvelopeOnMainThread("tool", "unity_script_run", ok, statusJson, error);
+                        return BuildEnvelopeOnMainThread(
+                            "tool",
+                            "unity_script_run",
+                            ok,
+                            statusJson,
+                            error,
+                            ok ? "" : status.errorCode);
                     }
 
                     if (token.IsCancellationRequested)
@@ -470,10 +476,16 @@ namespace Pie
             }
         }
 
-        private static string BuildEnvelopeOnMainThread(string kind, string name, bool ok, string resultJson, string error)
+        private static string BuildEnvelopeOnMainThread(
+            string kind,
+            string name,
+            bool ok,
+            string resultJson,
+            string error,
+            string errorCode = "CAPABILITY_ERROR")
         {
             return PieDevRpcDispatcher.InvokeSync(
-                () => BuildEnvelope(kind, name, ok, resultJson, error),
+                () => BuildEnvelope(kind, name, ok, resultJson, error, errorCode),
                 ScriptRunMainThreadTimeoutMs);
         }
 

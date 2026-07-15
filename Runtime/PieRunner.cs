@@ -288,7 +288,14 @@ namespace Pie
                 {
                     var name = ExtractJsonString(json, "name") ?? "tool";
                     var error = ExtractJsonString(json, "error");
-                    var result = ExtractJsonString(json, "result");
+                    // The runtime event bridge emits resultText/resultJson. Keep
+                    // the legacy result fallback for older core.bytes bundles so
+                    // existing embedded callers remain compatible during upgrades.
+                    var result = ExtractJsonString(json, "resultText");
+                    if (string.IsNullOrEmpty(result))
+                        result = ExtractJsonString(json, "result");
+                    if (string.IsNullOrEmpty(result))
+                        result = ExtractJsonString(json, "resultJson");
                     CompleteLatestToolMessage(name, error ?? result ?? "", !string.IsNullOrEmpty(error));
                     OnToolEnd?.Invoke(name, error ?? result ?? "");
                     break;

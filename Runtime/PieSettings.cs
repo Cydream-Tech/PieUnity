@@ -720,7 +720,13 @@ namespace Pie
                         {
                             var ok = string.Equals(status.status, "completed", StringComparison.Ordinal);
                             var error = ok ? "" : (status.errorMessage ?? status.status ?? "Unity script run failed.");
-                            return BuildEnvelopeOnMainThread("tool", "unity_script_run", ok, statusJson, error);
+                            return BuildEnvelopeOnMainThread(
+                                "tool",
+                                "unity_script_run",
+                                ok,
+                                statusJson,
+                                error,
+                                ok ? "" : status.errorCode);
                         }
 
                         if (token.IsCancellationRequested)
@@ -742,10 +748,16 @@ namespace Pie
                 }
             }
 
-            private static string BuildEnvelopeOnMainThread(string kind, string name, bool ok, string resultJson, string error)
+            private static string BuildEnvelopeOnMainThread(
+                string kind,
+                string name,
+                bool ok,
+                string resultJson,
+                string error,
+                string errorCode = "CAPABILITY_ERROR")
             {
                 return PieDevRpcDispatcher.InvokeSync(
-                    () => BuildEnvelope(kind, name, ok, resultJson, error),
+                    () => BuildEnvelope(kind, name, ok, resultJson, error, errorCode),
                     ScriptRunMainThreadTimeoutMs);
             }
 
@@ -1389,7 +1401,7 @@ namespace Pie
                 PieUnityCapabilityRegistry.RegisterTool(
                     "unity_script_run",
                     "unity.script",
-                    "Run a JavaScript generator task inside the Unity script host. The script must define export function* run(ctx, args) and yield for multi-frame work. Do not pass C#, shader source, or raw file contents to this tool. It returns only after completion, failure, or timeout.",
+                    "Run a JavaScript or single-file TypeScript generator task inside the Unity script host. language defaults to javascript; TypeScript imports are not supported. The script must define export function* run(ctx, args) and yield for multi-frame work. Do not pass C#, shader source, or raw file contents to this tool. It returns only after completion, failure, cancellation, or timeout.",
                     "editor+runtime",
                     false,
                     false,
@@ -1397,6 +1409,7 @@ namespace Pie
                     new[]
                     {
                         new PieUnityParameterDescriptor { name = "script", type = "string", required = true },
+                        new PieUnityParameterDescriptor { name = "language", type = "string", required = false },
                         new PieUnityParameterDescriptor { name = "name", type = "string", required = false },
                         new PieUnityParameterDescriptor { name = "entry", type = "string", required = false },
                         new PieUnityParameterDescriptor { name = "args", type = "object", required = false },
@@ -1405,7 +1418,17 @@ namespace Pie
                         new PieUnityParameterDescriptor { name = "maxFrames", type = "number", required = false },
                     },
                     InvokeScriptHostRunUnavailable,
-                    capabilityKind: "script");
+                    capabilityKind: "script",
+                    errorCodes: new[]
+                    {
+                        "TYPESCRIPT_COMPILE_ERROR",
+                        "SCRIPT_ERROR",
+                        "STEP_TIMEOUT",
+                        "TOTAL_TIMEOUT",
+                        "MAX_FRAMES",
+                        "CANCELLED",
+                        "UNSUPPORTED_LANGUAGE",
+                    });
             }
 
             private static string ResumeSessionViaChat(string argsJson)
@@ -1720,7 +1743,7 @@ namespace Pie
     // Merged from Runtime/UnityCapabilities/PieUnityCapabilitiesConstants.cs
     public static class PieUnityCapabilitiesConstants
         {
-            public const string Version = "0.1.26";
+            public const string Version = "0.1.27";
             public const string ManifestSchemaVersion = "2";
             public const string SkillProtocolVersion = "pie-unity-rpc/2";
             public const int DefaultPort = 8091;

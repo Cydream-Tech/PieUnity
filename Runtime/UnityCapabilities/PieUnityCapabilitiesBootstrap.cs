@@ -440,7 +440,7 @@ namespace Pie
             PieUnityCapabilityRegistry.RegisterTool(
                 "unity_script_run",
                 "unity.script",
-                "Run a JavaScript generator task inside the Unity script host. The script must define export function* run(ctx, args) and yield for multi-frame work. Do not pass C#, shader source, or raw file contents to this tool. It returns only after completion, failure, or timeout.",
+                "Run a JavaScript or single-file TypeScript generator task inside the Unity script host. language defaults to javascript; TypeScript imports are not supported. The script must define export function* run(ctx, args) and yield for multi-frame work. Do not pass C#, shader source, or raw file contents to this tool. It returns only after completion, failure, cancellation, or timeout.",
                 "editor+runtime",
                 false,
                 false,
@@ -448,6 +448,7 @@ namespace Pie
                 new[]
                 {
                     new PieUnityParameterDescriptor { name = "script", type = "string", required = true },
+                    new PieUnityParameterDescriptor { name = "language", type = "string", required = false },
                     new PieUnityParameterDescriptor { name = "name", type = "string", required = false },
                     new PieUnityParameterDescriptor { name = "entry", type = "string", required = false },
                     new PieUnityParameterDescriptor { name = "args", type = "object", required = false },
@@ -456,7 +457,17 @@ namespace Pie
                     new PieUnityParameterDescriptor { name = "maxFrames", type = "number", required = false },
                 },
                 InvokeScriptHostRunUnavailable,
-                capabilityKind: "script");
+                capabilityKind: "script",
+                errorCodes: new[]
+                {
+                    "TYPESCRIPT_COMPILE_ERROR",
+                    "SCRIPT_ERROR",
+                    "STEP_TIMEOUT",
+                    "TOTAL_TIMEOUT",
+                    "MAX_FRAMES",
+                    "CANCELLED",
+                    "UNSUPPORTED_LANGUAGE",
+                });
         }
 
         private static string ResumeSessionViaChat(string argsJson)

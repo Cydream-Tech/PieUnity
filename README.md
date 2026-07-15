@@ -309,7 +309,7 @@ TypeScript extensions are compiled in memory before activation. Runtime imports
 such as `import lodash from "lodash"` are rejected; generate a single-file
 module or inline dependencies for now.
 
-`pie-unity` now reads models only from `~/.pie/models.json`. The file must use top-level `profiles`, not `providers`, and each profile must explicitly declare:
+On desktop, `pie-unity` reads models from `~/.pie/models.json`. In an Android Player it first checks `Application.persistentDataPath/.pie/models.json`, then falls back to the UserProfile path when that file is absent. The file must use top-level `profiles`, not `providers`, and each profile must explicitly declare:
 
 - `api`
 - `baseUrl`
