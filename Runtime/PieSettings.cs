@@ -710,8 +710,14 @@ namespace Pie
                         () => PieUnityCapabilitiesBootstrap.StartUnityScriptRun(argsJson),
                         ScriptRunMainThreadTimeoutMs);
 
+                    var watchdog = System.Diagnostics.Stopwatch.StartNew();
+                    var initialStatus = JsonUtility.FromJson<ScriptRunStatusPayload>(statusJson ?? "{}");
+                    // Allow the JS host to publish TOTAL_TIMEOUT before reporting unknown transport state.
+                    var deadlineMs = (initialStatus != null && initialStatus.totalTimeoutMs > 0 ? initialStatus.totalTimeoutMs : 30000) + 1000L;
                     while (true)
                     {
+                        if (watchdog.ElapsedMilliseconds > deadlineMs)
+                            throw new TimeoutException("Unity script run wall-clock watchdog expired.");
                         var status = JsonUtility.FromJson<ScriptRunStatusPayload>(statusJson ?? "{}") ?? new ScriptRunStatusPayload();
                         if (!string.IsNullOrWhiteSpace(status.taskId))
                             taskId = status.taskId;
@@ -720,19 +726,13 @@ namespace Pie
                         {
                             var ok = string.Equals(status.status, "completed", StringComparison.Ordinal);
                             var error = ok ? "" : (status.errorMessage ?? status.status ?? "Unity script run failed.");
-                            return BuildEnvelopeOnMainThread(
-                                "tool",
-                                "unity_script_run",
-                                ok,
-                                statusJson,
-                                error,
-                                ok ? "" : status.errorCode);
+                            return BuildEnvelopeOnMainThread("tool", "unity_script_run", ok, statusJson, error);
                         }
 
                         if (token.IsCancellationRequested)
                         {
                             TryCancelUnityScriptRun(taskId, "Dev RPC server is stopping.");
-                            return BuildEnvelopeOnMainThread("tool", "unity_script_run", false, statusJson, "Dev RPC server is stopping.");
+                            return BuildScriptRunFailure(taskId, "cancelled", "CANCELLED", "Dev RPC server is stopping.");
                         }
 
                         Thread.Sleep(ScriptRunPollIntervalMs);
@@ -744,20 +744,23 @@ namespace Pie
                 catch (Exception ex)
                 {
                     TryCancelUnityScriptRun(taskId, ex.Message);
-                    return BuildEnvelopeOnMainThread("tool", "unity_script_run", false, "null", ex.Message);
+                    return BuildScriptRunFailure(taskId, "failed", ex is TimeoutException ? "HOST_TIMEOUT" : "HOST_ERROR", ex.Message);
                 }
             }
 
-            private static string BuildEnvelopeOnMainThread(
-                string kind,
-                string name,
-                bool ok,
-                string resultJson,
-                string error,
-                string errorCode = "CAPABILITY_ERROR")
+            // Transport terminal state must not call Unity, PuerTS, or the main-thread dispatcher.
+            private static string BuildScriptRunFailure(string taskId, string status, string code, string message)
+            {
+                var result = "{\"taskId\":\"" + EscapeJson(taskId ?? "") + "\",\"done\":true,\"status\":\"" + status
+                    + "\",\"errorCode\":\"" + code + "\",\"errorMessage\":\"" + EscapeJson(message ?? "") + "\",\"executionStateUnknown\":true}";
+                return "{\"ok\":false,\"kind\":\"tool\",\"name\":\"unity_script_run\",\"result\":\"" + EscapeJson(result)
+                    + "\",\"errorCode\":\"" + code + "\",\"error\":\"" + EscapeJson(message ?? "") + "\"}";
+            }
+
+            private static string BuildEnvelopeOnMainThread(string kind, string name, bool ok, string resultJson, string error)
             {
                 return PieDevRpcDispatcher.InvokeSync(
-                    () => BuildEnvelope(kind, name, ok, resultJson, error, errorCode),
+                    () => BuildEnvelope(kind, name, ok, resultJson, error),
                     ScriptRunMainThreadTimeoutMs);
             }
 
@@ -1003,6 +1006,13 @@ namespace Pie
                 public int tailLines = 200;
                 public int maxBytes = 65536;
                 public string contains = "";
+            }
+
+            [Serializable]
+            private sealed class ScriptTaskPayload
+            {
+                public string taskId;
+                public string reason;
             }
 
             public static void InitializeEditor()
@@ -1270,6 +1280,11 @@ namespace Pie
                     new PieUnityParameterDescriptor[0],
                     _ => runner.BuildRuntimeRpcStateJson());
 
+                PieUnityCapabilityRegistry.RegisterRpc(
+                    "runner.get_policy", "runtime", "Get the effective primary-agent permission policy.",
+                    "runtime", true, false, null, new PieUnityParameterDescriptor[0],
+                    _ => runner.GetRuntimePolicyJson());
+
                 PieUnityCapabilityRegistry.RegisterTool(
                     "chat_send",
                     "chat",
@@ -1398,10 +1413,28 @@ namespace Pie
 
             private static void RegisterScriptCapabilities()
             {
+                PieUnityCapabilityRegistry.RegisterRpc(
+                    "unity_script_start", "unity.script", "Start an async Unity script task and return its taskId immediately.",
+                    "editor+runtime", false, false, null,
+                    new[] { new PieUnityParameterDescriptor { name = "script", type = "string", required = true } },
+                    StartUnityScriptRun);
+                PieUnityCapabilityRegistry.RegisterRpc(
+                    "unity_script_status", "unity.script", "Get a script task status by taskId.",
+                    "editor+runtime", true, false, null,
+                    new[] { new PieUnityParameterDescriptor { name = "taskId", type = "string", required = true } },
+                    argsJson => GetUnityScriptRunStatus(ReadScriptTaskPayload(argsJson).taskId));
+                PieUnityCapabilityRegistry.RegisterRpc(
+                    "unity_script_cancel", "unity.script", "Cancel a running script task by taskId.",
+                    "editor+runtime", false, false, null,
+                    new[] { new PieUnityParameterDescriptor { name = "taskId", type = "string", required = true } },
+                    argsJson => {
+                        var payload = ReadScriptTaskPayload(argsJson);
+                        return CancelUnityScriptRun(payload.taskId, payload.reason);
+                    });
                 PieUnityCapabilityRegistry.RegisterTool(
                     "unity_script_run",
                     "unity.script",
-                    "Run a JavaScript or single-file TypeScript generator task inside the Unity script host. language defaults to javascript; TypeScript imports are not supported. The script must define export function* run(ctx, args) and yield for multi-frame work. Do not pass C#, shader source, or raw file contents to this tool. It returns only after completion, failure, cancellation, or timeout.",
+                    "Run an async JavaScript task inside the Unity script host. Define export async function run(ctx, args), await host calls, and await ctx.nextFrame()/waitFrames()/waitSeconds() for multi-frame work. Synchronous code cannot be preempted. Do not pass C#, shader source, or raw file contents.",
                     "editor+runtime",
                     false,
                     false,
@@ -1409,26 +1442,22 @@ namespace Pie
                     new[]
                     {
                         new PieUnityParameterDescriptor { name = "script", type = "string", required = true },
-                        new PieUnityParameterDescriptor { name = "language", type = "string", required = false },
                         new PieUnityParameterDescriptor { name = "name", type = "string", required = false },
-                        new PieUnityParameterDescriptor { name = "entry", type = "string", required = false },
                         new PieUnityParameterDescriptor { name = "args", type = "object", required = false },
                         new PieUnityParameterDescriptor { name = "totalTimeoutMs", type = "number", required = false },
                         new PieUnityParameterDescriptor { name = "perStepTimeoutMs", type = "number", required = false },
                         new PieUnityParameterDescriptor { name = "maxFrames", type = "number", required = false },
                     },
                     InvokeScriptHostRunUnavailable,
-                    capabilityKind: "script",
-                    errorCodes: new[]
-                    {
-                        "TYPESCRIPT_COMPILE_ERROR",
-                        "SCRIPT_ERROR",
-                        "STEP_TIMEOUT",
-                        "TOTAL_TIMEOUT",
-                        "MAX_FRAMES",
-                        "CANCELLED",
-                        "UNSUPPORTED_LANGUAGE",
-                    });
+                    capabilityKind: "script");
+            }
+
+            private static ScriptTaskPayload ReadScriptTaskPayload(string argsJson)
+            {
+                var payload = JsonUtility.FromJson<ScriptTaskPayload>(argsJson ?? "{}") ?? new ScriptTaskPayload();
+                if (string.IsNullOrWhiteSpace(payload.taskId))
+                    throw new InvalidOperationException("taskId is required.");
+                return payload;
             }
 
             private static string ResumeSessionViaChat(string argsJson)
@@ -1743,7 +1772,7 @@ namespace Pie
     // Merged from Runtime/UnityCapabilities/PieUnityCapabilitiesConstants.cs
     public static class PieUnityCapabilitiesConstants
         {
-            public const string Version = "0.1.30";
+            public const string Version = "0.1.31";
             public const string ManifestSchemaVersion = "2";
             public const string SkillProtocolVersion = "pie-unity-rpc/2";
             public const int DefaultPort = 8091;
@@ -2968,10 +2997,13 @@ namespace Pie
                 ApplySceneObjectPlacement(gameObject, payload, createdNew: true);
 
     #if UNITY_EDITOR
-                UnityEditor.Undo.RegisterCreatedObjectUndo(gameObject, "Create " + gameObject.name);
-                UnityEditor.Selection.activeGameObject = gameObject;
-                UnityEditor.EditorGUIUtility.PingObject(gameObject);
-                UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(gameObject.scene);
+                if (!UnityEditor.EditorApplication.isPlaying)
+                {
+                    UnityEditor.Undo.RegisterCreatedObjectUndo(gameObject, "Create " + gameObject.name);
+                    UnityEditor.Selection.activeGameObject = gameObject;
+                    UnityEditor.EditorGUIUtility.PingObject(gameObject);
+                    UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(gameObject.scene);
+                }
     #endif
 
                 var targetRef = ToRef(gameObject);
@@ -2999,7 +3031,10 @@ namespace Pie
                     if (parent == null)
                     {
                         if (createdNew)
-                            UnityEngine.Object.DestroyImmediate(gameObject);
+                        {
+                            if (Application.isPlaying) UnityEngine.Object.Destroy(gameObject);
+                            else UnityEngine.Object.DestroyImmediate(gameObject);
+                        }
                         throw new InvalidOperationException("Parent object not found.");
                     }
 
@@ -3011,7 +3046,7 @@ namespace Pie
                 gameObject.transform.position = new Vector3(payload.x, payload.y, payload.z);
 
     #if UNITY_EDITOR
-                if (!createdNew)
+                if (!createdNew && !UnityEditor.EditorApplication.isPlaying)
                 {
                     UnityEditor.Selection.activeGameObject = gameObject;
                     UnityEditor.EditorGUIUtility.PingObject(gameObject);
@@ -3051,7 +3086,8 @@ namespace Pie
                 var gameObject = ResolveApplyTarget(payload, requireExplicitTarget: true);
                 var targetRef = ToRef(gameObject);
     #if UNITY_EDITOR
-                UnityEditor.Undo.DestroyObjectImmediate(gameObject);
+                if (UnityEditor.EditorApplication.isPlaying) UnityEngine.Object.Destroy(gameObject);
+                else UnityEditor.Undo.DestroyObjectImmediate(gameObject);
     #else
                 UnityEngine.Object.Destroy(gameObject);
     #endif
@@ -3181,8 +3217,12 @@ namespace Pie
                 if (component == null)
                     throw new InvalidOperationException("Component not found on " + gameObject.name + ": " + componentType.FullName);
     #if UNITY_EDITOR
-                UnityEngine.Object.DestroyImmediate(component);
-                MarkSceneObjectChanged(gameObject);
+                if (UnityEditor.EditorApplication.isPlaying) UnityEngine.Object.Destroy(component);
+                else
+                {
+                    UnityEngine.Object.DestroyImmediate(component);
+                    MarkSceneObjectChanged(gameObject);
+                }
     #else
                 UnityEngine.Object.Destroy(component);
     #endif
@@ -3618,7 +3658,7 @@ namespace Pie
     #if UNITY_EDITOR
             private static void MarkSceneObjectChanged(GameObject gameObject)
             {
-                if (gameObject == null)
+                if (gameObject == null || UnityEditor.EditorApplication.isPlaying)
                     return;
                 UnityEditor.EditorUtility.SetDirty(gameObject);
                 UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(gameObject.scene);
@@ -3626,7 +3666,7 @@ namespace Pie
 
             private static void MarkComponentChanged(Component component)
             {
-                if (component == null)
+                if (component == null || UnityEditor.EditorApplication.isPlaying)
                     return;
                 UnityEditor.EditorUtility.SetDirty(component);
                 UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(component.gameObject.scene);

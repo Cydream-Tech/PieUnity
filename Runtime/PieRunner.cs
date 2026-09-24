@@ -20,6 +20,59 @@ namespace Pie
         [SerializeField] private string _projectRootOverride = "";
         [SerializeField] private PieSettings _settingsOverride;
 
+        public enum RuntimeConfirmationPolicy { Yolo, Confirm, Deny }
+        [SerializeField] private RuntimeConfirmationPolicy _confirmationPolicy = RuntimeConfirmationPolicy.Yolo;
+        [SerializeField, Min(1000)] private int _confirmationTimeoutMs = 60000;
+        public event Action<PieInteractionRequest> OnConfirmationRequested;
+        private readonly object _confirmationLock = new object();
+        private readonly Dictionary<string, PendingConfirmation> _confirmations = new Dictionary<string, PendingConfirmation>();
+
+        private sealed class PendingConfirmation
+        {
+            public PieInteractionResponse response;
+            public System.Threading.Timer timer;
+        }
+
+        public string GetRuntimePolicyJson()
+        {
+            if (_confirmationPolicy == RuntimeConfirmationPolicy.Yolo)
+                return "{\"mode\":\"normal\",\"confirmationPolicy\":\"allow\",\"yoloMode\":true}";
+            return _confirmationPolicy == RuntimeConfirmationPolicy.Deny
+                ? "{\"mode\":\"normal\",\"confirmationPolicy\":\"deny\",\"yoloMode\":false}"
+                : "{\"mode\":\"normal\",\"confirmationPolicy\":\"confirm\",\"yoloMode\":false}";
+        }
+
+        public bool RespondToConfirmation(string id, bool confirmed)
+        {
+            lock (_confirmationLock)
+            {
+                if (id == null || !_confirmations.TryGetValue(id, out var pending) || pending.response != null)
+                    return false;
+                pending.response = new PieInteractionResponse { type = "confirm", id = id, confirmed = confirmed };
+                pending.timer?.Dispose();
+                return true;
+            }
+        }
+
+        private void CancelConfirmations()
+        {
+            lock (_confirmationLock)
+            {
+                foreach (var entry in _confirmations)
+                {
+                    entry.Value.timer?.Dispose();
+                    if (entry.Value.response == null)
+                        entry.Value.response = new PieInteractionResponse { type = "confirm", id = entry.Key, confirmed = false, skipped = true };
+                }
+            }
+        }
+
+        private void OnDisable()
+        {
+            CancelConfirmations();
+            if (_bridge?.IsInitialized == true) _bridge.SendToJs("abort", "{}");
+        }
+
         public PieBridge Bridge => _bridge;
         public bool IsReady => _bridge?.IsInitialized == true;
         public string ProjectRootOverride => _projectRootOverride;
@@ -121,6 +174,7 @@ namespace Pie
 
         private void OnDestroy()
         {
+            CancelConfirmations();
             if (ActiveRunner == this)
                 ActiveRunner = null;
             PieUnityCapabilitiesBootstrap.ShutdownRuntime();
@@ -173,6 +227,46 @@ namespace Pie
         private string HandleInteractionHostCall(string argsJson)
         {
             var request = JsonUtility.FromJson<PieInteractionRequest>(argsJson ?? "{}") ?? new PieInteractionRequest();
+            if (request.type == "confirm_state")
+            {
+                lock (_confirmationLock)
+                {
+                    if (request.id == null || !_confirmations.TryGetValue(request.id, out var pending))
+                        return PieInteractionResponse.Unavailable("confirm", request.id, "Confirmation is no longer available.");
+                    if (pending.response == null) return "{\"pending\":true}";
+                    _confirmations.Remove(request.id);
+                    pending.timer?.Dispose();
+                    return PieInteractionResponse.ToJson(pending.response);
+                }
+            }
+            if (request.type == "confirm")
+            {
+                if (!isActiveAndEnabled || _confirmationPolicy == RuntimeConfirmationPolicy.Deny || OnConfirmationRequested == null)
+                    return PieInteractionResponse.ToJson(new PieInteractionResponse { type = "confirm", id = request.id, confirmed = false, skipped = true });
+                if (string.IsNullOrWhiteSpace(request.id))
+                    return PieInteractionResponse.Unavailable("confirm", request.id, "Confirmation id is required.");
+                lock (_confirmationLock)
+                {
+                    if (_confirmations.ContainsKey(request.id) || _confirmations.Count >= 64)
+                        return PieInteractionResponse.Unavailable("confirm", request.id, "Confirmation capacity or duplicate id.");
+                    var pending = new PendingConfirmation();
+                    _confirmations.Add(request.id, pending);
+                    var timeout = Math.Min(Math.Max(1000, _confirmationTimeoutMs), 300000);
+                    if (request.timeoutMs > 0) timeout = Math.Min(timeout, request.timeoutMs);
+                    pending.timer = new System.Threading.Timer(_ =>
+                    {
+                        // No Unity/PuerTS calls: expiry works even while the runner has no ticks.
+                        lock (_confirmationLock)
+                        {
+                            if (pending.response == null)
+                                pending.response = new PieInteractionResponse { type = "confirm", id = request.id, confirmed = false, timedOut = true };
+                        }
+                    }, null, timeout, System.Threading.Timeout.Infinite);
+                }
+                try { OnConfirmationRequested(request); }
+                catch { RespondToConfirmation(request.id, false); }
+                return "{\"pending\":true}";
+            }
             if (string.Equals(request.type, "notify", StringComparison.Ordinal))
             {
                 var message = string.IsNullOrWhiteSpace(request.message) ? "(empty notification)" : request.message;
@@ -264,12 +358,15 @@ namespace Pie
 
         public bool Abort()
         {
+            CancelConfirmations();
             if (_bridge?.IsInitialized != true) return false;
             return _bridge.SendToJs("abort", "{}");
         }
 
         public bool Reinitialize(string projectRoot = null)
         {
+            CancelConfirmations();
+            lock (_confirmationLock) _confirmations.Clear();
             _projectRootOverride = projectRoot ?? "";
 
             if (_bridge != null)
@@ -322,14 +419,7 @@ namespace Pie
                 {
                     var name = ExtractJsonString(json, "name") ?? "tool";
                     var error = ExtractJsonString(json, "error");
-                    // The runtime event bridge emits resultText/resultJson. Keep
-                    // the legacy result fallback for older core.bytes bundles so
-                    // existing embedded callers remain compatible during upgrades.
-                    var result = ExtractJsonString(json, "resultText");
-                    if (string.IsNullOrEmpty(result))
-                        result = ExtractJsonString(json, "result");
-                    if (string.IsNullOrEmpty(result))
-                        result = ExtractJsonString(json, "resultJson");
+                    var result = ExtractJsonString(json, "result");
                     CompleteLatestToolMessage(name, error ?? result ?? "", !string.IsNullOrEmpty(error));
                     OnToolEnd?.Invoke(name, error ?? result ?? "");
                     break;

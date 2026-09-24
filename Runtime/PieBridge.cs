@@ -405,7 +405,7 @@ namespace Pie
         {
             var isEditor = false;
 #if UNITY_EDITOR
-            isEditor = true;
+            isEditor = !Application.isPlaying;
             if (string.IsNullOrEmpty(projectRoot))
                 projectRoot = Directory.GetParent(Application.dataPath).FullName
                     .Replace("\\", "/");
@@ -428,6 +428,11 @@ namespace Pie
         extensionSearchPathsJson: {extensionSearchPathsJson},
         skillSearchPathsJson: {skillSearchPathsJson},
         fileToolRootsJson: {fileToolRootsJson},
+
+        getRuntimePolicy: function() {{
+            var runner = CS.Pie.PieRunner.ActiveRunner;
+            return runner ? JSON.parse(runner.GetRuntimePolicyJson()) : {{ mode: 'normal', confirmationPolicy: 'allow', yoloMode: true }};
+        }},
 
         getProjectRoot: function() {{
             return globalThis.pieBridge.projectRoot;

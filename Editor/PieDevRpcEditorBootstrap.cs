@@ -8,6 +8,7 @@ namespace Pie.Editor
     internal static class PieDevRpcEditorBootstrap
     {
         private static bool _registeredUpdate;
+        private static bool _wasPlaying;
         [System.Serializable]
         private class ThreadInfoPayload
         {
@@ -46,6 +47,14 @@ namespace Pie.Editor
         private static void Tick()
         {
             PieDevRpcDispatcher.Tick();
+            var playing = EditorApplication.isPlayingOrWillChangePlaymode;
+            if (_wasPlaying && !playing)
+            {
+                PieUnityCapabilitiesBootstrap.InitializeEditor();
+                PieChatWindow.EnsureDevRpcReady();
+                PieChatWindow.DevRpcReconnect();
+            }
+            _wasPlaying = playing;
             PieUnityCapabilitiesBootstrap.HeartbeatEditor();
         }
     }

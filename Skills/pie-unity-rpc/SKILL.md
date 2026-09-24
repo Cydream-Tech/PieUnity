@@ -21,6 +21,8 @@ Do not dump the full manifest unless the user explicitly asks for it. If the hel
 
 Script resource: `pie-unity-rpc.js`
 
+The helper prints TOON by default for concise agent-readable results. Add `--json` to any command when another program needs the unchanged JSON envelope, or `--full` to disable display truncation. Run the helper with no arguments or `help` to see available commands. Unknown flags fail with `UNKNOWN_FLAG`.
+
 Command templates below use `<script>` as a placeholder for the resolved script path in the current host.
 
 ## Resolve the Package Skill
@@ -83,21 +85,23 @@ For Unity project files, use normal Pie file tools rooted at the Unity project. 
 
 ## Script Run
 
-Use `script-run` only for JavaScript generator tasks that should execute inside Unity. The script must define a generator entrypoint. For multi-frame work, yield `ctx.nextFrame()`, `ctx.waitFrames(n)`, or `ctx.waitSeconds(s)`. The command returns after the task completes, fails, or times out.
+Use `script-run` for async JavaScript tasks that should execute inside Unity. The script must define `export async function run(ctx, args)`. Await frame boundaries with `await ctx.nextFrame()`, `await ctx.waitFrames(n)`, or `await ctx.waitSeconds(s)`, and await engine/host calls such as `ctx.query`, `ctx.inspect`, `ctx.edit`, `ctx.host(...).call(...)`, and `ctx.runtime.call(...)`. The command returns after the task completes, fails, or times out.
 
 ```bash
-node <script> script-run --project "/abs/path/to/project" --data '{"script":"export function* run(ctx, args) { return ctx.query({ scope: \"scene_object\", limit: 3 }); }"}'
-node <script> script-run --project "/abs/path/to/project" --data '{"script":"export function* run(ctx, args) { for (let i = 0; i < 60; i++) { ctx.log(\"frame\", i); yield ctx.nextFrame(); } return { ok: true }; }","totalTimeoutMs":10000,"maxFrames":120}'
+node <script> script-run --project "/abs/path/to/project" --data '{"script":"export async function run(ctx, args) { return await ctx.query({ scope: \"scene_object\", limit: 3 }); }"}'
+node <script> script-run --project "/abs/path/to/project" --data '{"script":"export async function run(ctx, args) { for (let i = 0; i < 60; i++) { ctx.log(\"frame\", i); await ctx.nextFrame(); } return { ok: true }; }","totalTimeoutMs":10000,"maxFrames":120}'
 ```
 
-Do not pass C#, shader source, or raw file contents to `script-run`. Use normal Pie file tools for Unity project files, then call `unity_refresh` through `tool` if Unity must import changed assets. Do not write long synchronous loops. Express long goals as short generator steps that yield between frames.
+Do not pass C#, shader source, or raw file contents to `script-run`. Use normal Pie file tools for Unity project files, then call `unity_refresh` through `tool` if Unity must import changed assets. Do not write long synchronous loops. Express long goals as short async steps that await between frames. Scene edits applied before a failure are reported through `partial`/`appliedOperations`; `await ctx.rollback()` best-effort destroys objects the run created.
+
+For a task that must be cancelled externally, use `rpc --method unity_script_start` with the same script payload. It returns a `taskId` immediately. Use `rpc --method unity_script_status --data '{"taskId":"..."}'` to inspect it and `rpc --method unity_script_cancel --data '{"taskId":"...","reason":"..."}'` to cancel it. Inspect `appliedOperations` after cancellation before retrying.
 
 For zero-registration runtime work, prefer `ctx.runtime` path inspection and calls:
 
 ```js
-export function* run(ctx, args) {
+export async function run(ctx, args) {
   const members = ctx.runtime.members("IJsEnvironment.Environment");
-  const result = ctx.runtime.call("IJsEnvironment.Environment.ReloadAllMods", []);
+  const result = await ctx.runtime.call("IJsEnvironment.Environment.ReloadAllMods", []);
   return { members, result };
 }
 ```
@@ -105,8 +109,8 @@ export function* run(ctx, args) {
 When a runtime host namespace exists in the manifest, `ctx.host(...)` remains the structured higher-level option:
 
 ```js
-export function* run(ctx, args) {
-  const result = yield ctx.host("voxmod").call("reload_all_mods", { force: true });
+export async function run(ctx, args) {
+  const result = await ctx.host("voxmod").call("reload_all_mods", { force: true });
   return result;
 }
 ```

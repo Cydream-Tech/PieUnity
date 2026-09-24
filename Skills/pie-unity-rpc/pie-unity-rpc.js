@@ -4,12 +4,15 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { formatAgentOutput } from "./agent-output.mjs";
 
 const REGISTRY_DIR = path.join(homedir(), ".pie-unity", "instances");
 const DEFAULT_WAIT_MS = 600;
 const DEFAULT_RETRIES = 30;
 const ACTIVE_INSTANCE_MAX_AGE_SEC = 120;
 const EXPECTED_SKILL_PROTOCOL_VERSION = "pie-unity-rpc/2";
+const KNOWN_FLAGS = new Set(["project", "instance", "port", "namespace", "name", "data", "tool", "method", "token", "retries", "waitMs", "configSettleMs", "json", "full", "help"]);
+let outputFlags = {};
 
 class InstanceSelectionError extends Error {
 	constructor(code, message, details = {}) {
@@ -26,8 +29,9 @@ export function parseArgs(argv) {
 	const flags = {};
 	for (let i = 1; i < args.length; i += 1) {
 		const item = args[i];
-		if (!item.startsWith("--")) continue;
-		const key = item.slice(2);
+		if (!item.startsWith("--")) throw new InstanceSelectionError("INVALID_ARGUMENT", `Unexpected argument: ${item}`);
+		const key = item.slice(2).replace(/-([a-z])/g, (_all, letter) => letter.toUpperCase());
+		if (!KNOWN_FLAGS.has(key)) throw new InstanceSelectionError("UNKNOWN_FLAG", `Unknown flag: ${item}`);
 		const next = args[i + 1];
 		if (!next || next.startsWith("--")) {
 			flags[key] = "true";
@@ -222,6 +226,8 @@ export async function selectReadyInstance(instances, flags) {
 	const ranked = rankInstancesByHealth(probed);
 	const healthy = ranked.filter((item) => item?.__health?.ready === true && item?.__health?.mainThreadResponsive === true);
 	if (healthy.length === 1) return healthy[0];
+	const activeOwner = healthy.filter((item) => String(item?.instanceId || "") === String(item?.__health?.instanceId || ""));
+	if (activeOwner.length === 1) return activeOwner[0];
 	if (ranked.length === 1) return ranked[0];
 	return selectInstance(instances, flags);
 }
@@ -465,12 +471,19 @@ function findMatchingInstance(instances, flags, instance) {
 
 export async function runCli(argv = process.argv) {
 	const { command, flags } = parseArgs(argv);
+	outputFlags = flags;
+	if (flags.help === "true" || command === "help") {
+		writeJson({ description: "Inspect and operate the current pie-unity host.", commands: ["instances", "health", "manifest", "query", "inspect", "edit", "log-read", "script-run", "tool", "rpc"], help: ["Use --project <path> to select a Unity project.", "Use --json for machine JSON or --full for untruncated TOON."] });
+		return;
+	}
 	if (command === "instances") {
-		const instances = await probeCandidateHealth(getActiveInstances(loadRegistry()), flags);
+		const nowUnix = Math.floor(Date.now() / 1000);
+		const recent = loadRegistry().filter((item) => nowUnix - Number(item?.lastSeenUnix || 0) <= ACTIVE_INSTANCE_MAX_AGE_SEC);
+		const instances = await probeCandidateHealth(recent, flags);
 		const filtered = flags.project
 			? instances.filter((item) => computeProjectMatchScore(flags.project, item.projectPath || "") > 0)
 			: instances;
-		writeJson({ service: "pie-unity", instances: filtered.map(formatCandidate) });
+		writeJson({ service: "pie-unity", instances: filtered.map(formatCandidate), help: filtered.length === 0 ? ["Open a Unity project with com.pie.agent, then run instances again."] : ["Use health --project <path> or manifest --instance <id> to continue."] });
 		return;
 	}
 
@@ -763,7 +776,11 @@ function normalizePath(value) {
 }
 
 function writeJson(payload) {
-	process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+	if (outputFlags.json === "true") {
+		process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+		return;
+	}
+	process.stdout.write(`${formatAgentOutput(payload, { full: outputFlags.full === "true" })}\n`);
 }
 
 function dedupeInstances(items) {
@@ -821,15 +838,11 @@ export const __testOnly = {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
 	runCli().catch((error) => {
 		if (error instanceof InstanceSelectionError) {
-			process.stderr.write(`${JSON.stringify({
-				error: error.message,
-				code: error.code,
-				...error.details,
-			}, null, 2)}\n`);
+			writeJson({ ok: false, errorCode: error.code, errorMessage: error.message, ...error.details, help: ["Run help for command usage or instances to discover a host."] });
 			process.exitCode = 2;
 			return;
 		}
-		process.stderr.write(`${error?.message || error}\n`);
+		writeJson({ ok: false, errorCode: "RPC_HELPER_ERROR", errorMessage: error?.message || String(error), help: ["Run health and inspect the host manifest before retrying."] });
 		process.exitCode = 1;
 	});
 }

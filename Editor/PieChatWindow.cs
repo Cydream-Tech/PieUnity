@@ -357,11 +357,20 @@ namespace Pie.Editor
             PieDevRpc.Register("interaction.enqueue_response", argsJson => DevRpcEnqueueInteractionResponse(argsJson));
             PieDevRpc.Register("interaction.clear_responses", _ => DevRpcClearInteractionResponses());
             PieDevRpc.Register("interaction.consume_completed", argsJson => DevRpcConsumeCompletedInteraction(argsJson));
+            PieUnityCapabilityRegistry.RegisterRpc("pie_chat.open", "chat", "Open Pie Chat and initialize its bridge.", "editor", false, false, null, new PieUnityParameterDescriptor[0], _ => DevRpcOpen());
+            PieUnityCapabilityRegistry.RegisterRpc("pie_chat.set_input", "chat", "Set the Pie Chat input text.", "editor", false, false, null, new[]
+            {
+                new PieUnityParameterDescriptor { name = "text", type = "string", required = true },
+            }, DevRpcSetInput);
+            PieUnityCapabilityRegistry.RegisterRpc("pie_chat.set_config", "chat", "Set the Pie Chat model configuration.", "editor", false, false, null, new PieUnityParameterDescriptor[0], DevRpcSetConfig);
+            PieUnityCapabilityRegistry.RegisterRpc("pie_chat.reconnect", "chat", "Reconnect the Pie Chat bridge.", "editor", false, false, null, new PieUnityParameterDescriptor[0], _ => DevRpcReconnect());
+            PieUnityCapabilityRegistry.RegisterRpc("pie_chat.get_session_path_info", "chat", "Inspect the active session path.", "editor", true, false, null, new PieUnityParameterDescriptor[0], DevRpcGetSessionPathInfo);
+            PieUnityCapabilityRegistry.RegisterRpc("pie_chat.get_recovery_state", "chat", "Inspect the chat recovery state.", "editor", true, false, null, new PieUnityParameterDescriptor[0], _ => DevRpcGetRecoveryState());
             PieUnityCapabilityRegistry.RegisterRpc("pie_chat.send", "chat", "Legacy Pie Chat send RPC.", "editor", false, true, null, new[]
             {
                 new PieUnityParameterDescriptor { name = "text", type = "string", required = true },
             }, DevRpcSend);
-            PieUnityCapabilityRegistry.RegisterRpc("pie_chat.abort", "chat", "Abort the active Pie Chat turn.", "editor", false, true, null, new PieUnityParameterDescriptor[0], _ => DevRpcAbort());
+            PieUnityCapabilityRegistry.RegisterRpc("pie_chat.abort", "chat", "Abort the active Pie Chat turn.", "editor", false, false, null, new PieUnityParameterDescriptor[0], _ => DevRpcAbort());
             PieUnityCapabilityRegistry.RegisterRpc("pie_chat.get_state", "chat", "Legacy Pie Chat state RPC.", "editor", true, true, null, new PieUnityParameterDescriptor[0], _ => DevRpcGetState());
             PieUnityCapabilityRegistry.RegisterRpc("pie_chat.get_messages", "chat", "Legacy Pie Chat messages RPC.", "editor", true, true, null, new[]
             {

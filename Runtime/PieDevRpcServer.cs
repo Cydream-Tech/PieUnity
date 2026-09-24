@@ -438,8 +438,15 @@ namespace Pie
                     () => PieUnityCapabilitiesBootstrap.StartUnityScriptRun(argsJson),
                     ScriptRunMainThreadTimeoutMs);
 
+                var watchdog = System.Diagnostics.Stopwatch.StartNew();
+                var initialStatus = JsonUtility.FromJson<ScriptRunStatusPayload>(statusJson ?? "{}");
+                // Give the JS host a short chance to publish its own TOTAL_TIMEOUT
+                // status before reporting an unknown transport state.
+                var deadlineMs = (initialStatus != null && initialStatus.totalTimeoutMs > 0 ? initialStatus.totalTimeoutMs : 30000) + 1000L;
                 while (true)
                 {
+                    if (watchdog.ElapsedMilliseconds > deadlineMs)
+                        throw new TimeoutException("Unity script run wall-clock watchdog expired.");
                     var status = JsonUtility.FromJson<ScriptRunStatusPayload>(statusJson ?? "{}") ?? new ScriptRunStatusPayload();
                     if (!string.IsNullOrWhiteSpace(status.taskId))
                         taskId = status.taskId;
@@ -448,19 +455,13 @@ namespace Pie
                     {
                         var ok = string.Equals(status.status, "completed", StringComparison.Ordinal);
                         var error = ok ? "" : (status.errorMessage ?? status.status ?? "Unity script run failed.");
-                        return BuildEnvelopeOnMainThread(
-                            "tool",
-                            "unity_script_run",
-                            ok,
-                            statusJson,
-                            error,
-                            ok ? "" : status.errorCode);
+                        return BuildEnvelopeOnMainThread("tool", "unity_script_run", ok, statusJson, error);
                     }
 
                     if (token.IsCancellationRequested)
                     {
                         TryCancelUnityScriptRun(taskId, "Dev RPC server is stopping.");
-                        return BuildEnvelopeOnMainThread("tool", "unity_script_run", false, statusJson, "Dev RPC server is stopping.");
+                        return BuildScriptRunFailure(taskId, "cancelled", "CANCELLED", "Dev RPC server is stopping.");
                     }
 
                     Thread.Sleep(ScriptRunPollIntervalMs);
@@ -472,20 +473,23 @@ namespace Pie
             catch (Exception ex)
             {
                 TryCancelUnityScriptRun(taskId, ex.Message);
-                return BuildEnvelopeOnMainThread("tool", "unity_script_run", false, "null", ex.Message);
+                return BuildScriptRunFailure(taskId, "failed", ex is TimeoutException ? "HOST_TIMEOUT" : "HOST_ERROR", ex.Message);
             }
         }
 
-        private static string BuildEnvelopeOnMainThread(
-            string kind,
-            string name,
-            bool ok,
-            string resultJson,
-            string error,
-            string errorCode = "CAPABILITY_ERROR")
+        // Transport terminal state must not call Unity, PuerTS, or the main-thread dispatcher.
+        private static string BuildScriptRunFailure(string taskId, string status, string code, string message)
+        {
+            var result = "{\"taskId\":\"" + EscapeJson(taskId ?? "") + "\",\"done\":true,\"status\":\"" + status
+                + "\",\"errorCode\":\"" + code + "\",\"errorMessage\":\"" + EscapeJson(message ?? "") + "\",\"executionStateUnknown\":true}";
+            return "{\"ok\":false,\"kind\":\"tool\",\"name\":\"unity_script_run\",\"result\":\"" + EscapeJson(result)
+                + "\",\"errorCode\":\"" + code + "\",\"error\":\"" + EscapeJson(message ?? "") + "\"}";
+        }
+
+        private static string BuildEnvelopeOnMainThread(string kind, string name, bool ok, string resultJson, string error)
         {
             return PieDevRpcDispatcher.InvokeSync(
-                () => BuildEnvelope(kind, name, ok, resultJson, error, errorCode),
+                () => BuildEnvelope(kind, name, ok, resultJson, error),
                 ScriptRunMainThreadTimeoutMs);
         }
 

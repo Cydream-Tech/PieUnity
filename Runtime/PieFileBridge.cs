@@ -35,6 +35,7 @@ namespace Pie
             public int ScannedDirectories;
             public int ScannedFiles;
             public bool LimitReached;
+			public bool SearchIncomplete;
             public string Pattern;
             public string RootPath;
         }
@@ -58,6 +59,8 @@ namespace Pie
             public string Glob;
             public bool Literal;
             public bool IgnoreCase;
+			public bool SearchIncomplete;
+			public string SafetyLimit;
         }
 
         [Serializable]
@@ -68,6 +71,13 @@ namespace Pie
             public bool IsFile;
             public long Size;
             public long LastWriteTicksUtc;
+        }
+
+        [Serializable]
+        public sealed class DirectoryReadResult
+        {
+            public string[] Entries;
+            public bool LimitReached;
         }
 
         [Serializable]
@@ -86,6 +96,8 @@ namespace Pie
             public bool Truncated;
             public string TruncatedBy;
             public bool FirstLineExceedsLimit;
+            public bool SelectedBytesLookBinary;
+            public bool FileBytesLookBinary;
             public long LastWriteTicksUtc;
             public long Size;
         }
@@ -108,19 +120,163 @@ namespace Pie
         };
         private static readonly HashSet<string> _binaryExtensionSet = new HashSet<string>(_binaryExtensions, StringComparer.OrdinalIgnoreCase);
 
-        private const int GrepMaxLineLength = 400;
+        private const int GrepMaxLineLength = 500;
         private const int RegexTimeoutMs = 250;
         private const int MaxRegexPatternLength = 512;
         private const int MaxGlobPatternLength = 256;
+        private const int MaxGlobBraceExpansions = 64;
+        private const int MaxScannedDirectories = 10000;
+		private const int MaxDirectoryEntries = 10000;
+		private const int MaxSearchFiles = 10000;
+		private const long MaxGrepFileBytes = 8L * 1024L * 1024L;
+		private const long MaxGrepTotalBytes = 64L * 1024L * 1024L;
+		private const int MaxGrepFileLines = 250000;
+		private const int MaxGrepContextLines = 20;
+		private const int MaxGrepResultLimit = 1000;
+
+		[Serializable]
+		private sealed class RegexLinesRequest
+		{
+			public string[] Lines;
+		}
+
+		[Serializable]
+		private sealed class RegexLinesResult
+		{
+			public int[] MatchLines;
+		}
+
+		private sealed class CompiledGlobMatcher
+		{
+			private readonly Regex[] _patterns;
+			private readonly Regex[] _leadingDoubleStarPatterns;
+			private readonly bool _matchEntryName;
+
+			public CompiledGlobMatcher(string normalizedPattern, Regex[] patterns, Regex[] leadingDoubleStarPatterns)
+			{
+				_patterns = patterns;
+				_leadingDoubleStarPatterns = leadingDoubleStarPatterns;
+				_matchEntryName = normalizedPattern.IndexOf('/') < 0;
+			}
+
+			public bool IsMatch(string relativePath, string entryName)
+			{
+				if (_matchEntryName)
+					return MatchesAny(entryName, _patterns);
+
+				var normalizedRelativePath = (relativePath ?? string.Empty).Replace("\\", "/");
+				return (_leadingDoubleStarPatterns != null && MatchesAny(normalizedRelativePath, _leadingDoubleStarPatterns))
+					|| MatchesAny(normalizedRelativePath, _patterns);
+			}
+
+			private static bool MatchesAny(string input, Regex[] patterns)
+			{
+				foreach (var pattern in patterns)
+				{
+					if (pattern.IsMatch(input ?? string.Empty))
+						return true;
+				}
+				return false;
+			}
+		}
+
+		private sealed class CompiledFindPattern
+		{
+			public readonly string NormalizedPattern;
+			public readonly CompiledGlobMatcher GlobMatcher;
+
+			public CompiledFindPattern(string normalizedPattern, CompiledGlobMatcher globMatcher)
+			{
+				NormalizedPattern = normalizedPattern;
+				GlobMatcher = globMatcher;
+			}
+		}
+
+        private static string ValidateTraversalRoot(string path)
+        {
+            var fullPath = Path.GetFullPath(path);
+            var root = Path.GetPathRoot(fullPath) ?? string.Empty;
+            var current = root;
+            var relative = fullPath.Substring(root.Length);
+            var parts = relative.Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var part in parts)
+            {
+                current = string.IsNullOrEmpty(current) ? part : Path.Combine(current, part);
+                var attributes = File.GetAttributes(current);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new IOException($"Symbolic links and junctions are not supported by the Unity filesystem sandbox: {current}");
+            }
+            return fullPath;
+        }
+
+        private static bool IsWithinTraversalRoot(string candidate, string root)
+        {
+            var fullCandidate = Path.GetFullPath(candidate);
+            var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var prefix = fullRoot + Path.DirectorySeparatorChar;
+            return string.Equals(fullCandidate, fullRoot, StringComparison.OrdinalIgnoreCase)
+                || fullCandidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsReparsePoint(string path)
+        {
+            return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+        }
+
+		private static string[] ReadDirectoryEntriesBounded(string path, int limit, out bool overflow, CancellationToken token = default(CancellationToken))
+		{
+			if (limit < 0) throw new ArgumentOutOfRangeException(nameof(limit));
+			// Keep one bounded lookahead entry for callers that need to distinguish
+			// an exact 10k directory from overflow without materializing the rest.
+			var effectiveLimit = Math.Min(limit, MaxDirectoryEntries + 1);
+			var entries = new List<string>(effectiveLimit);
+			overflow = false;
+			using (var enumerator = Directory.EnumerateFileSystemEntries(path).GetEnumerator())
+			{
+				while (enumerator.MoveNext())
+				{
+					token.ThrowIfCancellationRequested();
+					if (entries.Count >= effectiveLimit)
+					{
+						overflow = true;
+						break;
+					}
+					entries.Add(enumerator.Current);
+				}
+			}
+			entries.Sort(StringComparer.OrdinalIgnoreCase);
+			return entries.ToArray();
+		}
 
         public static Task<string> ReadAllTextAsync(string path)
         {
             return Task.Run(() => File.ReadAllText(path));
         }
 
-        public static Task<string> ReadTextRangeAsync(string path, int offsetLine, int limitLines, int maxOutputLines, int maxOutputBytes)
+        public static string ReadPrefixHex(string path, int maxBytes)
         {
-            return Task.Run(() => JsonUtility.ToJson(ExecuteReadTextRange(path, offsetLine, limitLines, maxOutputLines, maxOutputBytes)));
+            return ReadRangeHex(path, 0, maxBytes);
+        }
+
+        public static string ReadRangeHex(string path, int offset, int maxBytes)
+        {
+            var limit = Math.Max(0, Math.Min(maxBytes, 65536));
+            if (limit == 0) return "";
+            using (var stream = File.OpenRead(path))
+            {
+                var start = Math.Max(0, offset);
+                if (start >= stream.Length) return "";
+                stream.Seek(start, SeekOrigin.Begin);
+                var buffer = new byte[(int)Math.Min(limit, stream.Length - start)];
+                var read = 0;
+                while (read < buffer.Length)
+                {
+                    var next = stream.Read(buffer, read, buffer.Length - read);
+                    if (next == 0) break;
+                    read += next;
+                }
+                return BitConverter.ToString(buffer, 0, read).Replace("-", "");
+            }
         }
 
         public static Task<string> ReadAllBytesBase64Async(string path)
@@ -154,6 +310,24 @@ namespace Pie
                 return files.Concat(dirs).ToArray();
             });
         }
+
+        public static Task<DirectoryReadResult> ReadDirectoryBoundedAsync(string path, int limit)
+        {
+			return Task.Run(() =>
+			{
+				var result = ReadDirectoryBounded(path, limit);
+				result.Entries = result.Entries.Select(Path.GetFileName).ToArray();
+				return result;
+			});
+        }
+
+		public static DirectoryReadResult ReadDirectoryBounded(string path, int limit)
+		{
+			if (limit < 0) throw new ArgumentOutOfRangeException(nameof(limit));
+			bool overflow;
+			var entries = ReadDirectoryEntriesBounded(path, limit, out overflow);
+			return new DirectoryReadResult { Entries = entries, LimitReached = overflow };
+		}
 
         public static Task<bool> ExistsAsync(string path)
         {
@@ -199,11 +373,12 @@ namespace Pie
             return Task.Run(() => File.Delete(path));
         }
 
-        private static TextRangeReadResult ExecuteReadTextRange(string path, int offsetLine, int limitLines, int maxOutputLines, int maxOutputBytes)
+        private static TextRangeReadResult ExecuteReadTextRange(string path, int offsetLine, int limitLines, int maxOutputLines, int maxOutputBytes, CancellationToken token)
         {
+			token.ThrowIfCancellationRequested();
             var info = new FileInfo(path);
-            var startLine = Math.Max(0, offsetLine);
-            var endLine = limitLines < 0 ? int.MaxValue : startLine + Math.Max(0, limitLines);
+            long startLine = Math.Max(0, offsetLine);
+            long endLine = limitLines < 0 ? long.MaxValue : startLine + (long)Math.Max(0, limitLines);
             var outputLineLimit = maxOutputLines < 0 ? int.MaxValue : Math.Max(0, maxOutputLines);
             var outputByteLimit = maxOutputBytes < 0 ? int.MaxValue : Math.Max(0, maxOutputBytes);
             var fullHash = new FnvaTextHash();
@@ -225,6 +400,8 @@ namespace Pie
             bool truncated = false;
             string truncatedBy = null;
             bool firstLineExceedsLimit = false;
+            var fileBinaryDetector = new StreamingBinaryDetector();
+            var selectedBinaryDetector = new StreamingBinaryDetector();
 
             void StartLine()
             {
@@ -341,12 +518,34 @@ namespace Pie
                 pendingHighSurrogate = null;
             }
 
-            using (var reader = new StreamReader(path, Encoding.UTF8, true))
+            long observedSize = 0;
+            // Decode and classify the same open file snapshot. A second open would
+            // let a replacement race pair an old binary verdict with new content.
+            using (var rawStream = File.OpenRead(path))
             {
-                int read;
-                while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
+                observedSize = rawStream.Length;
+                var rawBuffer = new byte[8192];
+                var decoder = new UTF8Encoding(false, false).GetDecoder();
+                var rawLineIndex = 0;
+                int rawRead;
+                while ((rawRead = rawStream.Read(rawBuffer, 0, rawBuffer.Length)) > 0)
                 {
-                    for (int i = 0; i < read; i++)
+					token.ThrowIfCancellationRequested();
+                    for (var rawIndex = 0; rawIndex < rawRead; rawIndex++)
+                    {
+                        var value = rawBuffer[rawIndex];
+                        fileBinaryDetector.Update(value);
+                        if (rawLineIndex >= startLine && rawLineIndex < endLine)
+                            selectedBinaryDetector.Update(value);
+                        if (value == 0x0a)
+                            rawLineIndex++;
+                    }
+
+                    int bytesUsed;
+                    int charsUsed;
+                    bool completed;
+                    decoder.Convert(rawBuffer, 0, rawRead, buffer, 0, buffer.Length, false, out bytesUsed, out charsUsed, out completed);
+                    for (int i = 0; i < charsUsed; i++)
                     {
                         var ch = buffer[i];
                         fullHash.Update(ch);
@@ -375,6 +574,30 @@ namespace Pie
                         }
                     }
                 }
+				token.ThrowIfCancellationRequested();
+
+                int finalBytesUsed;
+                int finalCharsUsed;
+                bool finalCompleted;
+                decoder.Convert(new byte[0], 0, 0, buffer, 0, buffer.Length, true, out finalBytesUsed, out finalCharsUsed, out finalCompleted);
+                for (int i = 0; i < finalCharsUsed; i++)
+                {
+                    var ch = buffer[i];
+                    fullHash.Update(ch);
+                    if (pendingHighSurrogate.HasValue)
+                    {
+                        if (char.IsLowSurrogate(ch))
+                        {
+                            ScanLineText(new string(new[] { pendingHighSurrogate.Value, ch }));
+                            pendingHighSurrogate = null;
+                            continue;
+                        }
+                        FlushPendingHighSurrogate();
+                    }
+                    if (ch == '\n') FinishLine();
+                    else if (char.IsHighSurrogate(ch)) pendingHighSurrogate = ch;
+                    else ScanLineText(ch.ToString());
+                }
             }
 
             FlushPendingHighSurrogate();
@@ -386,7 +609,7 @@ namespace Pie
                 ContentHash = fullHash.Digest(),
                 SelectedContentHash = selectedHash.Digest(),
                 TotalLines = lineIndex,
-                TotalBytes = info.Length,
+				TotalBytes = observedSize,
                 SelectedLines = selectedLines,
                 SelectedBytes = selectedBytes,
                 FirstLineBytes = firstLineBytes,
@@ -395,9 +618,73 @@ namespace Pie
                 Truncated = truncated,
                 TruncatedBy = truncatedBy,
                 FirstLineExceedsLimit = firstLineExceedsLimit,
+                SelectedBytesLookBinary = selectedBinaryDetector.LooksBinary,
+                FileBytesLookBinary = fileBinaryDetector.LooksBinary,
                 LastWriteTicksUtc = info.LastWriteTimeUtc.Ticks,
-                Size = info.Length,
+				Size = observedSize,
             };
+        }
+
+        private sealed class StreamingBinaryDetector
+        {
+            private long _bytes;
+            private long _suspiciousControls;
+            private int _remainingUtf8Bytes;
+            private uint _codePoint;
+            private uint _minimumCodePoint;
+            private bool _invalidUtf8;
+            private bool _hasNul;
+
+            public void Update(byte value)
+            {
+                _bytes++;
+                if (value == 0) _hasNul = true;
+                if ((value < 0x20 && value != 0x09 && value != 0x0a && value != 0x0d) || value == 0x7f)
+                    _suspiciousControls++;
+
+                if (_invalidUtf8) return;
+                if (_remainingUtf8Bytes == 0)
+                {
+                    if (value <= 0x7f) return;
+                    if (value >= 0xc2 && value <= 0xdf)
+                    {
+                        _remainingUtf8Bytes = 1;
+                        _codePoint = (uint)(value & 0x1f);
+                        _minimumCodePoint = 0x80;
+                        return;
+                    }
+                    if (value >= 0xe0 && value <= 0xef)
+                    {
+                        _remainingUtf8Bytes = 2;
+                        _codePoint = (uint)(value & 0x0f);
+                        _minimumCodePoint = 0x800;
+                        return;
+                    }
+                    if (value >= 0xf0 && value <= 0xf4)
+                    {
+                        _remainingUtf8Bytes = 3;
+                        _codePoint = (uint)(value & 0x07);
+                        _minimumCodePoint = 0x10000;
+                        return;
+                    }
+                    _invalidUtf8 = true;
+                    return;
+                }
+
+                if ((value & 0xc0) != 0x80)
+                {
+                    _invalidUtf8 = true;
+                    return;
+                }
+                _codePoint = (_codePoint << 6) | (uint)(value & 0x3f);
+                _remainingUtf8Bytes--;
+                if (_remainingUtf8Bytes == 0 && (_codePoint < _minimumCodePoint || _codePoint > 0x10ffff
+                    || (_codePoint >= 0xd800 && _codePoint <= 0xdfff)))
+                    _invalidUtf8 = true;
+            }
+
+            public bool LooksBinary => _invalidUtf8 || _remainingUtf8Bytes != 0 || _hasNul
+                || (_bytes > 0 && (double)_suspiciousControls / _bytes > 0.02);
         }
 
         private struct FnvaTextHash
@@ -448,11 +735,12 @@ namespace Pie
 
         public static Task<string> FindAsync(string rootPath, string pattern, int limit)
         {
+            var compiledPattern = ValidateFindPattern(pattern);
             return Task.Run(() =>
             {
                 try
                 {
-                    var payload = ExecuteFind(rootPath, pattern, limit, CancellationToken.None);
+                    var payload = ExecuteFind(rootPath, pattern, compiledPattern, limit, CancellationToken.None);
                     return JsonUtility.ToJson(payload);
                 }
                 catch (RegexMatchTimeoutException ex)
@@ -464,11 +752,12 @@ namespace Pie
 
         public static Task<string> GrepAsync(string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset)
         {
+            var compiledGlob = ValidateOptionalGlobPattern(globPattern);
             return Task.Run(() =>
             {
                 try
                 {
-                    var payload = ExecuteGrep(searchPath, pattern, globPattern, ignoreCase, literal, contextLines, limit, outputMode, offset, CancellationToken.None);
+                    var payload = ExecuteGrep(searchPath, pattern, globPattern, compiledGlob, ignoreCase, literal, contextLines, limit, outputMode, offset, CancellationToken.None);
                     return JsonUtility.ToJson(payload);
                 }
                 catch (RegexMatchTimeoutException ex)
@@ -480,25 +769,54 @@ namespace Pie
 
         public static int StartFind(string rootPath, string pattern, int limit)
         {
+            var compiledPattern = ValidateFindPattern(pattern);
             int id = Interlocked.Increment(ref _nextRequestId);
             var state = new RequestState(id);
             _requests[id] = state;
 
             PieDiagnostics.Verbose($"[PieFileBridge] find_files start path={rootPath} pattern={pattern} limit={limit}");
-            Task.Run(() => RunFind(state, rootPath, pattern, limit));
+            Task.Run(() => RunFind(state, rootPath, pattern, compiledPattern, limit));
             return id;
         }
 
+		public static int StartReadTextRange(string path, int offsetLine, int limitLines, int maxOutputLines, int maxOutputBytes)
+		{
+			int id = Interlocked.Increment(ref _nextRequestId);
+			var state = new RequestState(id);
+			_requests[id] = state;
+			Task.Run(() => RunReadTextRange(state, path, offsetLine, limitLines, maxOutputLines, maxOutputBytes));
+			return id;
+		}
+
+		public static int StartReadDirectoryBounded(string path, int limit)
+		{
+			int id = Interlocked.Increment(ref _nextRequestId);
+			var state = new RequestState(id);
+			_requests[id] = state;
+			Task.Run(() => RunReadDirectoryBounded(state, path, limit));
+			return id;
+		}
+
         public static int StartGrep(string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset)
         {
+            var compiledGlob = ValidateOptionalGlobPattern(globPattern);
             int id = Interlocked.Increment(ref _nextRequestId);
             var state = new RequestState(id);
             _requests[id] = state;
 
             PieDiagnostics.Verbose($"[PieFileBridge] grep_text start path={searchPath} pattern={pattern} glob={globPattern} limit={limit}");
-            Task.Run(() => RunGrep(state, searchPath, pattern, globPattern, ignoreCase, literal, contextLines, limit, outputMode, offset));
+            Task.Run(() => RunGrep(state, searchPath, pattern, globPattern, compiledGlob, ignoreCase, literal, contextLines, limit, outputMode, offset));
             return id;
         }
+
+		public static int StartRegexLines(string pattern, bool ignoreCase, string linesJson)
+		{
+			int id = Interlocked.Increment(ref _nextRequestId);
+			var state = new RequestState(id);
+			_requests[id] = state;
+			Task.Run(() => RunRegexLines(state, pattern, ignoreCase, linesJson));
+			return id;
+		}
 
         public static bool IsRequestComplete(int requestId)
         {
@@ -565,11 +883,11 @@ namespace Pie
                 state.Cts.Dispose();
         }
 
-        private static void RunFind(RequestState state, string rootPath, string pattern, int limit)
+        private static void RunFind(RequestState state, string rootPath, string pattern, CompiledFindPattern compiledPattern, int limit)
         {
             try
             {
-                var payload = ExecuteFind(rootPath, pattern, limit, state.Cts.Token);
+                var payload = ExecuteFind(rootPath, pattern, compiledPattern, limit, state.Cts.Token);
                 state.ResultJson = JsonUtility.ToJson(payload);
                 PieDiagnostics.Verbose($"[PieFileBridge] find_files done pattern={pattern} matches={payload.Results.Length} dirs={payload.ScannedDirectories} files={payload.ScannedFiles}");
             }
@@ -594,11 +912,60 @@ namespace Pie
             }
         }
 
-        private static void RunGrep(RequestState state, string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset)
+		private static void RunReadTextRange(RequestState state, string path, int offsetLine, int limitLines, int maxOutputLines, int maxOutputBytes)
+		{
+			try
+			{
+				var payload = ExecuteReadTextRange(path, offsetLine, limitLines, maxOutputLines, maxOutputBytes, state.Cts.Token);
+				state.ResultJson = JsonUtility.ToJson(payload);
+			}
+			catch (OperationCanceledException)
+			{
+				state.Error = "Operation aborted";
+			}
+			catch (Exception ex)
+			{
+				state.Error = ex.Message;
+				PieDiagnostics.Error($"[PieFileBridge] read_file range error: {ex.Message}");
+			}
+			finally
+			{
+				state.IsComplete = true;
+			}
+		}
+
+		private static void RunReadDirectoryBounded(RequestState state, string path, int limit)
+		{
+			try
+			{
+				if (limit < 0) throw new ArgumentOutOfRangeException(nameof(limit));
+				bool overflow;
+				var entries = ReadDirectoryEntriesBounded(path, limit, out overflow, state.Cts.Token);
+				state.ResultJson = JsonUtility.ToJson(new DirectoryReadResult
+				{
+					Entries = entries.Select(Path.GetFileName).ToArray(),
+					LimitReached = overflow,
+				});
+			}
+			catch (OperationCanceledException)
+			{
+				state.Error = "Operation aborted";
+			}
+			catch (Exception ex)
+			{
+				state.Error = ex.Message;
+			}
+			finally
+			{
+				state.IsComplete = true;
+			}
+		}
+
+        private static void RunGrep(RequestState state, string searchPath, string pattern, string globPattern, CompiledGlobMatcher compiledGlob, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset)
         {
             try
             {
-                var payload = ExecuteGrep(searchPath, pattern, globPattern, ignoreCase, literal, contextLines, limit, outputMode, offset, state.Cts.Token);
+                var payload = ExecuteGrep(searchPath, pattern, globPattern, compiledGlob, ignoreCase, literal, contextLines, limit, outputMode, offset, state.Cts.Token);
                 state.ResultJson = JsonUtility.ToJson(payload);
                 PieDiagnostics.Verbose($"[PieFileBridge] grep_text done pattern={pattern} matches={payload.MatchCount} files={payload.FilesScanned}");
             }
@@ -623,7 +990,42 @@ namespace Pie
             }
         }
 
-        private static FindRequestResult ExecuteFind(string rootPath, string pattern, int limit, CancellationToken token)
+		private static void RunRegexLines(RequestState state, string pattern, bool ignoreCase, string linesJson)
+		{
+			try
+			{
+				var request = JsonUtility.FromJson<RegexLinesRequest>(linesJson);
+				var lines = request != null && request.Lines != null ? request.Lines : new string[0];
+				if (lines.Length > MaxGrepFileLines)
+					throw new IOException($"Regex input exceeds the {MaxGrepFileLines} line safety limit");
+				var regex = BuildRegex(pattern, ignoreCase, false);
+				var matches = new List<int>();
+				for (int index = 0; index < lines.Length; index++)
+				{
+					state.Cts.Token.ThrowIfCancellationRequested();
+					if (regex.IsMatch(lines[index] ?? string.Empty)) matches.Add(index);
+				}
+				state.ResultJson = JsonUtility.ToJson(new RegexLinesResult { MatchLines = matches.ToArray() });
+			}
+			catch (OperationCanceledException)
+			{
+				state.Error = "Operation aborted";
+			}
+			catch (RegexMatchTimeoutException ex)
+			{
+				state.Error = "REGEX_INVALID_OR_TIMEOUT: " + ex.Message;
+			}
+			catch (Exception ex)
+			{
+				state.Error = ex.Message;
+			}
+			finally
+			{
+				state.IsComplete = true;
+			}
+		}
+
+        private static FindRequestResult ExecuteFind(string rootPath, string pattern, CompiledFindPattern compiledPattern, int limit, CancellationToken token)
         {
             if (string.IsNullOrWhiteSpace(rootPath) || !Directory.Exists(rootPath))
                 throw new DirectoryNotFoundException($"Path not found: {rootPath}");
@@ -631,44 +1033,64 @@ namespace Pie
             if (string.IsNullOrWhiteSpace(pattern))
                 throw new ArgumentException("Pattern must not be empty");
 
+            rootPath = ValidateTraversalRoot(rootPath);
             var results = new List<string>();
             var queue = new Queue<string>();
             queue.Enqueue(rootPath);
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             int scannedDirectories = 0;
             int scannedFiles = 0;
             bool limitReached = false;
+			bool searchIncomplete = false;
 
             while (queue.Count > 0)
             {
                 token.ThrowIfCancellationRequested();
-                var dir = queue.Dequeue();
+                var dir = Path.GetFullPath(queue.Dequeue());
+                if (!IsWithinTraversalRoot(dir, rootPath) || IsReparsePoint(dir))
+                    throw new IOException($"Search directory escapes or crosses a reparse point: {dir}");
+                if (!visited.Add(dir))
+                    continue;
                 scannedDirectories++;
-
-                string[] entries;
-                try
+                if (scannedDirectories > MaxScannedDirectories)
                 {
-                    entries = Directory.GetFileSystemEntries(dir);
+                    searchIncomplete = true;
+                    break;
                 }
+
+				string[] entries;
+				try
+				{
+					bool directoryOverflow;
+					entries = ReadDirectoryEntriesBounded(dir, MaxDirectoryEntries, out directoryOverflow, token);
+					if (directoryOverflow) searchIncomplete = true;
+				}
                 catch
                 {
+					searchIncomplete = true;
                     continue;
                 }
 
-                Array.Sort(entries, StringComparer.OrdinalIgnoreCase);
-
-                foreach (var entryPath in entries)
+				foreach (var entryPath in entries)
                 {
                     token.ThrowIfCancellationRequested();
+					if (!IsWithinTraversalRoot(entryPath, rootPath) || IsReparsePoint(entryPath))
+					{
+						searchIncomplete = true;
+						continue;
+					}
 
-                    bool isDirectory;
-                    try
-                    {
-                        isDirectory = Directory.Exists(entryPath);
-                    }
-                    catch
-                    {
-                        continue;
-                    }
+					bool isDirectory;
+					try
+					{
+						var attributes = File.GetAttributes(entryPath);
+						isDirectory = (attributes & FileAttributes.Directory) != 0;
+					}
+					catch
+					{
+						searchIncomplete = true;
+						continue;
+					}
 
                     var entryName = Path.GetFileName(entryPath);
                     if (isDirectory)
@@ -676,7 +1098,12 @@ namespace Pie
                         if (_skipDirSet.Contains(entryName))
                             continue;
 
-                        queue.Enqueue(entryPath);
+						if (scannedDirectories + queue.Count >= MaxScannedDirectories)
+						{
+							searchIncomplete = true;
+							continue;
+						}
+						queue.Enqueue(entryPath);
                         continue;
                     }
 
@@ -684,8 +1111,14 @@ namespace Pie
                         continue;
 
                     scannedFiles++;
+					if (scannedFiles > MaxSearchFiles)
+					{
+						searchIncomplete = true;
+						limitReached = true;
+						break;
+					}
                     var relativePath = MakeRelativePath(rootPath, entryPath);
-                    if (MatchesFindPattern(relativePath, entryName, pattern))
+                    if (MatchesFindPattern(relativePath, entryName, compiledPattern))
                     {
                         if (results.Count < limit)
                         {
@@ -709,6 +1142,7 @@ namespace Pie
                 ScannedDirectories = scannedDirectories,
                 ScannedFiles = scannedFiles,
                 LimitReached = limitReached,
+				SearchIncomplete = searchIncomplete,
                 Pattern = pattern,
                 RootPath = rootPath,
             };
@@ -728,8 +1162,12 @@ namespace Pie
             public long LastWriteTicksUtc;
         }
 
-        private static GrepRequestResult ExecuteGrep(string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset, CancellationToken token)
+        private static GrepRequestResult ExecuteGrep(string searchPath, string pattern, string globPattern, CompiledGlobMatcher compiledGlob, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset, CancellationToken token)
         {
+			if (contextLines < 0 || contextLines > MaxGrepContextLines)
+				throw new ArgumentOutOfRangeException(nameof(contextLines), $"context must be between 0 and {MaxGrepContextLines}");
+			if (limit < 1 || limit > MaxGrepResultLimit)
+				throw new ArgumentOutOfRangeException(nameof(limit), $"limit must be between 1 and {MaxGrepResultLimit}");
             if (string.IsNullOrWhiteSpace(searchPath))
                 throw new ArgumentException("Search path must not be empty");
 
@@ -737,9 +1175,17 @@ namespace Pie
             bool isFile = File.Exists(searchPath);
             if (!isDirectory && !isFile)
                 throw new FileNotFoundException($"Path not found: {searchPath}");
+            searchPath = ValidateTraversalRoot(searchPath);
 
             var regex = BuildRegex(pattern, ignoreCase, literal);
-            var files = isDirectory ? CollectSearchFiles(searchPath, globPattern, token) : new List<string> { searchPath };
+			bool searchIncomplete = false;
+			string safetyLimit = null;
+			string collectionSafetyLimit = null;
+			var files = isDirectory
+				? CollectSearchFiles(searchPath, compiledGlob, token, out searchIncomplete, out collectionSafetyLimit)
+				: new List<string> { searchPath };
+			if (isDirectory)
+				safetyLimit = collectionSafetyLimit;
             files.Sort(StringComparer.OrdinalIgnoreCase);
             var mode = NormalizeGrepOutputMode(outputMode);
             var effectiveOffset = Math.Max(0, offset);
@@ -752,29 +1198,82 @@ namespace Pie
             bool matchLimitReached = false;
             bool linesTruncated = false;
             int filesScanned = 0;
+			long totalBytesScanned = 0;
 
             foreach (var filePath in files)
             {
                 token.ThrowIfCancellationRequested();
 
-                string content;
+				long fileBytes;
                 try
                 {
-                    content = File.ReadAllText(filePath);
+					fileBytes = new FileInfo(filePath).Length;
+					if (totalBytesScanned + fileBytes > MaxGrepTotalBytes)
+					{
+						searchIncomplete = true;
+						safetyLimit = "total_bytes";
+						break;
+					}
+					totalBytesScanned += fileBytes;
+					if (fileBytes > MaxGrepFileBytes)
+					{
+						if (!isDirectory)
+							throw new IOException($"grep_text is limited to {MaxGrepFileBytes} bytes per file");
+						searchIncomplete = true;
+						safetyLimit = "file_size";
+						continue;
+					}
                 }
                 catch
                 {
+					if (!isDirectory)
+						throw;
+					searchIncomplete = true;
+					safetyLimit = safetyLimit ?? "io_error";
                     continue;
                 }
 
+				var lines = new List<string>();
+				bool lineOverflow = false;
+				try
+				{
+					using (var reader = new StreamReader(filePath, Encoding.UTF8, true, 4096))
+					{
+						while (true)
+						{
+							token.ThrowIfCancellationRequested();
+							var line = reader.ReadLine();
+							if (line == null)
+								break;
+							if (lines.Count >= MaxGrepFileLines)
+							{
+								searchIncomplete = true;
+								safetyLimit = "file_size";
+								lineOverflow = true;
+								break;
+							}
+							lines.Add(line);
+						}
+					}
+				}
+				catch (OperationCanceledException) { throw; }
+				catch
+				{
+					if (!isDirectory) throw;
+					searchIncomplete = true;
+					safetyLimit = "io_error";
+					continue;
+				}
+				if (lineOverflow) continue;
                 filesScanned++;
-                var lines = content.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
+				var lineArray = lines.ToArray();
                 var relativePath = isDirectory ? MakeRelativePath(searchPath, filePath) : Path.GetFileName(filePath);
                 int fileMatchCount = 0;
 
-                for (int lineIdx = 0; lineIdx < lines.Length; lineIdx++)
+				for (int lineIdx = 0; lineIdx < lineArray.Length; lineIdx++)
                 {
-                    if (!regex.IsMatch(lines[lineIdx]))
+					token.ThrowIfCancellationRequested();
+                    if (!regex.IsMatch(lineArray[lineIdx]))
                         continue;
 
                     totalMatches++;
@@ -785,7 +1284,7 @@ namespace Pie
                         {
                             RelativePath = relativePath,
                             LineIndex = lineIdx,
-                            Lines = lines,
+							Lines = lineArray,
                         });
                     }
                 }
@@ -865,48 +1364,89 @@ namespace Pie
                 Glob = globPattern,
                 Literal = literal,
                 IgnoreCase = ignoreCase,
+				SearchIncomplete = searchIncomplete,
+				SafetyLimit = safetyLimit,
             };
         }
 
-        private static List<string> CollectSearchFiles(string rootPath, string globPattern, CancellationToken token)
+        private static List<string> CollectSearchFiles(string rootPath, CompiledGlobMatcher compiledGlob, CancellationToken token, out bool searchIncomplete, out string safetyLimit)
         {
+            rootPath = ValidateTraversalRoot(rootPath);
             var files = new List<string>();
             var queue = new Queue<string>();
             queue.Enqueue(rootPath);
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+			int scannedDirectories = 0;
+			searchIncomplete = false;
+			safetyLimit = null;
 
             while (queue.Count > 0)
             {
                 token.ThrowIfCancellationRequested();
-                var dir = queue.Dequeue();
-                string[] entries;
-                try
+                var dir = Path.GetFullPath(queue.Dequeue());
+                if (!IsWithinTraversalRoot(dir, rootPath) || IsReparsePoint(dir))
+                    throw new IOException($"Search directory escapes or crosses a reparse point: {dir}");
+                if (!visited.Add(dir))
+                    continue;
+                if (++scannedDirectories > MaxScannedDirectories)
                 {
-                    entries = Directory.GetFileSystemEntries(dir);
+					searchIncomplete = true;
+					safetyLimit = "directory_count";
+                    break;
+				}
+				string[] entries;
+				try
+				{
+					bool directoryOverflow;
+					entries = ReadDirectoryEntriesBounded(dir, MaxDirectoryEntries, out directoryOverflow, token);
+					if (directoryOverflow)
+					{
+						searchIncomplete = true;
+						safetyLimit = "directory_entries";
+					}
                 }
                 catch
                 {
+					searchIncomplete = true;
+					safetyLimit = "io_error";
                     continue;
                 }
 
                 foreach (var entryPath in entries)
                 {
                     token.ThrowIfCancellationRequested();
+					if (!IsWithinTraversalRoot(entryPath, rootPath) || IsReparsePoint(entryPath))
+					{
+						searchIncomplete = true;
+						safetyLimit = "io_error";
+						continue;
+					}
 
-                    bool isDirectory;
-                    try
-                    {
-                        isDirectory = Directory.Exists(entryPath);
-                    }
-                    catch
-                    {
-                        continue;
-                    }
+					bool isDirectory;
+					try
+					{
+						var attributes = File.GetAttributes(entryPath);
+						isDirectory = (attributes & FileAttributes.Directory) != 0;
+					}
+					catch
+					{
+						searchIncomplete = true;
+						safetyLimit = "io_error";
+						continue;
+					}
 
                     var entryName = Path.GetFileName(entryPath);
                     if (isDirectory)
                     {
                         if (!_skipDirSet.Contains(entryName))
-                            queue.Enqueue(entryPath);
+						{
+							if (scannedDirectories + queue.Count >= MaxScannedDirectories)
+							{
+								searchIncomplete = true;
+								safetyLimit = "directory_count";
+							}
+							else queue.Enqueue(entryPath);
+						}
                         continue;
                     }
 
@@ -917,10 +1457,18 @@ namespace Pie
                     if (_binaryExtensionSet.Contains(ext))
                         continue;
 
-                    if (!MatchesSimpleGlob(entryName, globPattern))
+					var relativePath = MakeRelativePath(rootPath, entryPath);
+					if (compiledGlob != null && !compiledGlob.IsMatch(relativePath, entryName))
                         continue;
 
-                    files.Add(entryPath);
+					files.Add(entryPath);
+					if (files.Count > MaxSearchFiles)
+					{
+						files.RemoveAt(files.Count - 1);
+						searchIncomplete = true;
+						safetyLimit = "file_count";
+						return files;
+					}
                 }
             }
 
@@ -951,55 +1499,96 @@ namespace Pie
             throw new ArgumentException("Invalid grep_text arguments: outputMode must be one of content, files_with_matches, or count.");
         }
 
-        private static bool MatchesSimpleGlob(string entryName, string globPattern)
+        private static bool MatchesFindPattern(string relativePath, string entryName, CompiledFindPattern pattern)
         {
-            if (string.IsNullOrWhiteSpace(globPattern))
-                return true;
-
-            if (globPattern.StartsWith("*.", StringComparison.Ordinal))
-                return string.Equals(Path.GetExtension(entryName), globPattern.Substring(1), StringComparison.OrdinalIgnoreCase);
-
-            if (globPattern.StartsWith("**/*.", StringComparison.Ordinal))
-                return string.Equals(Path.GetExtension(entryName), globPattern.Substring(4), StringComparison.OrdinalIgnoreCase);
-
-            return MatchesGlob(entryName, globPattern);
-        }
-
-        private static bool MatchesFindPattern(string relativePath, string entryName, string pattern)
-        {
-            var normalizedPattern = (pattern ?? string.Empty).Trim().Replace("\\", "/");
             var normalizedRelativePath = (relativePath ?? string.Empty).Replace("\\", "/");
-            if (normalizedPattern.StartsWith("./", StringComparison.Ordinal))
-                normalizedPattern = normalizedPattern.Substring(2);
+            if (pattern.GlobMatcher != null)
+                return pattern.GlobMatcher.IsMatch(normalizedRelativePath, entryName);
 
-            if (HasGlobChars(normalizedPattern))
-            {
-                if (normalizedPattern.IndexOf('/') < 0)
-                    return MatchesGlob(entryName, normalizedPattern);
-
-                if (normalizedPattern.StartsWith("**/", StringComparison.Ordinal) &&
-                    MatchesGlob(normalizedRelativePath, normalizedPattern.Substring(3)))
-                    return true;
-
-                return MatchesGlob(normalizedRelativePath, normalizedPattern);
-            }
-
-            return normalizedRelativePath.Equals(normalizedPattern, StringComparison.OrdinalIgnoreCase)
-                || normalizedRelativePath.EndsWith("/" + normalizedPattern, StringComparison.OrdinalIgnoreCase)
-                || entryName.Equals(normalizedPattern, StringComparison.OrdinalIgnoreCase)
-                || entryName.IndexOf(normalizedPattern, StringComparison.OrdinalIgnoreCase) >= 0
-                || normalizedRelativePath.IndexOf(normalizedPattern, StringComparison.OrdinalIgnoreCase) >= 0;
+            return normalizedRelativePath.Equals(pattern.NormalizedPattern, StringComparison.OrdinalIgnoreCase)
+                || normalizedRelativePath.EndsWith("/" + pattern.NormalizedPattern, StringComparison.OrdinalIgnoreCase)
+                || entryName.Equals(pattern.NormalizedPattern, StringComparison.OrdinalIgnoreCase)
+                || entryName.IndexOf(pattern.NormalizedPattern, StringComparison.OrdinalIgnoreCase) >= 0
+                || normalizedRelativePath.IndexOf(pattern.NormalizedPattern, StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static bool HasGlobChars(string pattern)
         {
-            return pattern.IndexOf('*') >= 0 || pattern.IndexOf('?') >= 0;
+            return pattern.IndexOf('*') >= 0
+                || pattern.IndexOf('?') >= 0
+                || pattern.IndexOf('[') >= 0
+                || pattern.IndexOf('{') >= 0;
         }
 
-        private static bool MatchesGlob(string input, string pattern)
+        private static CompiledFindPattern ValidateFindPattern(string pattern)
         {
-            var regex = GlobToRegex(pattern);
-            return regex.IsMatch(input);
+            if (string.IsNullOrWhiteSpace(pattern))
+                throw new ArgumentException("Pattern must not be empty");
+            var normalizedPattern = pattern.Trim().Replace("\\", "/");
+            if (normalizedPattern.Length > MaxGlobPatternLength)
+                throw new ArgumentException($"REGEX_INVALID_OR_TIMEOUT: glob pattern exceeds the {MaxGlobPatternLength} character safety limit");
+            if (normalizedPattern.StartsWith("./", StringComparison.Ordinal))
+                normalizedPattern = normalizedPattern.Substring(2);
+            var globMatcher = HasGlobChars(normalizedPattern)
+                ? CompileGlobMatcher(normalizedPattern)
+                : null;
+            return new CompiledFindPattern(normalizedPattern, globMatcher);
+        }
+
+        private static CompiledGlobMatcher ValidateOptionalGlobPattern(string pattern)
+        {
+            if (string.IsNullOrWhiteSpace(pattern))
+                return null;
+            var normalizedPattern = pattern.Replace("\\", "/");
+            if (normalizedPattern.Length > MaxGlobPatternLength)
+                throw new ArgumentException($"REGEX_INVALID_OR_TIMEOUT: glob pattern exceeds the {MaxGlobPatternLength} character safety limit");
+            return CompileGlobMatcher(normalizedPattern);
+        }
+
+        private static CompiledGlobMatcher CompileGlobMatcher(string normalizedPattern)
+        {
+            var patterns = CompileGlobRegexes(normalizedPattern);
+            var leadingDoubleStarPatterns = normalizedPattern.StartsWith("**/", StringComparison.Ordinal)
+                ? CompileGlobRegexes(normalizedPattern.Substring(3))
+                : null;
+            return new CompiledGlobMatcher(normalizedPattern, patterns, leadingDoubleStarPatterns);
+        }
+
+        private static Regex[] CompileGlobRegexes(string pattern)
+        {
+            return ExpandBracePatterns(pattern)
+                .Select(GlobToRegex)
+                .ToArray();
+        }
+
+        private static IEnumerable<string> ExpandBracePatterns(string pattern)
+        {
+            var pending = new Queue<string>();
+            var expanded = new List<string>();
+            pending.Enqueue(pattern ?? string.Empty);
+            while (pending.Count > 0)
+            {
+                var current = pending.Dequeue();
+                int open = current.IndexOf('{');
+                if (open < 0)
+                {
+                    expanded.Add(current);
+                    continue;
+                }
+                int close = current.IndexOf('}', open + 1);
+                if (close < 0)
+                    throw new ArgumentException("REGEX_INVALID_OR_TIMEOUT: unclosed glob brace");
+                var choices = current.Substring(open + 1, close - open - 1).Split(',');
+                if (choices.Length < 2)
+                    throw new ArgumentException("REGEX_INVALID_OR_TIMEOUT: glob braces require alternatives");
+                foreach (var choice in choices)
+                {
+                    if (expanded.Count + pending.Count >= MaxGlobBraceExpansions)
+                        throw new ArgumentException("REGEX_INVALID_OR_TIMEOUT: too many glob brace expansions");
+                    pending.Enqueue(current.Substring(0, open) + choice + current.Substring(close + 1));
+                }
+            }
+            return expanded;
         }
 
         private static Regex GlobToRegex(string pattern)
@@ -1007,6 +1596,8 @@ namespace Pie
             var normalizedPattern = (pattern ?? string.Empty).Replace("\\", "/");
             if (normalizedPattern.Length > MaxGlobPatternLength)
                 throw new ArgumentException("REGEX_INVALID_OR_TIMEOUT: glob pattern is too long");
+			if (Regex.IsMatch(normalizedPattern, @"(?:^|[^\\])[@+?!*]\("))
+				throw new ArgumentException("GLOB_UNSUPPORTED: grep_text does not support extglob; use brace alternatives such as *.{ts,js}");
 
             var sb = new System.Text.StringBuilder("^");
 
@@ -1041,6 +1632,31 @@ namespace Pie
                 if (c == '?')
                 {
                     sb.Append("[^/]");
+                    continue;
+                }
+
+                if (c == '[')
+                {
+                    int close = normalizedPattern.IndexOf(']', i + 1);
+                    if (close < 0)
+                        throw new ArgumentException("REGEX_INVALID_OR_TIMEOUT: unclosed glob character class");
+                    var content = normalizedPattern.Substring(i + 1, close - i - 1);
+                    if (content.Length == 0)
+                        throw new ArgumentException("REGEX_INVALID_OR_TIMEOUT: empty glob character class");
+                    bool negate = content[0] == '!' || content[0] == '^';
+                    if (negate) content = content.Substring(1);
+                    if (content.Length == 0)
+                        throw new ArgumentException("REGEX_INVALID_OR_TIMEOUT: empty glob character class");
+                    sb.Append("[");
+                    if (negate) sb.Append("^");
+                    foreach (char classChar in content)
+                    {
+                        if (classChar == '\\' || classChar == ']' || classChar == '^')
+                            sb.Append("\\");
+                        sb.Append(classChar);
+                    }
+                    sb.Append("]");
+                    i = close;
                     continue;
                 }
 

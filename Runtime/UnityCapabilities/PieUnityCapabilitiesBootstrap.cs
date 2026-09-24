@@ -44,6 +44,13 @@ namespace Pie
             public string contains = "";
         }
 
+        [Serializable]
+        private sealed class ScriptTaskPayload
+        {
+            public string taskId;
+            public string reason;
+        }
+
         public static void InitializeEditor()
         {
             var projectPath = GetProjectPath();
@@ -309,6 +316,11 @@ namespace Pie
                 new PieUnityParameterDescriptor[0],
                 _ => runner.BuildRuntimeRpcStateJson());
 
+            PieUnityCapabilityRegistry.RegisterRpc(
+                "runner.get_policy", "runtime", "Get the effective primary-agent permission policy.",
+                "runtime", true, false, null, new PieUnityParameterDescriptor[0],
+                _ => runner.GetRuntimePolicyJson());
+
             PieUnityCapabilityRegistry.RegisterTool(
                 "chat_send",
                 "chat",
@@ -437,10 +449,28 @@ namespace Pie
 
         private static void RegisterScriptCapabilities()
         {
+            PieUnityCapabilityRegistry.RegisterRpc(
+                "unity_script_start", "unity.script", "Start an async Unity script task and return its taskId immediately.",
+                "editor+runtime", false, false, null,
+                new[] { new PieUnityParameterDescriptor { name = "script", type = "string", required = true } },
+                StartUnityScriptRun);
+            PieUnityCapabilityRegistry.RegisterRpc(
+                "unity_script_status", "unity.script", "Get a script task status by taskId.",
+                "editor+runtime", true, false, null,
+                new[] { new PieUnityParameterDescriptor { name = "taskId", type = "string", required = true } },
+                argsJson => GetUnityScriptRunStatus(ReadScriptTaskPayload(argsJson).taskId));
+            PieUnityCapabilityRegistry.RegisterRpc(
+                "unity_script_cancel", "unity.script", "Cancel a running script task by taskId.",
+                "editor+runtime", false, false, null,
+                new[] { new PieUnityParameterDescriptor { name = "taskId", type = "string", required = true } },
+                argsJson => {
+                    var payload = ReadScriptTaskPayload(argsJson);
+                    return CancelUnityScriptRun(payload.taskId, payload.reason);
+                });
             PieUnityCapabilityRegistry.RegisterTool(
                 "unity_script_run",
                 "unity.script",
-                "Run a JavaScript or single-file TypeScript generator task inside the Unity script host. language defaults to javascript; TypeScript imports are not supported. The script must define export function* run(ctx, args) and yield for multi-frame work. Do not pass C#, shader source, or raw file contents to this tool. It returns only after completion, failure, cancellation, or timeout.",
+                "Run an async JavaScript task inside the Unity script host. Define export async function run(ctx, args), await host calls, and await ctx.nextFrame()/waitFrames()/waitSeconds() for multi-frame work. Synchronous code cannot be preempted. Do not pass C#, shader source, or raw file contents.",
                 "editor+runtime",
                 false,
                 false,
@@ -448,26 +478,22 @@ namespace Pie
                 new[]
                 {
                     new PieUnityParameterDescriptor { name = "script", type = "string", required = true },
-                    new PieUnityParameterDescriptor { name = "language", type = "string", required = false },
                     new PieUnityParameterDescriptor { name = "name", type = "string", required = false },
-                    new PieUnityParameterDescriptor { name = "entry", type = "string", required = false },
                     new PieUnityParameterDescriptor { name = "args", type = "object", required = false },
                     new PieUnityParameterDescriptor { name = "totalTimeoutMs", type = "number", required = false },
                     new PieUnityParameterDescriptor { name = "perStepTimeoutMs", type = "number", required = false },
                     new PieUnityParameterDescriptor { name = "maxFrames", type = "number", required = false },
                 },
                 InvokeScriptHostRunUnavailable,
-                capabilityKind: "script",
-                errorCodes: new[]
-                {
-                    "TYPESCRIPT_COMPILE_ERROR",
-                    "SCRIPT_ERROR",
-                    "STEP_TIMEOUT",
-                    "TOTAL_TIMEOUT",
-                    "MAX_FRAMES",
-                    "CANCELLED",
-                    "UNSUPPORTED_LANGUAGE",
-                });
+                capabilityKind: "script");
+        }
+
+        private static ScriptTaskPayload ReadScriptTaskPayload(string argsJson)
+        {
+            var payload = JsonUtility.FromJson<ScriptTaskPayload>(argsJson ?? "{}") ?? new ScriptTaskPayload();
+            if (string.IsNullOrWhiteSpace(payload.taskId))
+                throw new InvalidOperationException("taskId is required.");
+            return payload;
         }
 
         private static string ResumeSessionViaChat(string argsJson)

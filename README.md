@@ -141,13 +141,14 @@ PIE_UNITY_REAL_RPC=1 UNITY_EDITOR="/path/to/Unity" npm run verify:unity:reliabil
 The shipped runtime bridge is a tracked Unity `TextAsset` contract, not an ad-hoc local file.
 
 - Canonical runtime asset: `Resources/pie/core.bytes`
-- Required tracked generated artifacts: `core.bytes`, `core.bytes.meta`, `core.bytes.map`, `core.bytes.map.meta`
+- Required tracked generated artifacts: `core.bytes`, `core.bytes.meta`, `typescript-compiler.bytes`, `typescript-compiler.bytes.meta`
+- Source maps are not shipped or tracked in release artifacts
 - `core.js` is not a supported shipped runtime asset and must not appear in source or exported packages
 - Run `npm run build:unity` after changing `src/` or the Unity bundle build pipeline
 - Run `npm run check:unity-bundle-drift` to confirm the tracked generated bundle stays stable after rebuild
 - Run `npm run verify:unity:package-release` as the authoritative package release gate; it builds, checks bundle policy/drift, exports a standalone package, validates payload contents, and runs the clean-install dry-run verifier against the exported package
 
-`unity_script_run` is a cooperative step-bounded runner: use generator tasks, yield for multi-frame work, and expect long synchronous loops to fail with `STEP_TIMEOUT` instead of being arbitrarily preempted.
+`unity_script_run` is a cooperative step-bounded runner: define `export async function run(ctx, args)`, await frame boundaries and host calls, and expect long synchronous loops to fail with `STEP_TIMEOUT` after a guard check rather than being arbitrarily preempted.
 
 Runtime debugging is zero-registration by default. When a PlayMode/runtime host is alive, discoverability prefers the runtime owner, and `unity_script_run` exposes `ctx.runtime` for controlled same-`JsEnv` inspection and path-based calls such as `ctx.runtime.call("IJsEnvironment.Environment.ReloadAllMods", [])`. Prefer `ctx.runtime` over assuming raw globals like `VX`, `CS`, or `puer` are part of the public contract.
 
@@ -335,7 +336,7 @@ TypeScript extensions are compiled in memory before activation. Runtime imports
 such as `import lodash from "lodash"` are rejected; generate a single-file
 module or inline dependencies for now.
 
-On desktop, `pie-unity` reads models from `~/.pie/models.json`. In an Android Player it first checks `Application.persistentDataPath/.pie/models.json`, then falls back to the UserProfile path when that file is absent. The file must use top-level `profiles`, not `providers`, and each profile must explicitly declare:
+`pie-unity` now reads models only from `~/.pie/models.json`. The file must use top-level `profiles`, not `providers`, and each profile must explicitly declare:
 
 - `api`
 - `baseUrl`

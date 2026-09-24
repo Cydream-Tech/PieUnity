@@ -140,10 +140,13 @@ namespace Pie
             ApplySceneObjectPlacement(gameObject, payload, createdNew: true);
 
 #if UNITY_EDITOR
-            UnityEditor.Undo.RegisterCreatedObjectUndo(gameObject, "Create " + gameObject.name);
-            UnityEditor.Selection.activeGameObject = gameObject;
-            UnityEditor.EditorGUIUtility.PingObject(gameObject);
-            UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(gameObject.scene);
+            if (!UnityEditor.EditorApplication.isPlaying)
+            {
+                UnityEditor.Undo.RegisterCreatedObjectUndo(gameObject, "Create " + gameObject.name);
+                UnityEditor.Selection.activeGameObject = gameObject;
+                UnityEditor.EditorGUIUtility.PingObject(gameObject);
+                UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(gameObject.scene);
+            }
 #endif
 
             var targetRef = ToRef(gameObject);
@@ -171,7 +174,10 @@ namespace Pie
                 if (parent == null)
                 {
                     if (createdNew)
-                        UnityEngine.Object.DestroyImmediate(gameObject);
+                    {
+                        if (Application.isPlaying) UnityEngine.Object.Destroy(gameObject);
+                        else UnityEngine.Object.DestroyImmediate(gameObject);
+                    }
                     throw new InvalidOperationException("Parent object not found.");
                 }
 
@@ -183,7 +189,7 @@ namespace Pie
             gameObject.transform.position = new Vector3(payload.x, payload.y, payload.z);
 
 #if UNITY_EDITOR
-            if (!createdNew)
+            if (!createdNew && !UnityEditor.EditorApplication.isPlaying)
             {
                 UnityEditor.Selection.activeGameObject = gameObject;
                 UnityEditor.EditorGUIUtility.PingObject(gameObject);
@@ -223,7 +229,8 @@ namespace Pie
             var gameObject = ResolveApplyTarget(payload, requireExplicitTarget: true);
             var targetRef = ToRef(gameObject);
 #if UNITY_EDITOR
-            UnityEditor.Undo.DestroyObjectImmediate(gameObject);
+            if (UnityEditor.EditorApplication.isPlaying) UnityEngine.Object.Destroy(gameObject);
+            else UnityEditor.Undo.DestroyObjectImmediate(gameObject);
 #else
             UnityEngine.Object.Destroy(gameObject);
 #endif
@@ -353,8 +360,12 @@ namespace Pie
             if (component == null)
                 throw new InvalidOperationException("Component not found on " + gameObject.name + ": " + componentType.FullName);
 #if UNITY_EDITOR
-            UnityEngine.Object.DestroyImmediate(component);
-            MarkSceneObjectChanged(gameObject);
+            if (UnityEditor.EditorApplication.isPlaying) UnityEngine.Object.Destroy(component);
+            else
+            {
+                UnityEngine.Object.DestroyImmediate(component);
+                MarkSceneObjectChanged(gameObject);
+            }
 #else
             UnityEngine.Object.Destroy(component);
 #endif
@@ -798,7 +809,7 @@ namespace Pie
 
         private static void MarkComponentChanged(Component component)
         {
-            if (component == null)
+            if (component == null || UnityEditor.EditorApplication.isPlaying)
                 return;
             UnityEditor.EditorUtility.SetDirty(component);
             UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(component.gameObject.scene);
