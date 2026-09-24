@@ -49,6 +49,7 @@ namespace Pie
 }
 
 // <pie-unity-merged-runtime>
+#if !PIE_UNITY_SPLIT_SOURCES
 // Unity 6000 can keep stale import state for local package scripts after malformed meta files.
 // Keep these runtime definitions in an already-imported script so the package compiles deterministically.
 
@@ -1772,7 +1773,7 @@ namespace Pie
     // Merged from Runtime/UnityCapabilities/PieUnityCapabilitiesConstants.cs
     public static class PieUnityCapabilitiesConstants
         {
-            public const string Version = "0.1.31";
+            public const string Version = "0.1.32";
             public const string ManifestSchemaVersion = "2";
             public const string SkillProtocolVersion = "pie-unity-rpc/2";
             public const int DefaultPort = 8091;
@@ -4245,16 +4246,23 @@ namespace Pie
 
             private static bool IsProcessAlive(int pid)
             {
+#if ENABLE_IL2CPP && !UNITY_EDITOR
+                // IL2CPP's GetExitCodeProcess can trap in native code (not a catchable
+                // exception). IsExpired already checks the registry heartbeat lease.
+                return pid > 0;
+#else
                 try
                 {
-                    var process = System.Diagnostics.Process.GetProcessById(pid);
-                    return process != null && !process.HasExited;
+                    using (var process = System.Diagnostics.Process.GetProcessById(pid))
+                        return process != null && !process.HasExited;
                 }
                 catch
                 {
                     return false;
                 }
+#endif
             }
         }
 }
+#endif
 // </pie-unity-merged-runtime>

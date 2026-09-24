@@ -17,6 +17,22 @@ namespace Pie.Editor
             }
 
             if (string.IsNullOrEmpty(resultText)) return "Done.";
+            if (toolName == "unity_script_run")
+            {
+                var summary = ExtractJsonString(detailsJson ?? "", "summary")
+                    ?? ExtractJsonString(resultText, "summary");
+                if (string.IsNullOrWhiteSpace(summary))
+                {
+                    // Agent-facing results may be TOON rather than JSON.
+                    foreach (var line in resultText.Split('\n'))
+                    {
+                        if (!line.StartsWith("summary:", StringComparison.Ordinal)) continue;
+                        summary = line.Substring("summary:".Length).Trim().Trim('"');
+                        break;
+                    }
+                }
+                return string.IsNullOrWhiteSpace(summary) ? "Script completed." : summary;
+            }
             if (toolName == "manage_todo_list")
             {
                 if (resultText.Contains("Todo action failed", StringComparison.Ordinal)) return resultText.Trim();

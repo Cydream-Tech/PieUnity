@@ -58,6 +58,35 @@ Dev RPC no longer exposes duplicate project-file, target/result, skill, or edito
 
 `unity_scene_object_edit` is a scene object edit patch tool, including common component lifecycle/property patches such as add/remove/enable/set public field or property. Reads belong to `unity_scene_query` / `unity_scene_object_inspect`; logs belong to `unity_log_read`; short multi-frame Unity composition belongs to `unity_script_run`.
 
+Script waits and `ctx.frame` advance once per Unity frame in Play Mode, and once
+per host update outside Play Mode. `maxFrames` includes time spent waiting in
+`waitFrames` and `waitSeconds`; it is not a count of completed waits. Cancellation
+stops subsequent script edits but preserves changes already applied. Use explicit
+`ctx.rollback()` to remove objects created by the task; it is not a general undo
+for changes to pre-existing objects.
+
+## Editor chat formatting
+
+Pie Chat renders user messages and assistant replies with headings, paragraphs, bold/italic text,
+inline code, fenced code blocks, lists/task lists, quotes, dividers, and simple
+pipe tables. Links show their label and URL; images/HTML and full CommonMark
+nesting are not supported. Unclosed code fences remain readable while streaming.
+
+Tool results and thinking are collapsed by default. Expand a tool to inspect its
+arguments and full result. Message Copy preserves the original Markdown; code
+blocks have their own Copy button. Text wraps to the panel width and uses measured
+font layout, including Chinese text. This presentation layer is Editor-only and
+does not alter model output or persisted session content.
+
+Editor session sync restores tool arguments and details directly from the full
+session messages, independently of the runtime timeline's 50-turn/500-item limit.
+Search tools use the same effective-argument normalization during live execution
+and history restoration; the sync payload also retains the original arguments.
+
+For repeatable real-Unity script coverage, see the repository's
+[Three Sparks fixture](../../scripts/fixtures/pie-unity-script-game/README.md).
+It covers Editor, Play Mode, and a standalone macOS IL2CPP Development Player.
+
 ## Host Responsibility
 
 `ARCHITECTURE.md` is the shared architecture source of truth for Pie.
@@ -293,6 +322,11 @@ public class Demo : MonoBehaviour
 Runtime voice input is exposed as a static Begin/End API. It does not require
 adding a voice component to the scene:
 
+For macOS Player builds, set **Player Settings > Other Settings > Microphone Usage
+Description** to your application's explanation of microphone use. Pie preserves
+its runtime assembly for PuerTS/IL2CPP, which also retains the voice API; Unity
+requires this description even when the build's scene does not start a recording.
+
 ```csharp
 Pie.PieVoice.RequestMicrophonePermission(granted =>
 {
@@ -346,6 +380,15 @@ module or inline dependencies for now.
 If no valid profile is configured, Unity starts in an unconfigured model state and asks you to configure `~/.pie/models.json` before sending messages.
 
 Android runtime discovery and Pie logs are also stored below `Application.persistentDataPath`; Android's `UserProfile` location is not assumed to be writable. For Player builds, the package's Editor linker processor explicitly supplies `Runtime/link.xml` to UnityLinker, preserving the PuerTS-visible bridge surface that embedded JavaScript calls through `CS.Pie.*` on IL2CPP.
+
+PuerTS 2.2.2 enables its IL2CPP optimization on desktop and Android by default.
+Before an IL2CPP build, generate the project's PuerTS IL2CPP glue through
+**Tools > PuerTS > Generate il2cpp > Reflection Mode** (or Static Wrapper Mode).
+For a project using the regular reflection bridge, add
+`PUERTS_DISABLE_IL2CPP_OPTIMIZATION` to the target's Scripting Define Symbols
+instead. Without either configuration, native linking fails with missing symbols
+such as `InitialPuerts`; Pie's linker preservation does not generate this glue.
+See the [PuerTS IL2CPP setup](https://github.com/Tencent/puerts/blob/master/doc/unity/zhcn/performance/il2cpp.md).
 
 ## Paths
 

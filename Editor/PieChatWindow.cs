@@ -1177,77 +1177,69 @@ namespace Pie.Editor
 
         private void DrawMessage(ChatMessage msg)
         {
-            Color roleColor;
-            string roleLabel;
-            GUIStyle boxStyle = "box";
-            GUIStyle contentStyle = new GUIStyle(msg.IsCompact ? EditorStyles.wordWrappedMiniLabel : EditorStyles.wordWrappedLabel)
+            var isTool = msg.Role == "tool" || msg.Role == "toolResult";
+            var isThinking = msg.Role == "thinking";
+            var dark = EditorGUIUtility.isProSkin;
+            var width = Mathf.Max(80f, position.width - 64f);
+            var card = new GUIStyle(EditorStyles.helpBox)
             {
-                wordWrap = true
+                padding = new RectOffset(12, 12, 10, 10),
+                margin = new RectOffset(2, 2, 3, 3)
             };
-            GUIStyle toolTitleStyle = new GUIStyle(EditorStyles.miniBoldLabel)
-            {
-                wordWrap = true,
-                clipping = TextClipping.Overflow
-            };
-            switch (msg.Role)
-            {
-                case "user":      roleColor = new Color(0.3f, 0.6f, 1f);  roleLabel = "YOU";    break;
-                case "assistant": roleColor = new Color(0.2f, 0.8f, 0.3f); roleLabel = "PIE";   break;
-                case "thinking":  roleColor = new Color(0.65f, 0.7f, 0.9f); roleLabel = "THINK"; break;
-                case "tool":      roleColor = new Color(0.9f, 0.7f, 0.2f); roleLabel = "TOOL";  break;
-                default:          roleColor = Color.gray;                   roleLabel = "SYS";   break;
-            }
-
-            var previousColor = GUI.color;
-            if (msg.Role == "assistant")
-                GUI.color = new Color(0.19f, 0.22f, 0.19f);
-            else if (msg.Role == "user")
-                GUI.color = new Color(0.18f, 0.2f, 0.24f);
-            else if (msg.Role == "thinking")
-                GUI.color = new Color(0.16f, 0.18f, 0.24f);
-            else if (msg.Role == "tool")
-                GUI.color = msg.IsError
-                    ? new Color(0.28f, 0.19f, 0.19f)
-                    : msg.IsRunning
-                        ? new Color(0.27f, 0.24f, 0.18f)
-                        : new Color(0.21f, 0.21f, 0.18f);
-            else
-                GUI.color = new Color(0.22f, 0.22f, 0.22f);
-
-            EditorGUILayout.BeginVertical(boxStyle);
-            GUI.color = previousColor;
-
+            EditorGUILayout.BeginVertical(card);
             EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField(roleLabel, new GUIStyle(EditorStyles.miniLabel)
+            var roleStyle = new GUIStyle(EditorStyles.miniBoldLabel);
+            roleStyle.normal.textColor = msg.Role == "user"
+                ? (dark ? new Color(.55f, .72f, .96f) : new Color(.18f, .36f, .62f))
+                : (dark ? new Color(.59f, .77f, .65f) : new Color(.2f, .43f, .29f));
+            if (isTool || isThinking)
             {
-                fontStyle = FontStyle.Bold,
-                normal = { textColor = roleColor }
-            });
+                var title = isThinking ? "Thinking" : !string.IsNullOrEmpty(msg.Title) ? msg.Title
+                    : !string.IsNullOrEmpty(msg.ToolName) ? msg.ToolName : "Tool result";
+                msg.IsExpanded = EditorGUILayout.Foldout(msg.IsExpanded, title, true, EditorStyles.foldout);
+            }
+            else GUILayout.Label(msg.Role == "assistant" ? "PIE" : msg.Role == "user" ? "YOU" : "SYSTEM", roleStyle);
             GUILayout.FlexibleSpace();
-            if (msg.Role == "user" && msg.InputTokens > 0)
-                GUILayout.Label($"~↑{FormatTokenCount(msg.InputTokens)} tok", EditorStyles.miniLabel, GUILayout.Width(84));
-            if (msg.Role == "assistant" && msg.TotalTokens > 0)
-                GUILayout.Label($"{(msg.IsEstimatedUsage ? "~" : "")}{msg.TotalTokens} tok", EditorStyles.miniLabel, GUILayout.Width(72));
-            if (GUILayout.Button("Copy", EditorStyles.miniButton, GUILayout.Width(42)))
+            if (isTool)
+            {
+                var stateStyle = new GUIStyle(EditorStyles.miniLabel);
+                stateStyle.normal.textColor = msg.IsError ? new Color(.85f, .35f, .3f) : msg.IsRunning
+                    ? (dark ? new Color(.9f, .72f, .4f) : new Color(.55f, .38f, .12f)) : roleStyle.normal.textColor;
+                GUILayout.Label(msg.IsError ? "Failed" : msg.IsRunning ? "Running…" : "Done", stateStyle);
+            }
+            else if (msg.Role == "assistant" && msg.TotalTokens > 0)
+                GUILayout.Label($"{(msg.IsEstimatedUsage ? "~" : "")}{FormatTokenCount(msg.TotalTokens)} tok", EditorStyles.miniLabel);
+            if (GUILayout.Button("Copy", EditorStyles.miniButton, GUILayout.Width(44)))
                 EditorGUIUtility.systemCopyBuffer = msg.Content ?? "";
             EditorGUILayout.EndHorizontal();
 
-            if (msg.Role == "tool" && !string.IsNullOrEmpty(msg.Title))
+            if (isTool)
             {
-                DrawToolHeader(msg, toolTitleStyle);
-                if (!string.IsNullOrEmpty(msg.ArgsSummary))
-                    DrawSelectableText(msg.ArgsSummary, EditorStyles.wordWrappedMiniLabel);
-                if (!string.IsNullOrEmpty(msg.Summary))
-                    DrawSelectableText(msg.Summary, EditorStyles.wordWrappedMiniLabel);
+                if (!string.IsNullOrWhiteSpace(msg.Summary))
+                {
+                    GUILayout.Space(4);
+                    var summary = msg.Summary.Replace("\r", " ").Replace("\n", " ");
+                    if (summary.Length > 180) summary = summary.Substring(0, 177) + "…";
+                    DrawSelectableText(summary, EditorStyles.wordWrappedMiniLabel);
+                }
                 if (msg.IsExpanded)
-                    DrawSelectableText(msg.Content, contentStyle);
+                {
+                    GUILayout.Space(8);
+                    if (!string.IsNullOrEmpty(msg.ArgsText))
+                        PieChatMarkdown.DrawCode(msg.ArgsText, "Arguments", width);
+                    PieChatMarkdown.DrawCode(msg.Content ?? "", "Result", width);
+                }
             }
-            else
+            else if (!isThinking || msg.IsExpanded)
             {
-                DrawSelectableText(msg.Content, contentStyle);
+                GUILayout.Space(8);
+                if (msg.Role == "assistant" || msg.Role == "user" || isThinking)
+                    msg.Markdown.Draw(msg.Content ?? "", width);
+                else
+                    DrawSelectableText(msg.Content, new GUIStyle(EditorStyles.wordWrappedLabel) { fontSize = 13 });
             }
             EditorGUILayout.EndVertical();
-            GUILayout.Space(msg.IsCompact ? 2 : 4);
+            GUILayout.Space(isTool || isThinking ? 2 : 6);
         }
 
         private void DrawInput()
@@ -1921,12 +1913,31 @@ namespace Pie.Editor
                     {
                         var role = string.IsNullOrEmpty(message.role) ? "assistant" : message.role;
                         var content = FlattenSessionContent(message);
+                        var isToolResult = role == "toolResult";
+                        var argsJson = HasMeaningfulArgs(message.effectiveArgsJson)
+                            ? message.effectiveArgsJson : message.argsJson;
+                        if (isToolResult) role = "tool";
+                        if (role == "user" && !string.IsNullOrEmpty(message.displayContent))
+                            content = message.displayContent;
+                        if (role == "assistant" && string.IsNullOrEmpty(content) && message.stopReason == "toolUse")
+                            continue;
                         if (string.IsNullOrEmpty(content) && !string.IsNullOrEmpty(message.errorMessage))
                             content = $"⚠ {message.errorMessage}";
                         if (string.IsNullOrEmpty(content) && !string.IsNullOrEmpty(message.stopReason))
                             content = $"[{message.stopReason}]";
                         _messages.Add(new ChatMessage(role, content ?? "")
                         {
+                            Title = isToolResult ? message.toolName : "",
+                            ToolName = message.toolName,
+                            ToolCallId = message.toolCallId,
+                            ArgsText = argsJson ?? "",
+                            ArgsSummary = BuildArgsSummary(argsJson ?? ""),
+                            Summary = isToolResult
+                                ? (message.isError
+                                    ? SummarizeToolFailure(message.toolName, content)
+                                    : SummarizeToolResult(message.toolName, content, message.detailsJson ?? ""))
+                                : "",
+                            IsError = message.isError,
                             InputTokens = message.usage != null ? message.usage.input : (role == "user" ? EstimateTextTokens(content) : 0),
                             OutputTokens = message.usage != null ? message.usage.output : 0,
                             CacheReadTokens = message.usage != null ? message.usage.cacheRead : 0,
@@ -2575,46 +2586,8 @@ namespace Pie.Editor
 
         private float EstimateSelectableTextHeight(string text, GUIStyle style, float width)
         {
-            var safeText = text ?? "";
-            var availableWidth = Mathf.Max(80f, width - 8f);
-            var approxCharWidth = Mathf.Max(5.5f, (style.fontSize > 0 ? style.fontSize : 12) * 0.55f);
-            var charsPerLine = Mathf.Max(1, Mathf.FloorToInt(availableWidth / approxCharWidth));
-            var lineCount = 0;
-
-            var logicalLines = safeText.Replace("\r\n", "\n").Split('\n');
-            foreach (var logicalLine in logicalLines)
-            {
-                var length = string.IsNullOrEmpty(logicalLine) ? 1 : logicalLine.Length;
-                lineCount += Mathf.Max(1, Mathf.CeilToInt((float)length / charsPerLine));
-            }
-
-            var lineHeight = Mathf.Max(16f, style.lineHeight > 0f ? style.lineHeight : EditorGUIUtility.singleLineHeight);
-            return Mathf.Max(lineHeight + 6f, lineCount * lineHeight + 6f);
-        }
-
-        private void DrawToolHeader(ChatMessage msg, GUIStyle titleStyle)
-        {
-            var indicator = msg.IsExpanded ? "▼" : "▶";
-            var stateText = msg.IsError ? "error" : (msg.IsRunning ? "running" : "done");
-            var stateColor = msg.IsError
-                ? new Color(0.95f, 0.45f, 0.45f)
-                : msg.IsRunning
-                    ? new Color(0.95f, 0.8f, 0.35f)
-                    : new Color(0.6f, 0.85f, 0.55f);
-
-            EditorGUILayout.BeginHorizontal();
-            if (GUILayout.Button(indicator, EditorStyles.label, GUILayout.Width(18)))
-                msg.IsExpanded = !msg.IsExpanded;
-
-            var width = Mathf.Max(120f, position.width - 150f);
-            var titleHeight = EstimateSelectableTextHeight(msg.Title ?? "", titleStyle, width);
-            EditorGUILayout.SelectableLabel(msg.Title ?? "", titleStyle, GUILayout.MinHeight(titleHeight), GUILayout.ExpandWidth(true));
-
-            var previousColor = GUI.color;
-            GUI.color = stateColor;
-            GUILayout.Label(stateText, EditorStyles.miniBoldLabel, GUILayout.Width(54));
-            GUI.color = previousColor;
-            EditorGUILayout.EndHorizontal();
+            return Mathf.Max(EditorGUIUtility.singleLineHeight,
+                style.CalcHeight(new GUIContent(text ?? ""), Mathf.Max(40f, width)));
         }
 
         private void ScrollToBottomSoon()
@@ -2938,6 +2911,7 @@ namespace Pie.Editor
             public bool IsRunning;
             public bool IsError;
             public bool IsExpanded;
+            public readonly PieChatMarkdown Markdown = new PieChatMarkdown();
             public ChatMessage(string role, string content) { Role = role; Content = content; }
         }
 
@@ -2996,6 +2970,7 @@ namespace Pie.Editor
             public string title;
             public int messageCount;
             public SessionSyncMessage[] messages;
+            public PieTimelineItem[] timelineItems;
             public TodoStateItem[] todoState;
         }
 
@@ -3022,6 +2997,13 @@ namespace Pie.Editor
         private class SessionSyncMessage
         {
             public string role;
+            public string displayContent;
+            public string toolName;
+            public string toolCallId;
+            public string argsJson;
+            public string effectiveArgsJson;
+            public string detailsJson;
+            public bool isError;
             public string errorMessage;
             public string stopReason;
             public SessionSyncUsage usage;

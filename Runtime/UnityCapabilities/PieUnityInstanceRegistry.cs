@@ -382,15 +382,21 @@ namespace Pie
 
         private static bool IsProcessAlive(int pid)
         {
+#if ENABLE_IL2CPP && !UNITY_EDITOR
+            // IL2CPP's GetExitCodeProcess can trap in native code (not a catchable
+            // exception). IsExpired already checks the registry heartbeat lease.
+            return pid > 0;
+#else
             try
             {
-                var process = System.Diagnostics.Process.GetProcessById(pid);
-                return process != null && !process.HasExited;
+                using (var process = System.Diagnostics.Process.GetProcessById(pid))
+                    return process != null && !process.HasExited;
             }
             catch
             {
                 return false;
             }
+#endif
         }
     }
 }
