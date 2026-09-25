@@ -4713,9 +4713,10 @@ var _PieAgent = (() => {
     async request(url, options = {}) {
       const requestStartTime = Date.now();
       const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const reqTag = options.label ? `${requestId}/${options.label}` : requestId;
       const requestTimeoutMs = options.timeoutMs ?? 6e4;
       let requestTimeoutError;
-      logHttp("DEBUG", `Request [${requestId}] started`, {
+      logHttp("DEBUG", `Request [${reqTag}] started`, {
         url: url.slice(0, 100),
         method: options.method || "GET",
         hasBody: !!options.body
@@ -4753,7 +4754,7 @@ var _PieAgent = (() => {
               agentStats.httpReusedConnections++;
             }
           }
-          logHttp("DEBUG", `Request [${requestId}] connected`, {
+          logHttp("DEBUG", `Request [${reqTag}] connected`, {
             status: res.statusCode,
             connectTimeMs: connectTime,
             connectionReused: wasReused,
@@ -4776,14 +4777,14 @@ var _PieAgent = (() => {
                 res.on("data", (chunk) => chunks.push(chunk));
                 res.on("end", () => {
                   const body = Buffer.concat(chunks).toString("utf-8");
-                  logHttp("DEBUG", `Request [${requestId}] body received`, {
+                  logHttp("DEBUG", `Request [${reqTag}] body received`, {
                     bodyLength: body.length,
                     totalTimeMs: Date.now() - requestStartTime
                   });
                   resolveText(body);
                 });
                 res.on("error", (err) => {
-                  logHttp("ERROR", `Request [${requestId}] body read error`, { error: err.message });
+                  logHttp("ERROR", `Request [${reqTag}] body read error`, { error: err.message });
                   rejectText(err);
                 });
               });
@@ -4793,7 +4794,7 @@ var _PieAgent = (() => {
               try {
                 return JSON.parse(text);
               } catch (err) {
-                logHttp("ERROR", `Request [${requestId}] JSON parse error`, {
+                logHttp("ERROR", `Request [${reqTag}] JSON parse error`, {
                   error: err.message,
                   textPreview: text.slice(0, 200)
                 });
@@ -4826,7 +4827,15 @@ var _PieAgent = (() => {
                 error = e;
                 done = true;
                 wake({ done: true, value: void 0 });
-                logHttp("ERROR", `Request [${requestId}] SSE stream error`, { error: e.message });
+                if (signal?.aborted === true || isAbortErrorMessage(e.message)) {
+                  logHttp("INFO", `Request [${reqTag}] SSE stream aborted by caller`, { error: e.message });
+                } else if (requestTimeoutError) {
+                  logHttp("WARN", `Request [${reqTag}] SSE stream failed (request timeout)`, { error: e.message });
+                } else if (e.message === "SSE stream aborted" || e.message === "SSE stream closed before end" || e.message === "SSE stream ended before response completed") {
+                  logHttp("WARN", `Request [${reqTag}] SSE stream closed by remote`, { error: e.message });
+                } else {
+                  logHttp("ERROR", `Request [${reqTag}] SSE stream error`, { error: e.message });
+                }
               };
               const flushBuffer = (final = false) => {
                 if (final) {
@@ -4878,7 +4887,7 @@ var _PieAgent = (() => {
                 }
                 done = true;
                 wake({ done: true, value: void 0 });
-                logHttp("DEBUG", `Request [${requestId}] SSE stream ended`, {
+                logHttp("DEBUG", `Request [${reqTag}] SSE stream ended`, {
                   totalBytes,
                   lineCount,
                   durationMs: Date.now() - sseStartTime
@@ -4929,13 +4938,13 @@ var _PieAgent = (() => {
         });
         req.on("error", (e) => {
           if (isAbortErrorMessage(e.message) && options.signal?.aborted) {
-            logHttp("DEBUG", `Request [${requestId}] aborted`, {
+            logHttp("DEBUG", `Request [${reqTag}] aborted`, {
               totalTimeMs: Date.now() - requestStartTime
             });
             reject(e);
             return;
           }
-          logHttp("ERROR", `Request [${requestId}] failed`, {
+          logHttp("ERROR", `Request [${reqTag}] failed`, {
             error: e.message,
             totalTimeMs: Date.now() - requestStartTime
           });
@@ -4943,13 +4952,13 @@ var _PieAgent = (() => {
         });
         req.on("timeout", () => {
           requestTimeoutError = new Error("Request timeout");
-          logHttp("ERROR", `Request [${requestId}] timeout`);
+          logHttp("ERROR", `Request [${reqTag}] timeout`);
           req.destroy(requestTimeoutError);
         });
         req.setTimeout(requestTimeoutMs);
         if (options.signal) {
           options.signal.addEventListener("abort", () => {
-            logHttp("DEBUG", `Request [${requestId}] aborted`);
+            logHttp("DEBUG", `Request [${reqTag}] aborted`);
             req.destroy(new Error("Request was aborted"));
           }, { once: true });
         }
@@ -6199,7 +6208,9 @@ var _PieAgent = (() => {
           headers,
           body: JSON.stringify(params),
           signal: options?.signal,
-          timeoutMs: options?.timeoutMs ?? getOpenAICompatStreamTimeoutMs()
+          timeoutMs: options?.timeoutMs ?? getOpenAICompatStreamTimeoutMs(),
+          // Log attribution only (never sent over the wire).
+          label: `${model.provider}/${model.id}`
         });
         if (!response.ok) {
           const errorBody = await response.text().catch(() => "");
@@ -6469,11 +6480,24 @@ var _PieAgent = (() => {
           throw createProtocolError(`OpenAI-compatible stream ended with finish_reason=${rawFinishReason} but did not include any tool calls.`);
         }
         if (output.stopReason === "length" && toolCallEntries.length > 0) {
-          const hasTruncatedArgs = toolCallEntries.some(
+          const truncatedEntries = toolCallEntries.filter(
             ({ partialArgs }) => tryParseFinalToolArguments(partialArgs) === null
           );
-          if (hasTruncatedArgs) {
-            throw new Error("OpenAI-compatible stream ended with finish_reason=length before tool call arguments were complete. Increase maxTokens or reduce prompt size.");
+          if (truncatedEntries.length > 0) {
+            const truncatedBlocks = new Set(truncatedEntries.map((entry) => entry.block));
+            for (let i2 = toolCallEntries.length - 1; i2 >= 0; i2--) {
+              if (truncatedBlocks.has(toolCallEntries[i2].block)) {
+                toolCallEntries.splice(i2, 1);
+              }
+            }
+            output.content = output.content.filter(
+              (block) => block.type !== "toolCall" || !truncatedBlocks.has(block)
+            );
+            const dropped = truncatedEntries.map((entry) => entry.block.name || "unnamed").sort().map((name) => `"${name}"`).join(", ");
+            output.content.push({
+              type: "text",
+              text: `[output truncated: finish_reason=length cut ${truncatedEntries.length === 1 ? "a tool call" : `${truncatedEntries.length} tool calls`} mid-arguments (${dropped}); the call${truncatedEntries.length === 1 ? " was" : "s were"} dropped. Re-issue the call or continue with fewer/smaller requests.]`
+            });
           }
         }
         for (const { block, partialArgs, contentIndex } of toolCallEntries) {
