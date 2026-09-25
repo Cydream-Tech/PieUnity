@@ -21,9 +21,12 @@ namespace Pie.Editor
     /// Delivery is authored per skill via SKILL.md frontmatter:
     ///   pie-delivery: all | player-only | editor-only   (default: all)
     ///
-    /// Editor-only skills are excluded from the bake entirely; the manifest
-    /// ships All + PlayerOnly entries, and PieSkillManifest.ToJsonForMode
-    /// filters per mode at load time.
+    /// EditorOnly entries are KEPT in the baked asset so a later
+    /// EditorOnly layer can override an earlier layer's All entry (same name
+    /// resolution as the filesystem loader); PieSkillManifest.ToJsonForMode
+    /// filters them out for player consumption and PlayerOnly for editor
+    /// consumption at load time. Identical name collisions across layers
+    /// resolve later-layer-wins, matching the editor's filesystem scan.
     /// </summary>
     public static class PieSkillManifestBaker
     {
@@ -42,9 +45,10 @@ namespace Pie.Editor
 
         public static int PreprocessBuild()
         {
-            // A bake failure must never abort a player build: the manifest is
-            // an additive payload (missing manifest = no bundled skills), so
-            // log loudly and let the build continue.
+            // A bake failure must never abort a player build. If a manifest
+            // from an earlier successful bake exists it is kept and will ship
+            // (possibly stale); with none, the build simply carries no bundled
+            // skills. Either way, warn loudly so the drift is visible.
             try
             {
                 var (entries, summary) = Bake();
@@ -52,7 +56,8 @@ namespace Pie.Editor
             }
             catch (Exception ex)
             {
-                Debug.LogWarning($"[Pie] Skill manifest bake failed (build continues without bundled skills): {ex.Message}\n{ex.StackTrace}");
+                Debug.LogWarning($"[Pie] Skill manifest bake failed; any previously baked manifest will ship as-is (possibly stale). " +
+                    $"Re-run Tools/Pie/Bake Skill Manifest (Player) after fixing. Cause: {ex.Message}\n{ex.StackTrace}");
             }
             PieSkillManifest.ClearCache();
             return 0;
@@ -64,6 +69,7 @@ namespace Pie.Editor
             var paths = PieProjectPaths.GetSkillSearchPaths(projectRoot);
             var entries = new List<PieSkillManifestEntry>();
             var byName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var failedLayers = 0;
 
             // paths are ordered lowest-priority first (the JS filesystem loader
             // registers them in this order and later registrations win on name
@@ -74,7 +80,25 @@ namespace Pie.Editor
             foreach (var skillsDir in paths)
             {
                 if (string.IsNullOrWhiteSpace(skillsDir) || !Directory.Exists(skillsDir)) continue;
-                CollectFromDirectory(skillsDir, entries, byName);
+                try
+                {
+                    CollectFromDirectory(skillsDir, entries, byName);
+                }
+                catch (Exception ex)
+                {
+                    // One unreadable layer must not kill the whole bake: other
+                    // layers still contribute their skills.
+                    failedLayers++;
+                    Debug.LogWarning($"[Pie] Skill manifest: skipping unreadable skills directory '{skillsDir}': {ex.Message}");
+                }
+            }
+
+            if (failedLayers > 0 && entries.Count == 0)
+            {
+                // Every layer failed and nothing was collected: writing now
+                // would replace the previous manifest with an empty one. Fail
+                // the bake instead so any existing (stale) manifest ships.
+                throw new InvalidOperationException($"all {failedLayers} skill layer(s) were unreadable; refusing to overwrite the manifest with an empty one");
             }
 
             WriteManifestAsset(entries);
@@ -100,7 +124,11 @@ namespace Pie.Editor
             if (string.IsNullOrWhiteSpace(name)) return;
             string content;
             try { content = File.ReadAllText(skillMdPath) ?? ""; }
-            catch { return; }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Pie] Skill manifest: skipping unreadable skill '{skillMdPath}': {ex.Message}");
+                return;
+            }
 
             var delivery = ParseDelivery(content);
             // EditorOnly entries are kept (not skipped here) so a later
@@ -185,11 +213,34 @@ namespace Pie.Editor
                 manifest = ScriptableObject.CreateInstance<PieSkillManifest>();
                 AssetDatabase.CreateAsset(manifest, ManifestAssetPath);
             }
+            else if (EntriesEqual(manifest.entries, entries))
+            {
+                // Nothing changed: skip SetDirty/Save so rebakes are no-ops
+                // for version control (no asset churn).
+                return;
+            }
 
             manifest.entries = entries.ToArray();
             EditorUtility.SetDirty(manifest);
             AssetDatabase.SaveAssets();
             AssetDatabase.Refresh();
+        }
+
+        private static bool EntriesEqual(PieSkillManifestEntry[] current, List<PieSkillManifestEntry> next)
+        {
+            if (current == null) return next.Count == 0;
+            if (current.Length != next.Count) return false;
+            for (var i = 0; i < current.Length; i++)
+            {
+                var a = current[i];
+                var b = next[i];
+                if (a == null || b == null) return a == b;
+                if (!string.Equals(a.name, b.name, StringComparison.Ordinal)) return false;
+                if (!string.Equals(a.description, b.description, StringComparison.Ordinal)) return false;
+                if (!string.Equals(a.content, b.content, StringComparison.Ordinal)) return false;
+                if (a.delivery != b.delivery) return false;
+            }
+            return true;
         }
 
         private sealed class PlayerBuildProcessor : IPreprocessBuildWithReport

@@ -61,8 +61,8 @@ namespace Pie
                 foreach (var entry in _confirmations)
                 {
                     entry.Value.timer?.Dispose();
-                    if (entry.Value.response == null)
-                        entry.Value.response = new PieInteractionResponse { type = "confirm", id = entry.Key, confirmed = false, skipped = true };
+                    // Abort also revokes an approval that JS has not consumed yet.
+                    entry.Value.response = new PieInteractionResponse { type = "confirm", id = entry.Key, confirmed = false, skipped = true };
                 }
             }
         }

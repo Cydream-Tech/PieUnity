@@ -16347,6 +16347,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
     const lines = [
       "\n\nThe following skills provide specialized instructions for specific tasks.",
       "Use read_file to load a skill's entry file when the task matches its description.",
+      "Skills that include an inline <content> block are already fully loaded; no read_file is needed for them.",
       "When a skill file references a relative path, resolve it against that skill's baseDir and use the resulting ordinary path with file or bash tools.",
       "Skills are ordinary files in the current runtime filesystem; do not use special skill/resource tool protocols.",
       "",
@@ -16356,7 +16357,13 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       lines.push("  <skill>");
       lines.push(`    <name>${escapeXml(skill.name)}</name>`);
       lines.push(`    <description>${escapeXml(skill.description)}</description>`);
-      if (skill.filePath) {
+      if (skill.inlineContent !== void 0) {
+        lines.push("    <content>");
+        for (const contentLine of skill.inlineContent.replace(/\r\n/g, "\n").split("\n")) {
+          lines.push(`      ${escapeXml(contentLine)}`);
+        }
+        lines.push("    </content>");
+      } else if (skill.filePath) {
         lines.push(`    <entry>${escapeXml(skill.filePath)}</entry>`);
       }
       if (skill.baseDir) {
@@ -37345,14 +37352,22 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       content: skill.prompt,
       filePath: skill.filePath ? normalizePath2(skill.filePath) : void 0,
       path: skill.filePath ? normalizePath2(skill.filePath) : void 0,
-      baseDir: skill.baseDir ? normalizePath2(skill.baseDir) : void 0
+      baseDir: skill.baseDir ? normalizePath2(skill.baseDir) : void 0,
+      // Player-build bundled skills have no file for read_file; their body
+      // must be inlined so the model can actually use them.
+      inlineContent: skill.filePath ? void 0 : skill.prompt
     };
   }
   function getAvailableSkills(projectRoot2) {
     return createUnitySkillLoader(projectRoot2).getAllSkills().map(toLoadedSkill);
   }
   function formatSkillsForPrompt2(skills) {
-    return formatSkillSummariesForPrompt(skills);
+    return formatSkillSummariesForPrompt(
+      skills.map((skill) => ({
+        ...skill,
+        inlineContent: skill.inlineContent ?? (skill.filePath ? void 0 : skill.content)
+      }))
+    );
   }
 
   // src/tools/project-agents-file.ts

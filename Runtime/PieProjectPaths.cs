@@ -86,7 +86,12 @@ namespace Pie
                 using var stream = new FileStream(gitPath, FileMode.Open, FileAccess.Read, FileShare.Read);
                 using var reader = new StreamReader(stream);
                 var firstLine = reader.ReadLine();
-                return firstLine != null && firstLine.TrimStart().StartsWith("gitdir:", StringComparison.Ordinal);
+                if (firstLine == null) return false;
+                var trimmed = firstLine.TrimStart();
+                if (!trimmed.StartsWith("gitdir:", StringComparison.Ordinal)) return false;
+                // A bare "gitdir:" with no path is not a usable worktree pointer.
+                var gitdir = trimmed.Substring("gitdir:".Length).Trim();
+                return gitdir.Length > 0;
             }
             catch
             {
