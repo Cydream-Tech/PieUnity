@@ -37218,6 +37218,41 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   }
 
   // src/skills.ts
+  function getBundledSkillEntries() {
+    const bridge2 = globalThis.pieBridge;
+    let raw;
+    try {
+      raw = bridge2?.getBundledSkillsJson?.();
+    } catch {
+      return [];
+    }
+    if (typeof raw !== "string" || raw.trim().length === 0) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((entry) => typeof entry === "object" && entry !== null && typeof entry.name === "string" && entry.name.length > 0);
+    } catch {
+      return [];
+    }
+  }
+  function mergeBundledSkills(loader, bundled) {
+    const existing = new Set(loader.getAllSkills().map((skill) => skill.name));
+    let added = 0;
+    for (const entry of bundled) {
+      if (!entry.name || existing.has(entry.name)) continue;
+      loader.registerSkill({
+        name: entry.name,
+        displayName: entry.name,
+        description: typeof entry.description === "string" ? entry.description : "",
+        prompt: typeof entry.content === "string" ? entry.content : "",
+        source: "bundled",
+        baseDir: ""
+      });
+      existing.add(entry.name);
+      added += 1;
+    }
+    return added;
+  }
   var hasLoggedEmptySkillScan = false;
   function normalizePath2(path3) {
     return String(path3 ?? "").replace(/\\/g, "/");
@@ -37299,13 +37334,14 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     if (loader.getAllSkills().length === 0) {
       logEmptySkillScan(projectRoot2, skillDirs);
     }
+    mergeBundledSkills(loader, getBundledSkillEntries());
     return loader;
   }
   function toLoadedSkill(skill) {
     return {
       name: skill.name,
       description: skill.description,
-      source: "project",
+      source: skill.source === "bundled" ? "bundled" : "project",
       content: skill.prompt,
       filePath: skill.filePath ? normalizePath2(skill.filePath) : void 0,
       path: skill.filePath ? normalizePath2(skill.filePath) : void 0,
@@ -37323,17 +37359,37 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   function getProjectAgentsPath(projectRoot2) {
     return CS.System.IO.Path.Combine(projectRoot2, "AGENTS.md");
   }
+  function getProjectAgentsPaths(projectRoot2) {
+    const bridge2 = globalThis.pieBridge;
+    const raw = bridge2?.getProjectAgentsPathsJson?.();
+    if (typeof raw === "string" && raw.trim().length > 0) {
+      try {
+        const parsed = JSON.parse(raw);
+        const layers = Array.isArray(parsed) ? parsed.map((entry) => String(entry ?? "")).filter((entry) => entry.length > 0) : [];
+        if (layers.length > 0) return layers;
+      } catch {
+      }
+    }
+    return [getProjectAgentsPath(projectRoot2)];
+  }
+  function readProjectAgentsLayers(projectRoot2) {
+    const layers = [];
+    for (const path3 of getProjectAgentsPaths(projectRoot2)) {
+      if (!CS.System.IO.File.Exists(path3)) continue;
+      const content = String(CS.System.IO.File.ReadAllText(path3) ?? "");
+      if (content.trim().length > 0) layers.push({ path: path3, content });
+    }
+    return layers;
+  }
+  function readProjectAgentsFile(projectRoot2) {
+    return readProjectAgentsLayers(projectRoot2).map((layer) => layer.content.trim()).filter((content) => content.length > 0).join("\n\n");
+  }
   function ensureProjectAgentsDir(projectRoot2) {
     const agentsPath = getProjectAgentsPath(projectRoot2);
     const dir = CS.System.IO.Path.GetDirectoryName(agentsPath);
     if (dir && !CS.System.IO.Directory.Exists(dir)) {
       CS.System.IO.Directory.CreateDirectory(dir);
     }
-  }
-  function readProjectAgentsFile(projectRoot2) {
-    const agentsPath = getProjectAgentsPath(projectRoot2);
-    if (!CS.System.IO.File.Exists(agentsPath)) return "";
-    return CS.System.IO.File.ReadAllText(agentsPath);
   }
   function writeProjectAgentsFile(projectRoot2, content) {
     ensureProjectAgentsDir(projectRoot2);
@@ -37518,10 +37574,12 @@ ${rootObjectLines}
   }
   function buildUnitySystemPrompt(params) {
     const skillsSection = formatSkillsForPrompt2(getAvailableSkills(params.root));
-    const knowledgeSection = buildProjectContextSection([{
-      path: toDisplayPath(params.root, getProjectAgentsPath(params.root)),
-      content: readProjectAgentsFile(params.root)
-    }]);
+    const knowledgeSection = buildProjectContextSection(
+      readProjectAgentsLayers(params.root).map((layer) => ({
+        path: toDisplayPath(params.root, layer.path),
+        content: layer.content
+      }))
+    );
     const extensionSection = getSystemPromptPatches();
     const fileToolPromptLines = buildFileToolPromptLines();
     const toolsSection = buildToolsPromptSection(params.tools);

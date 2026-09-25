@@ -44,6 +44,66 @@ namespace Pie
         private const string DefaultAgentsSkillRelativePath = ".agents/skills";
         private const string RuntimeStateFolderName = "Pie";
 
+        /// <summary>
+        /// Walk up from <paramref name="startDir"" looking for a git boundary
+        /// (.git directory, or a .git file for worktrees/submodules), mirroring
+        /// the CLI's resolveCliProjectRoot. Returns the start directory when no
+        /// boundary is found. Editor-only by intent: player builds have no repo.
+        /// </summary>
+        public static string FindRepoRoot(string startDir)
+        {
+            var current = string.IsNullOrEmpty(startDir) ? null : NormalizePath(startDir);
+            var fallback = current;
+            while (!string.IsNullOrEmpty(current))
+            {
+                var gitPath = Path.Combine(current, ".git");
+                if (Directory.Exists(gitPath)) return current;
+                if (File.Exists(gitPath) && IsWorktreePointer(gitPath)) return current;
+                try
+                {
+                    var parent = Directory.GetParent(current);
+                    current = parent == null ? null : NormalizePath(parent.FullName);
+                }
+                catch
+                {
+                    return fallback;
+                }
+            }
+            return fallback;
+        }
+
+        /// <summary>
+        /// A ".git" file is a worktree/submodule pointer whose first content
+        /// line starts with "gitdir:". Any other .git file (e.g. a stray
+        /// dotfile in the user's home that happens to be named .git) must NOT
+        /// be treated as a repository boundary — honoring it would wrongly
+        /// extend skill/AGENTS.md discovery to unrelated directories.
+        /// </summary>
+        private static bool IsWorktreePointer(string gitPath)
+        {
+            try
+            {
+                using var stream = new FileStream(gitPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                using var reader = new StreamReader(stream);
+                var firstLine = reader.ReadLine();
+                return firstLine != null && firstLine.TrimStart().StartsWith("gitdir:", StringComparison.Ordinal);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>Git repo root for skill/AGENTS.md discovery; equals projectRoot outside repos.</summary>
+        public static string GetRepoRoot(string projectRoot)
+        {
+#if UNITY_EDITOR
+            return FindRepoRoot(projectRoot);
+#else
+            return projectRoot;
+#endif
+        }
+
         public static string GetExtensionSearchPathsJson(string projectRoot)
         {
             return BuildJsonArray(GetExtensionSearchPaths(projectRoot));
@@ -128,7 +188,46 @@ namespace Pie
             var agentsSkills = ResolveProjectPath(projectRoot, DefaultAgentsSkillRelativePath);
             if (!string.IsNullOrEmpty(agentsSkills) && resolved.FindIndex(p => string.Equals(p, agentsSkills, StringComparison.OrdinalIgnoreCase)) < 0)
                 resolved.Insert(0, agentsSkills);
+#if UNITY_EDITOR
+            // Monorepo layer: when the Unity project sits inside a git repo whose
+            // root is above the project, repo-level .agents/skills joins the
+            // discovery set at the LOWEST priority (project layers override it),
+            // matching the CLI's ancestor-.agents ordering. projectRoot itself
+            // stays the Unity project dir, so file-tool roots and /init targets
+            // are unchanged.
+            var repoRoot = FindRepoRoot(projectRoot);
+            if (!string.IsNullOrEmpty(repoRoot) && !string.Equals(repoRoot, projectRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                var repoAgentsSkills = NormalizePath(Path.Combine(repoRoot, DefaultAgentsSkillRelativePath));
+                if (resolved.FindIndex(p => string.Equals(p, repoAgentsSkills, StringComparison.OrdinalIgnoreCase)) < 0)
+                    resolved.Insert(0, repoAgentsSkills);
+            }
+#endif
             return resolved;
+        }
+
+        /// <summary>
+        /// AGENTS.md layers for the system prompt, far to near: repo root first
+        /// (router/progressive-disclosure root, matching CLI discovery), then the
+        /// Unity project layer. Existence is checked by the JS reader.
+        /// </summary>
+        public static IReadOnlyList<string> GetProjectAgentsPaths(string projectRoot)
+        {
+            var layers = new List<string>();
+            var repoRoot = GetRepoRoot(projectRoot);
+            var repoAgents = NormalizePath(Path.Combine(repoRoot ?? "", DefaultAgentsFileRelativePath));
+            if (!string.IsNullOrEmpty(repoRoot) && !string.Equals(repoRoot, projectRoot, StringComparison.OrdinalIgnoreCase)
+                && !layers.Exists(p => string.Equals(p, repoAgents, StringComparison.OrdinalIgnoreCase)))
+                layers.Add(repoAgents);
+            var projectAgents = NormalizePath(Path.Combine(projectRoot ?? "", DefaultAgentsFileRelativePath));
+            if (!layers.Exists(p => string.Equals(p, projectAgents, StringComparison.OrdinalIgnoreCase)))
+                layers.Add(projectAgents);
+            return layers;
+        }
+
+        public static string GetProjectAgentsPathsJson(string projectRoot)
+        {
+            return BuildJsonArray(GetProjectAgentsPaths(projectRoot));
         }
 
         private static string GetPrimaryPath(string projectRoot, IReadOnlyList<string> resolvedPaths, string fallbackRelativePath)

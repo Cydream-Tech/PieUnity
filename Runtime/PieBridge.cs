@@ -25,6 +25,13 @@ namespace Pie
         private bool _isInitialized = false;
         private bool _isDisposed = false;
         private string _lastError = null;
+        // Snapshot of the inject-time project root and settings so the JS
+        // bridge getters can recompute search paths / file-tool roots live
+        // (settings edits and play-mode transitions must not require a bridge
+        // re-initialization to take effect). Static: pieBridge getters run
+        // during Initialize, before the Instance singleton is assigned.
+        private static string _injectedProjectRoot = null;
+        private static PieSettings _injectedSettings = null;
         private bool _isUnityScriptHostReady = false;
         private bool _isRuntimeHostBridgeReady = false;
         private bool _isRuntimeBridgeReady = false;
@@ -438,6 +445,11 @@ namespace Pie
             if (string.IsNullOrEmpty(projectRoot))
                 projectRoot = Application.persistentDataPath.Replace("\\", "/");
 #endif
+            // Snapshot AFTER the default-derivation above: callers may pass a
+            // null projectRoot (PieRunner without an override), and the live
+            // getters must see the resolved root, not the null they were handed.
+            _injectedProjectRoot = projectRoot;
+            _injectedSettings = settings;
             if (!Directory.Exists(projectRoot))
                 Directory.CreateDirectory(projectRoot);
 
@@ -463,6 +475,18 @@ namespace Pie
             return globalThis.pieBridge.projectRoot;
         }},
 
+        getRepoRoot: function() {{
+            return CS.Pie.PieProjectPaths.GetRepoRoot(globalThis.pieBridge.projectRoot);
+        }},
+
+        getProjectAgentsPathsJson: function() {{
+            return CS.Pie.PieProjectPaths.GetProjectAgentsPathsJson(globalThis.pieBridge.projectRoot);
+        }},
+
+        getBundledSkillsJson: function() {{
+            return CS.Pie.PieBridge.GetLiveBundledSkillsJson();
+        }},
+
         getProjectAgentsPath: function() {{
             return CS.Pie.PieProjectPaths.GetProjectAgentsPath(globalThis.pieBridge.projectRoot);
         }},
@@ -480,15 +504,15 @@ namespace Pie
         }},
 
         getExtensionSearchPathsJson: function() {{
-            return globalThis.pieBridge.extensionSearchPathsJson;
+            return CS.Pie.PieBridge.GetLiveExtensionSearchPathsJson();
         }},
 
         getSkillSearchPathsJson: function() {{
-            return globalThis.pieBridge.skillSearchPathsJson;
+            return CS.Pie.PieBridge.GetLiveSkillSearchPathsJson();
         }},
 
         getFileToolRootsJson: function() {{
-            return globalThis.pieBridge.fileToolRootsJson;
+            return CS.Pie.PieBridge.GetLiveFileToolRootsJson();
         }},
 
         sendToUnity: function(eventName, data) {{
@@ -531,6 +555,63 @@ namespace Pie
 
             var ok = _jsEnv.Eval<bool>(initCode);
             if (!ok) throw new Exception("pieBridge injection returned false");
+        }
+
+        /// <summary>
+        /// Live recompute of the JS bridge payloads (skill/extension search
+        /// paths, file-tool roots) so PieSettings edits and editor play-mode
+        /// transitions take effect on the next read instead of requiring a
+        /// bridge re-initialization. The inject-time JSON snapshot properties
+        /// on pieBridge remain for debugging/compatibility.
+        /// </summary>
+        private static bool ComputeIsEditorForFileTools()
+        {
+#if UNITY_EDITOR
+            return !UnityEngine.Application.isPlaying;
+#else
+            return false;
+#endif
+        }
+
+        public static string GetLiveExtensionSearchPathsJson()
+        {
+            if (_injectedProjectRoot == null) return WarnUninitializedLivePayload("extension search paths");
+            return PieProjectPaths.GetExtensionSearchPathsJson(_injectedProjectRoot, _injectedSettings);
+        }
+
+        public static string GetLiveSkillSearchPathsJson()
+        {
+            if (_injectedProjectRoot == null) return WarnUninitializedLivePayload("skill search paths");
+            return PieProjectPaths.GetSkillSearchPathsJson(_injectedProjectRoot, _injectedSettings);
+        }
+
+        public static string GetLiveFileToolRootsJson()
+        {
+            if (_injectedProjectRoot == null) return WarnUninitializedLivePayload("file-tool roots");
+            return PieProjectPaths.GetFileToolRootsJson(_injectedProjectRoot, _injectedSettings, ComputeIsEditorForFileTools());
+        }
+
+        /// <summary>
+        /// Live payloads require InjectPieBridge to have run in this domain
+        /// (with domain-reload disabled a fresh domain may read before any
+        /// inject). Returning "[]" with a warning is safer than feeding the
+        /// path resolvers an empty project root, which would resolve against
+        /// the process working directory.
+        /// </summary>
+        private static string WarnUninitializedLivePayload(string what)
+        {
+            Debug.LogWarning($"[Pie] Live {what} requested before PieBridge injection; returning empty set.");
+            return "[]";
+        }
+
+        public static string GetLiveBundledSkillsJson()
+        {
+#if UNITY_EDITOR
+            var isEditor = !UnityEngine.Application.isPlaying;
+#else
+            var isEditor = false;
+#endif
+            return PieSkillManifest.ToJsonForMode(isEditor);
         }
 
         private bool VerifyPieObject()
