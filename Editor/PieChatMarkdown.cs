@@ -229,8 +229,20 @@ namespace Pie.Editor
             GUILayout.Space(4);
             if (_codeFont == null)
             {
-                _codeFont = Font.CreateDynamicFontFromOSFont(new[] { "Menlo", "Consolas", "Liberation Mono", "Courier New" }, 12);
-                _codeFont.hideFlags = HideFlags.HideAndDontSave;
+                // CreateDynamicFontFromOSFont returns null when none of the OS
+                // fonts are available instead of throwing; probe candidates
+                // one by one and fall back to the built-in font so code blocks
+                // never take the chat window down with a NullReferenceException.
+                foreach (var fontName in new[] { "Menlo", "Consolas", "Liberation Mono", "Courier New", "Monospace" })
+                {
+                    var candidate = Font.CreateDynamicFontFromOSFont(fontName, 12);
+                    if (candidate == null) continue;
+                    _codeFont = candidate;
+                    _codeFont.hideFlags = HideFlags.HideAndDontSave;
+                    break;
+                }
+                if (_codeFont == null)
+                    _codeFont = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
             }
             var codeStyle = new GUIStyle(EditorStyles.wordWrappedLabel) { font = _codeFont, fontSize = 12, richText = false, wordWrap = true };
             DrawText(text, codeStyle, width - 24);

@@ -41,6 +41,7 @@ namespace Pie
         private const string DefaultExtensionRelativePath = "Assets/Pie/Extensions";
         private const string DefaultSkillRelativePath = "Assets/Pie/Skills";
         private const string DefaultAgentsFileRelativePath = "AGENTS.md";
+        private const string DefaultAgentsSkillRelativePath = ".agents/skills";
         private const string RuntimeStateFolderName = "Pie";
 
         public static string GetExtensionSearchPathsJson(string projectRoot)
@@ -76,7 +77,10 @@ namespace Pie
 
         public static string GetPrimarySkillDirectory(string projectRoot)
         {
-            return GetPrimaryPath(projectRoot, GetSkillSearchPaths(projectRoot), DefaultSkillRelativePath);
+            // Creation target for new skills: configured paths or the Pie default
+            // only — the cross-tool .agents/skills layer is a read/discovery path
+            // and must not capture newly authored skills.
+            return GetPrimaryPath(projectRoot, ResolvePaths(projectRoot, LoadConfiguredPaths(settings => settings.SkillSearchPaths, null), DefaultSkillRelativePath), DefaultSkillRelativePath);
         }
 
         public static string GetProjectAgentsPath(string projectRoot)
@@ -116,7 +120,15 @@ namespace Pie
 
         public static IReadOnlyList<string> GetSkillSearchPaths(string projectRoot, PieSettings settingsOverride)
         {
-            return ResolvePaths(projectRoot, LoadConfiguredPaths(settings => settings.SkillSearchPaths, settingsOverride), DefaultSkillRelativePath);
+            var resolved = ResolvePaths(projectRoot, LoadConfiguredPaths(settings => settings.SkillSearchPaths, settingsOverride), DefaultSkillRelativePath);
+            // Cross-tool standard layer (".agents/skills"), lower priority than
+            // the Pie defaults: the JS loader registers paths in order and later
+            // registrations win on name collisions, matching the CLI ordering
+            // (builtin < ~/.agents < ~/.pie < ancestor .agents < ./.pie).
+            var agentsSkills = ResolveProjectPath(projectRoot, DefaultAgentsSkillRelativePath);
+            if (!string.IsNullOrEmpty(agentsSkills) && resolved.FindIndex(p => string.Equals(p, agentsSkills, StringComparison.OrdinalIgnoreCase)) < 0)
+                resolved.Insert(0, agentsSkills);
+            return resolved;
         }
 
         private static string GetPrimaryPath(string projectRoot, IReadOnlyList<string> resolvedPaths, string fallbackRelativePath)

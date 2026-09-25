@@ -75,14 +75,6 @@ namespace Pie
         }
 
         [Serializable]
-        private sealed class ScreenshotPayload
-        {
-            public string path = "";
-            public int width = 1280;
-            public int height = 720;
-        }
-
-        [Serializable]
         private sealed class AssetRef
         {
             public string path = "";
@@ -366,24 +358,6 @@ namespace Pie
                 _ => SetPlayModeJson(false),
                 capabilityKind: "host",
                 writeScope: "editor");
-
-            PieUnityCapabilityRegistry.RegisterTool(
-                "unity_screenshot",
-                "unity.editor",
-                "Capture a Unity screenshot to a project-relative or absolute path.",
-                "editor",
-                false,
-                false,
-                null,
-                new[]
-                {
-                    new PieUnityParameterDescriptor { name = "path", type = "string", required = true },
-                    new PieUnityParameterDescriptor { name = "width", type = "integer", required = false },
-                    new PieUnityParameterDescriptor { name = "height", type = "integer", required = false },
-                },
-                ScreenshotJson,
-                capabilityKind: "host",
-                writeScope: "filesystem");
 #endif
         }
 
@@ -598,22 +572,6 @@ namespace Pie
 #endif
         }
 
-        public static string ScreenshotJson(string argsJson)
-        {
-#if UNITY_EDITOR
-            var payload = JsonUtility.FromJson<ScreenshotPayload>(argsJson ?? "{}") ?? new ScreenshotPayload();
-            if (string.IsNullOrWhiteSpace(payload.path))
-                throw new InvalidOperationException("path is required.");
-            var output = payload.path;
-            if (!Path.IsPathRooted(output))
-                output = Path.Combine(Directory.GetParent(Application.dataPath).FullName, output);
-            Directory.CreateDirectory(Path.GetDirectoryName(output));
-            ScreenCapture.CaptureScreenshot(output, 1);
-            return JsonUtility.ToJson(new AuthoringResult { summary = "Screenshot requested at " + output + ".", path = output, phase = "screenshot" });
-#else
-            throw new InvalidOperationException("unity_screenshot is only available in the Unity Editor.");
-#endif
-        }
 
 #if UNITY_EDITOR
         private static void ApplyComponentAction(GameObject root, string action, string componentType, string propertyPath, string value, string objectPath, string objectComponentType, string listAction, int listIndex)

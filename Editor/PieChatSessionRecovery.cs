@@ -16,6 +16,7 @@ namespace Pie.Editor
         public const string BaseUrlKey = Prefix + "BaseUrl";
         public const string SavedAtKey = Prefix + "SavedAtTicksUtc";
         public const string LastKnownActiveSessionKey = Prefix + "LastKnownActiveSession";
+        public const string AutoResendSessionKey = Prefix + "AutoResendSessionId";
         public const double RestoreDelaySeconds = 0.5d;
 
         [Serializable]
@@ -97,6 +98,16 @@ namespace Pie.Editor
                 baseUrl = SessionState.GetString(BaseUrlKey, ""),
                 savedAtTicksUtc = savedAtTicksUtc,
             };
+        }
+
+        public static string GetAutoResendSessionId()
+        {
+            return SessionState.GetString(AutoResendSessionKey, "");
+        }
+
+        public static void SetAutoResendSessionId(string sessionId)
+        {
+            SessionState.SetString(AutoResendSessionKey, sessionId ?? "");
         }
 
         public static void Clear()

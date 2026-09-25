@@ -33,6 +33,7 @@ namespace Pie
         public string argsJson = "";
         public string resultText = "";
         public string detailsJson = "";
+        public string imagePath = "";
         public bool isError;
         public bool isTruncated;
     }

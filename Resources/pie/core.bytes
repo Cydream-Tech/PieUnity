@@ -3815,9 +3815,9 @@ var _PieAgent = (() => {
       if (length === 0) return new Uint8Array();
       const handle = await getNodeFs().promises.open(path3, "r");
       try {
-        const buffer = Buffer.allocUnsafe(length);
-        const { bytesRead } = await handle.read(buffer, 0, length, 0);
-        return new Uint8Array(buffer.subarray(0, bytesRead));
+        const view = new Uint8Array(length);
+        const { bytesRead } = await handle.read(view, 0, length, 0);
+        return view.subarray(0, bytesRead);
       } finally {
         await handle.close();
       }
@@ -4282,7 +4282,10 @@ var _PieAgent = (() => {
       while (offset2 < length) {
         const requested = Math.min(length - offset2, 65536);
         if (offset2 > 0 && typeof bridge2.ReadRangeHex !== "function") {
-          throw new Error("The Unity file bridge cannot read prefixes beyond 64 KiB. Update PieFileBridge with ReadRangeHex.");
+          console.warn(
+            `[pie] readFilePrefix truncated at 64 KiB: the Unity file bridge is missing ReadRangeHex. Update the Pie package so PieFileBridge matches the runtime bundle. (requested ${length} bytes of '${path3}')`
+          );
+          break;
         }
         const hex = String((offset2 === 0 ? bridge2.ReadPrefixHex(normalizedPath, requested) : bridge2.ReadRangeHex(normalizedPath, offset2, requested)) ?? "");
         if (hex.length % 2 !== 0) throw new Error("The Unity file bridge returned an invalid hex prefix.");
@@ -5692,6 +5695,8 @@ var _PieAgent = (() => {
       requiresAssistantAfterToolResult: false,
       requiresThinkingAsText: true,
       supportsStrictMode: true,
+      streamRequiresDone: true,
+      streamRequiresFinishReason: true,
       cacheCapability: NO_CACHE_CAPABILITY
     };
   }
@@ -5709,6 +5714,8 @@ var _PieAgent = (() => {
       requiresAssistantAfterToolResult: model.compat.requiresAssistantAfterToolResult ?? detected.requiresAssistantAfterToolResult,
       requiresThinkingAsText: model.compat.requiresThinkingAsText ?? detected.requiresThinkingAsText,
       supportsStrictMode: model.compat.supportsStrictMode ?? detected.supportsStrictMode,
+      streamRequiresDone: model.compat.streamRequiresDone ?? detected.streamRequiresDone,
+      streamRequiresFinishReason: model.compat.streamRequiresFinishReason ?? detected.streamRequiresFinishReason,
       cacheCapability: model.compat.cacheCapability ?? detected.cacheCapability
     };
   }
@@ -6142,6 +6149,16 @@ var _PieAgent = (() => {
     }
     return parsed;
   }
+  function tryParseFinalToolArguments(partialArgs) {
+    const text = partialArgs.trim();
+    if (!text) return null;
+    try {
+      const parsed = JSON.parse(text);
+      return isRecord(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
   var streamOpenAICompletions = (model, context, options) => {
     const stream = new AssistantMessageEventStream();
     (async () => {
@@ -6259,6 +6276,14 @@ var _PieAgent = (() => {
           if (id) {
             let entry = toolCallsById.get(id);
             if (!entry) {
+              const unpaired = toolCallEntries.filter((candidate) => !candidate.block.id);
+              if (unpaired.length === 1) {
+                rememberToolCallId(id, unpaired[0]);
+                return unpaired[0];
+              }
+              if (unpaired.length > 1) {
+                throw createProtocolError(`OpenAI-compatible stream returned tool call id "${id}" without an index while multiple unnamed calls are in flight; the call cannot be disambiguated.`);
+              }
               entry = createToolCallEntry(toolCall);
               rememberToolCallId(id, entry);
             }
@@ -6434,17 +6459,22 @@ var _PieAgent = (() => {
           }
         }
         finishCurrentBlock(currentBlock);
-        if (!sawDone) {
-          throw createProtocolError(`OpenAI-compatible stream ended without data: [DONE]${rawFinishReason ? ` (last finish_reason=${rawFinishReason})` : ""}.`);
+        if (compat.streamRequiresDone && !sawDone) {
+          throw createProtocolError(`OpenAI-compatible stream ended without data: [DONE]${rawFinishReason ? ` (last finish_reason=${rawFinishReason})` : ""}. Set compat.streamRequiresDone=false for gateways that legitimately omit the terminator.`);
         }
-        if (!sawFinishReason) {
-          throw createProtocolError("OpenAI-compatible stream ended without finish_reason.");
+        if (compat.streamRequiresFinishReason && !sawFinishReason) {
+          throw createProtocolError("OpenAI-compatible stream ended without finish_reason. Set compat.streamRequiresFinishReason=false for endpoints that omit it.");
         }
         if (output.stopReason === "toolUse" && toolCallEntries.length === 0) {
           throw createProtocolError(`OpenAI-compatible stream ended with finish_reason=${rawFinishReason} but did not include any tool calls.`);
         }
         if (output.stopReason === "length" && toolCallEntries.length > 0) {
-          throw new Error("OpenAI-compatible stream ended with finish_reason=length before tool calls could be safely executed.");
+          const hasTruncatedArgs = toolCallEntries.some(
+            ({ partialArgs }) => tryParseFinalToolArguments(partialArgs) === null
+          );
+          if (hasTruncatedArgs) {
+            throw new Error("OpenAI-compatible stream ended with finish_reason=length before tool call arguments were complete. Increase maxTokens or reduce prompt size.");
+          }
         }
         for (const { block, partialArgs, contentIndex } of toolCallEntries) {
           if (!block.name.trim()) {
@@ -18828,6 +18858,68 @@ ${compactSummary}`;
       return entry;
     }
     /**
+     * Append an extension-owned custom entry to the active path. Custom
+     * entries persist with the session tree (they follow fork branches) but
+     * never enter the LLM message context.
+     */
+    appendCustomEntry(customType, data2) {
+      if (!this.activeSession) {
+        throw new Error("No active session");
+      }
+      if (!customType || typeof customType !== "string") {
+        throw new Error("appendCustomEntry requires a non-empty customType");
+      }
+      const entry = {
+        id: generateEntryId(),
+        parentId: this.activeSession.activeEntryId,
+        type: "custom",
+        timestamp: Date.now(),
+        customType,
+        data: data2
+      };
+      this.activeSession.entries.push(entry);
+      this.activeSession.activeEntryId = entry.id;
+      this.activeSession.isDirty = true;
+      return entry;
+    }
+    /** Get the custom entries of one kind on the current active path, oldest first. */
+    getCustomEntries(customType) {
+      if (!this.activeSession) return [];
+      return this.getPathToEntry(this.activeSession.activeEntryId ?? "").filter((entry) => entry.type === "custom" && entry.customType === customType);
+    }
+    /** Set or clear a bookmark label on an entry. Labels persist with the session. */
+    setLabel(entryId, label) {
+      if (!this.activeSession) {
+        throw new Error("No active session");
+      }
+      const entry = this.activeSession.entries.find((candidate) => candidate.id === entryId);
+      if (!entry) {
+        throw new Error(`Entry not found: ${entryId}`);
+      }
+      if (label === void 0 || label === "") {
+        delete entry.label;
+      } else {
+        entry.label = label;
+      }
+      this.activeSession.isDirty = true;
+    }
+    getLabel(entryId) {
+      if (!this.activeSession) return void 0;
+      return this.activeSession.entries.find((candidate) => candidate.id === entryId)?.label;
+    }
+    /** Set a manual display name for the active session (never auto-overwritten). */
+    setSessionName(name) {
+      if (!this.activeSession) {
+        throw new Error("No active session");
+      }
+      this.activeSession.metadata.name = name;
+      this.activeSession.metadata.nameSource = "manual";
+      this.activeSession.isDirty = true;
+    }
+    getSessionName() {
+      return this.activeSession?.metadata.nameSource === "manual" ? this.activeSession?.metadata.name : void 0;
+    }
+    /**
      * Update messages (legacy compatibility - rebuilds tree)
      * @deprecated Use addMessage() instead
      */
@@ -21985,6 +22077,97 @@ ${compactSummary}`;
     return `Available roots: ${rootSummaries.join("; ")}. ${defaultSentence} ${allowlistSentence}`.trim();
   }
 
+  // ../../packages/shared-headless-capabilities/src/builtin/fs/utf8.ts
+  function encodeUtf8(text) {
+    if (typeof TextEncoder !== "undefined") {
+      return new TextEncoder().encode(text);
+    }
+    const out = [];
+    for (let i2 = 0; i2 < text.length; i2 += 1) {
+      let codePoint = text.charCodeAt(i2);
+      if (codePoint >= 55296 && codePoint <= 56319) {
+        const low = i2 + 1 < text.length ? text.charCodeAt(i2 + 1) : 0;
+        if (low >= 56320 && low <= 57343) {
+          codePoint = 65536 + (codePoint - 55296 << 10) + (low - 56320);
+          i2 += 1;
+        } else {
+          codePoint = 65533;
+        }
+      } else if (codePoint >= 56320 && codePoint <= 57343) {
+        codePoint = 65533;
+      }
+      if (codePoint < 128) {
+        out.push(codePoint);
+      } else if (codePoint < 2048) {
+        out.push(192 | codePoint >> 6, 128 | codePoint & 63);
+      } else if (codePoint < 65536) {
+        out.push(224 | codePoint >> 12, 128 | codePoint >> 6 & 63, 128 | codePoint & 63);
+      } else {
+        out.push(
+          240 | codePoint >> 18,
+          128 | codePoint >> 12 & 63,
+          128 | codePoint >> 6 & 63,
+          128 | codePoint & 63
+        );
+      }
+    }
+    return new Uint8Array(out);
+  }
+  function utf8ByteLength(text) {
+    return encodeUtf8(text).length;
+  }
+  function probeUtf8Sequence(bytes, offset2) {
+    const lead = bytes[offset2] ?? 0;
+    if (lead < 128) return { status: "complete", codePoint: lead, width: 1 };
+    if (lead < 194 || lead > 244) return { status: "invalid", width: 1 };
+    const width = lead < 224 ? 2 : lead < 240 ? 3 : 4;
+    let minFirst = 128;
+    let maxFirst = 191;
+    if (lead === 224) minFirst = 160;
+    else if (lead === 237) maxFirst = 159;
+    else if (lead === 240) minFirst = 144;
+    else if (lead === 244) maxFirst = 143;
+    let codePoint = lead & (width === 2 ? 31 : width === 3 ? 15 : 7);
+    for (let k = 1; k < width; k += 1) {
+      const byte = bytes[offset2 + k];
+      if (byte === void 0) return { status: "incomplete" };
+      const min = k === 1 ? minFirst : 128;
+      const max = k === 1 ? maxFirst : 191;
+      if (byte < min || byte > max) return { status: "invalid", width: k };
+      codePoint = codePoint << 6 | byte & 63;
+    }
+    return { status: "complete", codePoint, width };
+  }
+  function createLenientStreamingDecoder() {
+    let pending = [];
+    return {
+      decode(bytes, options) {
+        const chunk = bytes ?? new Uint8Array(0);
+        const combined = pending.concat(Array.from(chunk));
+        const flush = options?.stream !== true;
+        let out = "";
+        let i2 = 0;
+        while (i2 < combined.length) {
+          const probe = probeUtf8Sequence(combined, i2);
+          if (probe.status === "incomplete") {
+            if (flush) {
+              out += String.fromCodePoint(65533);
+              i2 = combined.length;
+            } else {
+              pending = combined.slice(i2);
+              return out;
+            }
+            continue;
+          }
+          out += String.fromCodePoint(probe.status === "complete" ? probe.codePoint : 65533);
+          i2 += probe.width;
+        }
+        pending = [];
+        return out;
+      }
+    };
+  }
+
   // ../../packages/shared-headless-capabilities/src/builtin/fs/truncate.ts
   var DEFAULT_MAX_LINES = 2e3;
   var DEFAULT_MAX_BYTES = 50 * 1024;
@@ -22001,7 +22184,7 @@ ${compactSummary}`;
   function truncateHead(content, options = {}) {
     const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
     const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
-    const totalBytes = Buffer.byteLength(content, "utf-8");
+    const totalBytes = utf8ByteLength(content);
     const lines = content.split("\n");
     const totalLines = lines.length;
     if (totalLines <= maxLines && totalBytes <= maxBytes) {
@@ -22019,7 +22202,7 @@ ${compactSummary}`;
         maxBytes
       };
     }
-    const firstLineBytes = Buffer.byteLength(lines[0], "utf-8");
+    const firstLineBytes = utf8ByteLength(lines[0]);
     if (firstLineBytes > maxBytes) {
       return {
         content: "",
@@ -22040,7 +22223,7 @@ ${compactSummary}`;
     let truncatedBy = "lines";
     for (let i2 = 0; i2 < lines.length && i2 < maxLines; i2++) {
       const line = lines[i2];
-      const lineBytes = Buffer.byteLength(line, "utf-8") + (i2 > 0 ? 1 : 0);
+      const lineBytes = utf8ByteLength(line) + (i2 > 0 ? 1 : 0);
       if (outputBytesCount + lineBytes > maxBytes) {
         truncatedBy = "bytes";
         break;
@@ -22052,7 +22235,7 @@ ${compactSummary}`;
       truncatedBy = "lines";
     }
     const outputContent = outputLinesArr.join("\n");
-    const finalOutputBytes = Buffer.byteLength(outputContent, "utf-8");
+    const finalOutputBytes = utf8ByteLength(outputContent);
     return {
       content: outputContent,
       truncated: true,
@@ -22623,39 +22806,92 @@ Base directory: ${dirname(absolutePath)}
     return detectBinaryKind(filePath) ?? { kind: "document", mimeType: "application/octet-stream" };
   }
   async function readImageInfo(path3, fs) {
-    if (typeof Buffer === "undefined") {
-      return void 0;
-    }
     try {
-      const base64 = await fs.readFile(path3, "base64");
-      const bytes = Buffer.from(base64, "base64");
-      if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+      let base64 = "";
+      const size = (await fs.stat(path3).catch(() => void 0))?.size ?? 0;
+      if (typeof fs.readFile === "function") {
+        base64 = await fs.readFile(path3, "base64").catch(() => "");
+      }
+      if (!base64 && size > 0 && typeof fs.readFileSync === "function") {
+        base64 = fs.readFileSync(path3, "base64");
+      }
+      if (!base64) {
+        console.error(`[pie] readImageInfo got empty base64 for ${path3}`);
+        return void 0;
+      }
+      const bytes = decodeBase64ToBytes(base64);
+      if (bytes.length === 0) {
+        console.error(`[pie] readImageInfo decoded 0 bytes for ${path3} (base64 length ${base64.length})`);
+        return void 0;
+      }
+      const pngMagic = [137, 80, 78, 71, 13, 10, 26, 10];
+      if (bytes.length >= 8 && pngMagic.every((byte, index) => bytes[index] === byte)) {
         return { mimeType: "image/png", base64, ...parsePngDimensions(bytes) };
       }
       if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) {
         return { mimeType: "image/jpeg", base64, ...parseJpegDimensions(bytes) };
       }
       if (bytes.length >= 6) {
-        const gifHeader = bytes.subarray(0, 6).toString("ascii");
+        const gifHeader = asciiAt(bytes, 0, 6);
         if (gifHeader === "GIF87a" || gifHeader === "GIF89a") {
           return { mimeType: "image/gif", base64, ...parseGifDimensions(bytes) };
         }
       }
-      if (bytes.length >= 12 && bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") {
+      if (bytes.length >= 12 && asciiAt(bytes, 0, 4) === "RIFF" && asciiAt(bytes, 8, 12 - 8) === "WEBP") {
         return { mimeType: "image/webp", base64, ...parseWebpDimensions(bytes) };
       }
-    } catch {
+    } catch (error) {
+      console.error(`[pie] readImageInfo failed for ${path3}: ${error instanceof Error ? error.message : String(error)}`);
       return void 0;
     }
     return void 0;
+  }
+  function decodeBase64ToBytes(base64) {
+    if (typeof Buffer !== "undefined") {
+      return Buffer.from(base64, "base64");
+    }
+    const clean = base64.replace(/[^A-Za-z0-9+/=]/g, "");
+    if (clean.length % 4 !== 0) {
+      return new Uint8Array(0);
+    }
+    const lookup = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const bytes = new Uint8Array(clean.length / 4 * 3);
+    let at2 = 0;
+    for (let i2 = 0; i2 < clean.length; i2 += 4) {
+      const padding = clean[i2 + 2] === "=" ? clean[i2 + 3] === "=" ? 2 : 1 : 0;
+      const n = lookup.indexOf(clean[i2]) << 18 | lookup.indexOf(clean[i2 + 1]) << 12 | (padding < 2 ? lookup.indexOf(clean[i2 + 2]) << 6 : 0) | (padding < 1 ? lookup.indexOf(clean[i2 + 3]) : 0);
+      bytes[at2++] = n >> 16 & 255;
+      if (padding < 2) bytes[at2++] = n >> 8 & 255;
+      if (padding < 1) bytes[at2++] = n & 255;
+    }
+    return bytes.subarray(0, at2);
+  }
+  function readUIntBE(bytes, offset2, length) {
+    let value = 0;
+    for (let i2 = 0; i2 < length; i2 += 1) {
+      value = value * 256 + bytes[offset2 + i2];
+    }
+    return value;
+  }
+  function readUIntLE(bytes, offset2, length) {
+    let value = 0;
+    for (let i2 = length - 1; i2 >= 0; i2 -= 1) {
+      value = value * 256 + bytes[offset2 + i2];
+    }
+    return value;
+  }
+  function asciiAt(bytes, offset2, length) {
+    let text = "";
+    for (let i2 = 0; i2 < length; i2 += 1) text += String.fromCharCode(bytes[offset2 + i2]);
+    return text;
   }
   function parsePngDimensions(bytes) {
     if (bytes.length < 24) {
       return {};
     }
     return {
-      width: bytes.readUInt32BE(16),
-      height: bytes.readUInt32BE(20)
+      width: readUIntBE(bytes, 16, 4),
+      height: readUIntBE(bytes, 20, 4)
     };
   }
   function parseGifDimensions(bytes) {
@@ -22663,8 +22899,8 @@ Base directory: ${dirname(absolutePath)}
       return {};
     }
     return {
-      width: bytes.readUInt16LE(6),
-      height: bytes.readUInt16LE(8)
+      width: readUIntLE(bytes, 6, 2),
+      height: readUIntLE(bytes, 8, 2)
     };
   }
   function parseJpegDimensions(bytes) {
@@ -22682,15 +22918,15 @@ Base directory: ${dirname(absolutePath)}
       if (offset2 + 2 > bytes.length) {
         break;
       }
-      const segmentLength = bytes.readUInt16BE(offset2);
+      const segmentLength = readUIntBE(bytes, offset2, 2);
       if (segmentLength < 2 || offset2 + segmentLength > bytes.length) {
         break;
       }
       const isStartOfFrame = marker >= 192 && marker <= 195 || marker >= 197 && marker <= 199 || marker >= 201 && marker <= 203 || marker >= 205 && marker <= 207;
       if (isStartOfFrame && segmentLength >= 7) {
         return {
-          height: bytes.readUInt16BE(offset2 + 3),
-          width: bytes.readUInt16BE(offset2 + 5)
+          height: readUIntBE(bytes, offset2 + 3, 2),
+          width: readUIntBE(bytes, offset2 + 5, 2)
         };
       }
       offset2 += segmentLength;
@@ -22701,21 +22937,21 @@ Base directory: ${dirname(absolutePath)}
     if (bytes.length < 30) {
       return {};
     }
-    const chunkType = bytes.subarray(12, 16).toString("ascii");
+    const chunkType = asciiAt(bytes, 12, 4);
     if (chunkType === "VP8X" && bytes.length >= 30) {
       return {
-        width: 1 + bytes.readUIntLE(24, 3),
-        height: 1 + bytes.readUIntLE(27, 3)
+        width: 1 + readUIntLE(bytes, 24, 3),
+        height: 1 + readUIntLE(bytes, 27, 3)
       };
     }
     if (chunkType === "VP8 " && bytes.length >= 30) {
       return {
-        width: bytes.readUInt16LE(26) & 16383,
-        height: bytes.readUInt16LE(28) & 16383
+        width: readUIntLE(bytes, 26, 2) & 16383,
+        height: readUIntLE(bytes, 28, 2) & 16383
       };
     }
     if (chunkType === "VP8L" && bytes.length >= 25) {
-      const bits = bytes.readUInt32LE(21);
+      const bits = readUIntLE(bytes, 21, 4);
       return {
         width: (bits & 16383) + 1,
         height: (bits >> 14 & 16383) + 1
@@ -25697,7 +25933,7 @@ ${hint}`;
         const lineNumber = lineIndex + 1;
         const formatted = matches.has(lineIndex) ? `${input.relativePath}:${lineNumber}: ${text}` : `${input.relativePath}-${lineNumber}- ${text}`;
         input.outputLines.push(formatted);
-        outputBytes += Buffer.byteLength(formatted, "utf8") + (input.outputLines.length > 1 ? 1 : 0);
+        outputBytes += utf8ByteLength(formatted) + (input.outputLines.length > 1 ? 1 : 0);
         if (outputBytes > DEFAULT_MAX_BYTES) return { outputBytes, linesTruncated, outputBudgetReached: true };
       }
     }
@@ -26686,6 +26922,112 @@ ${tools.map((tool) => buildToolLine(tool, mode)).filter(Boolean).join("\n")}
     const text = textChunks.join("\n").trim();
     return { text, sources: uniqueSources(sources), results: text ? [makeTextSegment(text)] : [], actualQueries: [originalQuery] };
   }
+  var MAX_PLAIN_PAYLOAD_CHARS = 2 * 1024 * 1024;
+  async function readOpenAIResponsesSearchStream(response, originalQuery) {
+    if (!response.body) {
+      const statusDetail = await response.text().then((text) => text.slice(0, 200)).catch(() => "");
+      throw new Error(`Responses web_search returned no SSE body (HTTP ${response.status}${statusDetail ? `: ${statusDetail}` : ""}).`);
+    }
+    const reader = response.body.getReader();
+    const decoder = typeof TextDecoder !== "undefined" ? new TextDecoder() : createLenientStreamingDecoder();
+    const outputItems = [];
+    let completedOutput = [];
+    let textDeltas = "";
+    let buffer = "";
+    let dataLines = [];
+    let plainText = "";
+    let completed = false;
+    let searched = false;
+    const handleEvent = (data2) => {
+      if (!data2 || data2 === "[DONE]") return;
+      const event = JSON.parse(data2);
+      if (!isRecord5(event)) return;
+      const type = event.type;
+      if (type === "response.web_search_call.completed") searched = true;
+      if (type === "response.output_item.done" && isRecord5(event.item)) {
+        if (event.item.type === "web_search_call" && event.item.status === "completed") searched = true;
+        if (event.item.type === "message") outputItems.push(event.item);
+      }
+      if (type === "response.output_text.delta" && typeof event.delta === "string") textDeltas += event.delta;
+      if (type === "response.completed") {
+        completed = true;
+        const result = isRecord5(event.response) ? event.response : {};
+        completedOutput = Array.isArray(result.output) ? result.output : [];
+        const toolUsage = isRecord5(result.tool_usage) ? result.tool_usage : {};
+        const webSearch = isRecord5(toolUsage.web_search) ? toolUsage.web_search : {};
+        if (typeof webSearch.num_requests === "number" && webSearch.num_requests > 0) searched = true;
+      }
+      if (type === "response.failed" || type === "response.incomplete" || type === "error") {
+        const result = isRecord5(event.response) ? event.response : {};
+        const error = isRecord5(event.error) ? event.error : isRecord5(result.error) ? result.error : {};
+        throw new Error(`Responses web_search ${type}: ${String(error.message || error.code || "upstream error")}`);
+      }
+    };
+    const handleLine = (rawLine) => {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (line === "") {
+        const data2 = dataLines.join("\n");
+        dataLines = [];
+        handleEvent(data2);
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trimStart());
+      } else {
+        plainText += line;
+        if (plainText.length > MAX_PLAIN_PAYLOAD_CHARS) {
+          throw new Error(`Responses web_search plain-text payload exceeded ${MAX_PLAIN_PAYLOAD_CHARS} characters.`);
+        }
+      }
+    };
+    let streamDrained = false;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) streamDrained = true;
+        buffer += decoder.decode(value, { stream: !done });
+        if (buffer.length > MAX_PLAIN_PAYLOAD_CHARS) {
+          throw new Error(`Responses web_search line exceeded ${MAX_PLAIN_PAYLOAD_CHARS} characters.`);
+        }
+        let newline;
+        while ((newline = buffer.indexOf("\n")) !== -1) {
+          handleLine(buffer.slice(0, newline));
+          buffer = buffer.slice(newline + 1);
+        }
+        if (completed || done) break;
+      }
+      if (!completed) {
+        if (buffer) handleLine(buffer);
+        if (dataLines.length) handleEvent(dataLines.join("\n"));
+      }
+    } finally {
+      if (!streamDrained) await reader.cancel().catch(() => void 0);
+      reader.releaseLock();
+    }
+    if (!completed && plainText.trim().startsWith("{")) {
+      try {
+        const document = JSON.parse(plainText);
+        if (isRecord5(document) && Array.isArray(document.output)) {
+          completed = true;
+          completedOutput = document.output;
+          const toolUsage = isRecord5(document.tool_usage) ? document.tool_usage : {};
+          const webSearch = isRecord5(toolUsage.web_search) ? toolUsage.web_search : {};
+          if (typeof webSearch.num_requests === "number" && webSearch.num_requests > 0) searched = true;
+          for (const item of completedOutput) {
+            if (isRecord5(item) && item.type === "web_search_call" && item.status === "completed") searched = true;
+            if (isRecord5(item) && item.type === "message" && Array.isArray(item.content)) {
+              for (const block of item.content) {
+                if (isRecord5(block) && Array.isArray(block.annotations) && block.annotations.length > 0) searched = true;
+              }
+            }
+          }
+        }
+      } catch {
+      }
+    }
+    if (!completed) throw new Error("Responses web_search stream ended before response.completed.");
+    if (!searched) throw new Error("Responses web_search completed without a search call.");
+    const output = outputItems.length ? outputItems : completedOutput;
+    return extractOpenAIResponsesContent({ output, output_text: output.length ? void 0 : textDeltas }, originalQuery);
+  }
   function extractChatCompletionsContent(response, originalQuery) {
     const body = isRecord5(response) ? response : {};
     const sources = [];
@@ -26727,6 +27069,9 @@ ${tools.map((tool) => buildToolLine(tool, mode)).filter(Boolean).join("\n")}
       },
       body: JSON.stringify({
         model: params.model.id,
+        store: false,
+        stream: true,
+        tool_choice: { type: "web_search" },
         input: [{
           role: "user",
           content: [{
@@ -26743,7 +27088,7 @@ Perform a web search for this query and summarize the useful results with source
       const errorBody = await response.text().catch(() => "");
       throw new Error(`Responses API error ${response.status}: ${errorBody}`);
     }
-    return extractOpenAIResponsesContent(await response.json(), params.input.query);
+    return readOpenAIResponsesSearchStream(response, params.input.query);
   }
   async function runAnthropicNativeSearch(params) {
     const baseUrl = (params.model.baseUrl || "").replace(/\/+$/, "");
@@ -27044,8 +27389,9 @@ Perform a web search for the query: ${params.input.query}`
             }
             const qualityWarnings = evaluateSearchQuality(search);
             const durationSeconds = (Date.now() - start) / 1e3;
-            if (qualityWarnings.length > 0) {
-              lastFailureReason = `Provider returned low-quality web_search results: ${qualityWarnings.join(", ")}`;
+            const hardQualityFailures = qualityWarnings.filter((warning) => warning !== "only_homepage_or_search_page_sources");
+            if (hardQualityFailures.length > 0) {
+              lastFailureReason = `Provider returned low-quality web_search results: ${hardQualityFailures.join(", ")}`;
               lastFailureCategory = "low_quality_result";
               attempts.push(makeAttempt({
                 model: searchModel,
@@ -27055,7 +27401,7 @@ Perform a web search for the query: ${params.input.query}`
                 fallbackReason: lastFailureReason,
                 sourceCount: search.sources.length,
                 durationSeconds,
-                qualityWarnings
+                qualityWarnings: hardQualityFailures
               }));
               continue;
             }
@@ -27089,6 +27435,7 @@ Perform a web search for the query: ${params.input.query}`
                 sources: search.sources,
                 actualQueries: search.actualQueries,
                 results: search.results,
+                qualityWarnings,
                 attempts
               },
               isError: false
@@ -28971,11 +29318,114 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
         throw err;
       }
       const capturedRequestId = requestId;
+      const lineEncoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : {
+        // PuerTS ships neither TextEncoder nor Buffer; encode UTF-8 manually.
+        encode(text) {
+          const out = [];
+          for (let i2 = 0; i2 < text.length; i2 += 1) {
+            let cp = text.charCodeAt(i2);
+            if (cp >= 55296 && cp <= 56319 && i2 + 1 < text.length) {
+              const lo = text.charCodeAt(i2 + 1);
+              if (lo >= 56320 && lo <= 57343) {
+                cp = 65536 + (cp - 55296 << 10) + (lo - 56320);
+                i2 += 1;
+              }
+            }
+            if (cp < 128) out.push(cp);
+            else if (cp < 2048) out.push(192 | cp >> 6, 128 | cp & 63);
+            else if (cp < 65536) out.push(224 | cp >> 12, 128 | cp >> 6 & 63, 128 | cp & 63);
+            else out.push(240 | cp >> 18, 128 | cp >> 12 & 63, 128 | cp >> 6 & 63, 128 | cp & 63);
+          }
+          return new Uint8Array(out);
+        }
+      };
+      function createBodyStream(start, onCancel) {
+        const chunks = [];
+        let finished = false;
+        let cancelled = false;
+        let failure;
+        let started = false;
+        const waiters = [];
+        const wake = () => {
+          const pending = waiters.splice(0, waiters.length);
+          for (const resolve2 of pending) resolve2();
+        };
+        let stopPump = null;
+        const ensureStarted = () => {
+          if (started || cancelled || finished) return;
+          started = true;
+          let pumpActive = true;
+          stopPump = () => {
+            pumpActive = false;
+          };
+          void start({
+            enqueue: (chunk) => {
+              if (pumpActive) chunks.push(chunk);
+              wake();
+            },
+            close: () => {
+              finished = true;
+              wake();
+            },
+            error: (reason) => {
+              failure = reason;
+              finished = true;
+              wake();
+            }
+          });
+        };
+        return {
+          getReader: () => ({
+            read: async () => {
+              ensureStarted();
+              while (chunks.length === 0 && !finished) {
+                await new Promise((resolve2) => {
+                  waiters.push(resolve2);
+                });
+              }
+              if (chunks.length > 0) return { done: false, value: chunks.shift() };
+              if (failure !== void 0) throw failure;
+              return { done: true };
+            },
+            releaseLock: () => {
+            },
+            cancel: async () => {
+              if (cancelled) return;
+              cancelled = true;
+              finished = true;
+              stopPump?.();
+              chunks.length = 0;
+              onCancel?.();
+              wake();
+            }
+          })
+        };
+      }
       const response = {
         status: httpStatus,
         statusText: httpStatus >= 200 && httpStatus < 300 ? "OK" : "Error",
         ok: httpStatus >= 200 && httpStatus < 300,
         headers: { "content-type": "application/json" },
+        // Standard WHATWG-style body so shared streaming consumers
+        // (response.body.getReader()) work on this host, not just readSSELines.
+        // Cancelling the reader also cancels the native SSE request so a
+        // completed search no longer keeps the connection open until EOF.
+        body: createBodyStream(async (controller) => {
+          try {
+            for await (const line of response.readSSELines?.() ?? []) {
+              controller.enqueue(lineEncoder.encode(line + "\n"));
+            }
+            controller.close();
+          } catch (error) {
+            controller.error(error);
+          }
+        }, () => {
+          try {
+            CS.Pie.PieHttpBridge.CancelRequest(capturedRequestId);
+          } catch {
+          }
+          sseBuffers.delete(capturedRequestId);
+        }),
         async text() {
           const lines = [];
           for await (const line of response.readSSELines?.() ?? []) {
@@ -35549,7 +35999,7 @@ Actions: create, read, complete_current, clear.`;
     task.status = "completed";
     task.result = result;
     task.updatedAt = nowIso3();
-    task.gates = [];
+    rejectPendingGates(task, "TASK_COMPLETED", "Unity script run completed before this gate was awaited.");
     notifyWaiters(task);
   }
   function failTask(task, code, message) {
@@ -35888,8 +36338,12 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     if (ready.length === 0) return;
     task.stepStartMs = now;
     task.updatedAt = nowIso3();
-    task.onProgress?.(buildStatus(task));
     for (const gate of ready) gate.resolve();
+    try {
+      task.onProgress?.(buildStatus(task));
+    } catch (error) {
+      installedBridge?.log?.("error", `[unity.script.run:${task.id}] progress callback failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   function createScriptRun(bridge2, payload) {
     const task = {
@@ -35965,7 +36419,13 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     const task = createScriptRun(bridge2, payload);
     if (options.onProgress) {
       task.onProgress = options.onProgress;
-      if (task.status === "running") options.onProgress(buildStatus(task));
+      if (task.status === "running") {
+        try {
+          options.onProgress(buildStatus(task));
+        } catch (error) {
+          installedBridge?.log?.("error", `[unity.script.run:${task.id}] progress callback failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
     }
     const promise = task.status === "running" ? new Promise((resolve2) => {
       task.waiters.push(resolve2);
@@ -36649,6 +37109,18 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
         "Refresh Unity host state after project file changes. In the editor this refreshes assets; in runtime it is a no-op.",
         "unity_refresh",
         Type.Object({
+          full: Type.Optional(Type.Boolean({ description: "Return untruncated model-facing output when the result is large." }))
+        })
+      ),
+      createDevRpcTool(
+        "unity_screenshot",
+        "Capture the current game view as a PNG screenshot rendered from the active camera (or a named camera). The capture is saved under the persistent root at PieScreenshots/; the result returns path plus absolutePath. To visually inspect the capture afterwards, call read_file with root=persistent and the returned path (optionally with a question) so the image is analyzed by the understanding model.",
+        "unity_screenshot",
+        Type.Object({
+          width: Type.Optional(Type.Number({ description: "Capture width in pixels (64-3840, default 1280)." })),
+          height: Type.Optional(Type.Number({ description: "Capture height in pixels (64-3840, default 720)." })),
+          cameraName: Type.Optional(Type.String({ description: "Capture from this named camera instead of the active one." })),
+          path: Type.Optional(Type.String({ description: "Relative path under PieScreenshots/ for the PNG (default: timestamped capture_*.png). No '..' segments." })),
           full: Type.Optional(Type.Boolean({ description: "Return untruncated model-facing output when the result is large." }))
         })
       ),
@@ -37389,6 +37861,54 @@ ${extensionSection.join("\n\n---\n\n")}
     const todoCount = Array.isArray(record.todoState) ? record.todoState.length : 0;
     return messageCount === 0 && todoCount === 0;
   }
+  var SESSION_IMAGE_BUDGET_CHARS = 6 * 1024 * 1024;
+  var RESERVED_MESSAGE_IMAGE_CHARS = 8 * 1024 * 1024;
+  function isImageBlock(block) {
+    return typeof block === "object" && block !== null && block.type === "image" && typeof block.data === "string";
+  }
+  function hasImageBlocks(message) {
+    return Array.isArray(message.content) && message.content.some(isImageBlock);
+  }
+  function imagePlaceholder(block) {
+    const kilobytes = Math.max(1, Math.round(block.data.length * 3 / 4 / 1024));
+    return {
+      type: "text",
+      text: `[image attachment omitted from session history (${block.mimeType || "image"}, ~${kilobytes} KB)]`
+    };
+  }
+  function capSessionImagePayload(messages) {
+    let reservedIndex = -1;
+    for (let i2 = messages.length - 1; i2 >= 0; i2 -= 1) {
+      if (hasImageBlocks(messages[i2])) {
+        reservedIndex = i2;
+        break;
+      }
+    }
+    let remaining = SESSION_IMAGE_BUDGET_CHARS;
+    const result = new Array(messages.length);
+    for (let i2 = messages.length - 1; i2 >= 0; i2 -= 1) {
+      const message = messages[i2];
+      const content = message.content;
+      if (!Array.isArray(content)) {
+        result[i2] = message;
+        continue;
+      }
+      let allowance = i2 === reservedIndex ? RESERVED_MESSAGE_IMAGE_CHARS : remaining;
+      let changed = false;
+      const nextContent = content.map((block) => {
+        if (!isImageBlock(block)) return block;
+        if (block.data.length <= allowance) {
+          allowance -= block.data.length;
+          return block;
+        }
+        changed = true;
+        return imagePlaceholder(block);
+      });
+      if (i2 !== reservedIndex) remaining = allowance;
+      result[i2] = changed ? { ...message, content: nextContent } : message;
+    }
+    return result;
+  }
   async function saveSession(projectRoot2, record) {
     ensureSessionsDir(projectRoot2);
     const existing = await loadSession(projectRoot2, record.id);
@@ -37398,6 +37918,7 @@ ${extensionSection.join("\n\n---\n\n")}
       updatedAt: isoNow(),
       title: deriveSessionTitle(record.messages || []),
       messageCount: Array.isArray(record.messages) ? record.messages.length : 0,
+      messages: capSessionImagePayload(record.messages || []),
       todoState: normalizeTodoState(record.todoState)
     };
     if (isSessionEmpty(normalized)) {
@@ -37515,6 +38036,8 @@ ${extensionSection.join("\n\n---\n\n")}
   var MAX_TOOL_FIELD = 4e3;
   var MAX_TIMELINE_ITEMS = 500;
   var MAX_TURNS = 50;
+  var MAX_TRACKED_TOOL_ORIGINS = 256;
+  var UNCLOSED_TOOL_NOTE = "Tool did not report a result before the turn ended.";
   function isRecord10(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
@@ -37588,7 +38111,7 @@ ${extensionSection.join("\n\n---\n\n")}
     const offset2 = userIndices.length > MAX_TURNS ? userIndices[userIndices.length - MAX_TURNS] : 0;
     return { messages: messages.slice(offset2), offset: offset2 };
   }
-  function buildRuntimeTimelineItems(sessionId, messages, createdAt) {
+  function buildRuntimeTimelineItems(sessionId, messages, createdAt, liveClientTurnId) {
     const source = Array.isArray(messages) ? messages : [];
     const { messages: recent, offset: offset2 } = turnSlice(source);
     const baseTimestamp = Math.max(0, Date.parse(createdAt || "")) || 1;
@@ -37648,6 +38171,14 @@ ${extensionSection.join("\n\n---\n\n")}
           if (!isRecord10(block) || block.type !== "toolCall") continue;
           const callId = String(block.id || "");
           const toolName = String(block.name || "tool");
+          const existing = callId ? toolsByCallId.get(callId) : void 0;
+          if (existing) {
+            const encodedArgs2 = jsonText(block.arguments);
+            existing.argsJson = encodedArgs2.value;
+            existing.isTruncated = existing.isTruncated || encodedArgs2.truncated;
+            if (!existing.toolName || existing.toolName === "tool") existing.toolName = toolName;
+            continue;
+          }
           const stableCallId = callId || `${messageIndex}:${toolName}`;
           const encodedArgs = jsonText(block.arguments);
           const item = baseTimelineItem({
@@ -37699,12 +38230,23 @@ ${extensionSection.join("\n\n---\n\n")}
         item.isTruncated = item.isTruncated || result.truncated || details.truncated;
       }
     });
+    for (const item of items) {
+      if (item.kind !== "tool" || item.status !== "running") continue;
+      if (liveClientTurnId && item.clientTurnId === liveClientTurnId) continue;
+      item.status = "aborted";
+      item.completedAt = item.updatedAt;
+      if (!item.resultText) item.resultText = UNCLOSED_TOOL_NOTE;
+    }
     return items.length > MAX_TIMELINE_ITEMS ? items.slice(items.length - MAX_TIMELINE_ITEMS) : items;
   }
-  function createRuntimeUserMessage(content, displayContent, clientTurnId, timestamp = Date.now()) {
+  function createRuntimeUserMessage(content, displayContent, clientTurnId, timestamp = Date.now(), imageBlocks) {
+    const contentBlocks = imageBlocks && imageBlocks.length > 0 ? [
+      { type: "text", text: content },
+      ...imageBlocks.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType }))
+    ] : content;
     return {
       role: "user",
-      content,
+      content: contentBlocks,
       displayContent,
       clientTurnId,
       timestamp
@@ -37727,6 +38269,18 @@ ${extensionSection.join("\n\n---\n\n")}
     bridge;
     getSessionId;
     active = null;
+    /**
+     * Tool call ids started since boot, mapped to the turn that started them.
+     * Survives session switches so a late tool result can be attributed to its
+     * original turn instead of polluting the next turn of a different session.
+     */
+    toolCallOrigins = /* @__PURE__ */ new Map();
+    /**
+     * Call ids that already received a terminal card this boot. A late
+     * tool_execution_start for one of them (out-of-order forwarding) must not
+     * reopen the card as running.
+     */
+    closedToolCallIds = /* @__PURE__ */ new Set();
     get activeClientTurnId() {
       return this.active?.clientTurnId || "";
     }
@@ -37825,6 +38379,9 @@ ${extensionSection.join("\n\n---\n\n")}
       const active = this.active;
       if (!active) return;
       active.hadToolActivity = true;
+      if (toolCallId && this.closedToolCallIds.has(toolCallId)) {
+        return;
+      }
       const encodedArgs = jsonText(args);
       active.toolSequence += 1;
       const itemId = toolCallId ? `${active.clientTurnId}:tool:${toolCallId}` : `${active.clientTurnId}:tool:${toolName || "tool"}:${active.toolSequence}`;
@@ -37836,8 +38393,14 @@ ${extensionSection.join("\n\n---\n\n")}
         argsJson: encodedArgs.value,
         argsTruncated: encodedArgs.truncated
       };
-      if (toolCallId) active.toolsByCallId.set(toolCallId, tracked);
-      active.toolsByName.set(toolName || "tool", tracked);
+      if (toolCallId) {
+        active.toolsByCallId.set(toolCallId, tracked);
+        this.rememberToolCallOrigin(toolCallId, active, tracked);
+      }
+      const nameKey = toolName || "tool";
+      const queue = active.toolsByName.get(nameKey);
+      if (queue) queue.push(tracked);
+      else active.toolsByName.set(nameKey, [tracked]);
       const item = baseTimelineItem({
         sessionId: active.sessionId,
         clientTurnId: active.clientTurnId,
@@ -37854,41 +38417,90 @@ ${extensionSection.join("\n\n---\n\n")}
       this.emitTimeline(item);
     }
     endTool(params) {
+      const timestamp = params.timestamp ?? Date.now();
       const active = this.active;
+      const origin = params.toolCallId ? this.toolCallOrigins.get(params.toolCallId) : void 0;
+      if (origin && (!active || active.clientTurnId !== origin.clientTurnId)) {
+        this.toolCallOrigins.delete(params.toolCallId);
+        this.emitToolTerminal(params, {
+          sessionId: origin.sessionId,
+          clientTurnId: origin.clientTurnId,
+          startedAt: origin.item.startedAt,
+          tracked: origin.item,
+          fallbackItemId: origin.item.itemId
+        }, timestamp);
+        return;
+      }
       if (!active) return;
       active.hadToolActivity = true;
-      const timestamp = params.timestamp ?? Date.now();
       const toolNameKey = params.toolName || "tool";
-      const tracked = (params.toolCallId ? active.toolsByCallId.get(params.toolCallId) : void 0) || active.toolsByName.get(toolNameKey);
+      const tracked = (params.toolCallId ? active.toolsByCallId.get(params.toolCallId) : void 0) || (params.toolCallId ? active.toolsByName.get(toolNameKey)?.find((candidate) => !candidate.toolCallId) : active.toolsByName.get(toolNameKey)?.[0]);
       const fallbackItemId = params.toolCallId ? `${active.clientTurnId}:tool:${params.toolCallId}` : `${active.clientTurnId}:tool:${toolNameKey}:unmatched`;
-      const args = tracked ? { value: tracked.argsJson, truncated: tracked.argsTruncated } : jsonText(params.args);
+      this.emitToolTerminal(params, {
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        startedAt: tracked?.startedAt ?? timestamp,
+        tracked,
+        fallbackItemId
+      }, timestamp);
+      if (params.toolCallId && origin) this.toolCallOrigins.delete(params.toolCallId);
+      if (params.toolCallId) this.rememberClosedToolCallId(params.toolCallId);
+      if (tracked) {
+        if (tracked.toolCallId) active.toolsByCallId.delete(tracked.toolCallId);
+        const queueKey = tracked.toolName || "tool";
+        const queue = active.toolsByName.get(queueKey);
+        if (queue) {
+          const at2 = queue.indexOf(tracked);
+          if (at2 >= 0) queue.splice(at2, 1);
+          if (queue.length === 0) active.toolsByName.delete(queueKey);
+        }
+      }
+    }
+    rememberClosedToolCallId(toolCallId) {
+      if (this.closedToolCallIds.size >= MAX_TRACKED_TOOL_ORIGINS) {
+        const oldest = this.closedToolCallIds.values().next().value;
+        if (oldest !== void 0) this.closedToolCallIds.delete(oldest);
+      }
+      this.closedToolCallIds.add(toolCallId);
+    }
+    rememberToolCallOrigin(toolCallId, active, item) {
+      if (this.toolCallOrigins.size >= MAX_TRACKED_TOOL_ORIGINS) {
+        const oldest = this.toolCallOrigins.keys().next().value;
+        if (oldest !== void 0) this.toolCallOrigins.delete(oldest);
+      }
+      this.toolCallOrigins.set(toolCallId, {
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        item
+      });
+    }
+    emitToolTerminal(params, identity, timestamp) {
+      const args = identity.tracked ? { value: identity.tracked.argsJson, truncated: identity.tracked.argsTruncated } : jsonText(params.args);
       const resultText = truncate2(params.resultText, MAX_TOOL_FIELD);
       const details = jsonText(params.result?.details);
       const item = baseTimelineItem({
-        sessionId: active.sessionId,
-        clientTurnId: active.clientTurnId,
-        itemId: tracked?.itemId || fallbackItemId,
+        sessionId: identity.sessionId,
+        clientTurnId: identity.clientTurnId,
+        itemId: identity.tracked?.itemId || identity.fallbackItemId,
         kind: "tool",
         status: params.isError ? "failed" : "succeeded",
-        timestamp: tracked?.startedAt ?? timestamp
+        timestamp: identity.startedAt
       });
       item.updatedAt = timestamp;
       item.completedAt = timestamp;
-      item.toolCallId = params.toolCallId || tracked?.toolCallId || "";
-      item.toolName = params.toolName || tracked?.toolName || "tool";
+      item.toolCallId = params.toolCallId || identity.tracked?.toolCallId || "";
+      item.toolName = params.toolName || identity.tracked?.toolName || "tool";
       item.summary = summary(resultText.value) || item.toolName;
       item.argsJson = args.value;
       item.resultText = resultText.value;
       item.detailsJson = details.value;
       item.isError = params.isError;
       item.isTruncated = args.truncated || resultText.truncated || details.truncated;
-      this.emitTimeline(item);
-      if (tracked) {
-        if (tracked.toolCallId) active.toolsByCallId.delete(tracked.toolCallId);
-        if (active.toolsByName.get(tracked.toolName || "tool") === tracked) {
-          active.toolsByName.delete(tracked.toolName || "tool");
-        }
+      const capturePath = /^absolutePath:\s*(.+?)\s*$/m.exec(params.resultText || "")?.[1];
+      if (params.toolName === "unity_screenshot" && capturePath) {
+        item.imagePath = capturePath;
       }
+      this.emitTimeline(item);
     }
     emitError(message, overrides = {}) {
       const active = this.active;
@@ -37926,17 +38538,59 @@ ${extensionSection.join("\n\n---\n\n")}
     finishTurn(outcome, stopReason) {
       const active = this.active;
       if (active?.terminalSent) return;
-      if (active) active.terminalSent = true;
+      if (active) {
+        active.terminalSent = true;
+        this.flushUnclosedTools(active);
+      }
+      if (!active) return;
       const payload = {
-        sessionId: active?.sessionId || this.getSessionId(),
-        clientTurnId: active?.clientTurnId || "",
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
         outcome,
         stopReason
       };
       this.bridge.sendToUnity("turn_finished", payload);
     }
     resetForSessionSwitch() {
+      const active = this.active;
+      if (active) {
+        if (!active.terminalSent) {
+          active.terminalSent = true;
+          this.flushUnclosedTools(active);
+        }
+        active.toolsByCallId.clear();
+        active.toolsByName.clear();
+      }
       this.active = null;
+    }
+    flushUnclosedTools(active) {
+      const timestamp = Date.now();
+      const seen = /* @__PURE__ */ new Set();
+      const pending = [
+        ...active.toolsByCallId.values(),
+        ...[...active.toolsByName.values()].flat()
+      ];
+      for (const tracked of pending) {
+        if (seen.has(tracked.itemId)) continue;
+        seen.add(tracked.itemId);
+        const item = baseTimelineItem({
+          sessionId: active.sessionId,
+          clientTurnId: active.clientTurnId,
+          itemId: tracked.itemId,
+          kind: "tool",
+          status: "aborted",
+          timestamp: tracked.startedAt
+        });
+        item.updatedAt = timestamp;
+        item.completedAt = timestamp;
+        item.toolCallId = tracked.toolCallId;
+        item.toolName = tracked.toolName || "tool";
+        item.summary = item.toolName;
+        item.argsJson = tracked.argsJson;
+        item.isTruncated = tracked.argsTruncated;
+        item.resultText = UNCLOSED_TOOL_NOTE;
+        this.emitTimeline(item);
+      }
     }
     emitTimeline(item) {
       this.bridge.sendToUnity("timeline_item", item);
@@ -37986,8 +38640,8 @@ ${extensionSection.join("\n\n---\n\n")}
       deps.setCurrentSession(await saveSession(deps.projectRoot, nextRecord));
       syncSessionInfo();
     }
-    async function persistCurrentSessionForRecoveryWithPendingUserMessage2(content, displayContent = content, clientTurnId = "") {
-      const pendingMessage = createRuntimeUserMessage(content, displayContent, clientTurnId);
+    async function persistCurrentSessionForRecoveryWithPendingUserMessage2(content, displayContent = content, clientTurnId = "", imageBlocks) {
+      const pendingMessage = createRuntimeUserMessage(content, displayContent, clientTurnId, Date.now(), imageBlocks);
       const nextRecord = {
         ...deps.getCurrentSession(),
         provider: deps.getProvider(),
@@ -38631,12 +39285,27 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         provider: trimmedProvider,
         baseUrl: trimmedBaseUrl,
         reasoning: false,
-        input: ["text"],
+        // Vision is the safe default for runtime-configured models: image
+        // blocks survive payload construction and providers without image
+        // support reject them loudly instead of the payload silently dropping
+        // attachments the user explicitly sent.
+        input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128e3,
         maxTokens: 8192
       }
     };
+  }
+  function normalizeRuntimeWebSearchMode(value) {
+    const normalized = String(value ?? "auto").trim().toLowerCase();
+    if (normalized === "responses" || normalized === "openai_responses") return "responses";
+    if (normalized === "off" || normalized === "disabled") return "off";
+    return "auto";
+  }
+  function applyRuntimeWebSearchOverride(model, mode) {
+    if (mode === "responses") return { ...model, webSearch: { type: "openai_responses" } };
+    if (mode === "off") return { ...model, webSearch: void 0 };
+    return model;
   }
   function resolveConfiguredModel(bridge2, provider, modelId, options = {}) {
     if (!provider || !modelId) return null;
@@ -39084,6 +39753,45 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   function stringField(value, key) {
     return isRecord12(value) && typeof value[key] === "string" ? value[key] : void 0;
   }
+  var MAX_IMAGE_ATTACHMENTS = 4;
+  var ALLOWED_IMAGE_MIME_TYPES = /* @__PURE__ */ new Set(["image/png", "image/jpeg"]);
+  var MAX_IMAGE_DECODED_BYTES = 15e5;
+  var MAX_TOTAL_IMAGE_DECODED_BYTES = 6e6;
+  var STRICT_BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+  function base64DecodedBytes(data2) {
+    const padding = data2.endsWith("==") ? 2 : data2.endsWith("=") ? 1 : 0;
+    return Math.floor(data2.length * 3 / 4) - padding;
+  }
+  function parseImageAttachments(raw) {
+    if (raw === void 0 || raw === null) return { images: [] };
+    if (!Array.isArray(raw)) return { images: [], error: "images must be an array of { data, mimeType }" };
+    const images = [];
+    let totalDecodedBytes = 0;
+    for (const [index, image] of raw.entries()) {
+      if (images.length >= MAX_IMAGE_ATTACHMENTS) {
+        return { images, error: `too many image attachments (max ${MAX_IMAGE_ATTACHMENTS})` };
+      }
+      if (!isRecord12(image) || typeof image.data !== "string" || typeof image.mimeType !== "string") {
+        return { images, error: `images[${index}] must be { data: string, mimeType: string }` };
+      }
+      if (!ALLOWED_IMAGE_MIME_TYPES.has(image.mimeType)) {
+        return { images, error: `images[${index}].mimeType must be image/png or image/jpeg` };
+      }
+      if (image.data.length === 0 || image.data.length % 4 !== 0 || !STRICT_BASE64_PATTERN.test(image.data)) {
+        return { images, error: `images[${index}].data is not valid padded base64` };
+      }
+      const decodedBytes = base64DecodedBytes(image.data);
+      if (decodedBytes > MAX_IMAGE_DECODED_BYTES) {
+        return { images, error: `images[${index}] exceeds the ${MAX_IMAGE_DECODED_BYTES} byte per-image limit` };
+      }
+      totalDecodedBytes += decodedBytes;
+      if (totalDecodedBytes > MAX_TOTAL_IMAGE_DECODED_BYTES) {
+        return { images, error: `image attachments exceed the ${MAX_TOTAL_IMAGE_DECODED_BYTES} byte total limit` };
+      }
+      images.push({ data: image.data, mimeType: image.mimeType });
+    }
+    return { images };
+  }
   function installUnityPublicApi(host) {
     globalThis.pie = {
       handleCSharpMessage: async function(action, data2) {
@@ -39093,6 +39801,19 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               const content = stringField(data2, "content") ?? String(data2);
               const displayContent = stringField(data2, "displayContent") ?? content;
               const clientTurnId = host.beginRuntimeChatTurn(displayContent, stringField(data2, "clientTurnId"));
+              const parsedImages = parseImageAttachments(data2?.images);
+              if (parsedImages.error) {
+                const message = `Invalid image attachments: ${parsedImages.error}`;
+                host.emitRuntimeError(message, {
+                  code: "INVALID_IMAGE_ATTACHMENTS",
+                  category: "input",
+                  retryable: false
+                });
+                host.bridge.sendToUnity("error", { message });
+                await host.finalizeRuntimeChatTurn("failed", "error");
+                break;
+              }
+              const images = parsedImages.images;
               if (!host.hasConfiguredModelSelection()) {
                 const message = host.getModelSelectionWarning();
                 host.emitRuntimeError(message, {
@@ -39111,10 +39832,10 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 await host.finalizeRuntimeChatTurn("completed", "stop");
                 break;
               }
-              await host.persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId);
+              await host.persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId, images);
               host.emitSessionSync();
               host.sessionTrace.noteDispatchStart({ mode: "unity" });
-              host.promptAgentWithRecovery(finalContent, displayContent, clientTurnId).catch(async (err) => {
+              host.promptAgentWithRecovery(finalContent, displayContent, clientTurnId, images).catch(async (err) => {
                 const msg = err instanceof Error ? err.message : String(err);
                 host.bridge.log("error", `[pie/index] agent.prompt rejected: ${msg}`);
                 host.emitRuntimeError(msg);
@@ -39133,8 +39854,10 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               const model = stringField(data2, "model") || "";
               const baseUrl = stringField(data2, "baseUrl");
               const verboseLogs = isRecord12(data2) && data2.verboseLogs === true;
+              const webSearchMode = stringField(data2, "webSearchMode");
               if (isRecord12(data2) && data2.verboseLogs !== void 0) host.setVerboseLogs(verboseLogs);
               host.setModelSelection(provider, model, apiKey, baseUrl);
+              if (webSearchMode !== void 0) host.setRuntimeWebSearchMode(webSearchMode);
               host.applyModelSelectionSync(provider, model);
               host.bridge.sendToUnity("config_applied", host.getModelStatus());
               host.persistCurrentSessionSafely();
@@ -39531,7 +40254,7 @@ ${initialAgentsFile}`);
       }
     };
   }
-  function encodeUtf8(text) {
+  function encodeUtf82(text) {
     if (typeof TextEncoder !== "undefined") {
       const bytes2 = new TextEncoder().encode(text);
       return bytes2.buffer.slice(bytes2.byteOffset, bytes2.byteOffset + bytes2.byteLength);
@@ -39573,16 +40296,22 @@ ${initialAgentsFile}`);
         body,
         signal: init?.signal ?? void 0
       });
-      const text = await response.text();
+      let textCache;
+      const text = async () => {
+        if (textCache === void 0) textCache = await response.text();
+        return textCache;
+      };
       return {
         ok: response.ok,
         status: response.status,
         statusText: response.statusText,
         headers: createHeaders(response.headers || {}),
         url,
-        arrayBuffer: async () => encodeUtf8(text),
-        text: async () => text,
-        json: async () => JSON.parse(text)
+        body: response.body ?? null,
+        readSSELines: response.readSSELines?.bind(response),
+        arrayBuffer: async () => encodeUtf82(await text()),
+        text,
+        json: async () => JSON.parse(await text())
       };
     });
   }
@@ -40007,10 +40736,18 @@ ${initialAgentsFile}`);
       }
       const isToolResult = messageRecord.role === "toolResult";
       const args = argsByCallId.get(String(messageRecord.toolCallId || ""));
-      const serializedContent = typeof messageRecord.content === "string" ? [{ type: "text", text: messageRecord.content }] : Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord14(block)).map((block) => ({
+      const serializedContent = typeof messageRecord.content === "string" ? [{ type: "text", text: messageRecord.content }] : Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord14(block)).map((block) => block.type === "toolCall" ? {
+        type: "toolCall",
+        text: typeof block.text === "string" ? block.text : "",
+        // Editor history uses these to render calls that never
+        // received a toolResult (interrupted runs).
+        toolCallId: typeof block.id === "string" ? block.id : "",
+        toolName: typeof block.name === "string" ? block.name : "",
+        argsJson: JSON.stringify(block.arguments ?? {})
+      } : {
         type: String(block.type || "text"),
         text: typeof block.text === "string" ? block.text : ""
-      })) : [];
+      }) : [];
       return {
         role: String(messageRecord.role || "assistant"),
         timestamp: typeof messageRecord.timestamp === "number" ? messageRecord.timestamp : 0,
@@ -40047,6 +40784,7 @@ ${initialAgentsFile}`);
   var _modelId = _initialSelection?.modelId || "";
   var _baseUrlOverride = "";
   var _runtimeApiKeyOverride = "";
+  var _runtimeWebSearchMode = "auto";
   var _verboseLogs = false;
   var _currentSession = createSessionRecord({
     provider: _provider,
@@ -40077,15 +40815,10 @@ ${initialAgentsFile}`);
   function resolveModelWithRuntimeOverrides(provider, modelId) {
     const resolved = resolveConfiguredModel(bridge, provider, modelId, { allowMissingApiKey: !!_runtimeApiKeyOverride });
     const baseUrl = _baseUrlOverride.trim();
-    if (!resolved) return createRuntimeConfiguredModel(provider, modelId, baseUrl);
-    if (!baseUrl) return resolved;
-    return {
-      ...resolved,
-      model: {
-        ...resolved.model,
-        baseUrl
-      }
-    };
+    const base = resolved || createRuntimeConfiguredModel(provider, modelId, baseUrl);
+    if (!base) return null;
+    const modelWithBaseUrl = baseUrl ? { ...base.model, baseUrl } : base.model;
+    return { ...base, model: applyRuntimeWebSearchOverride(modelWithBaseUrl, _runtimeWebSearchMode) };
   }
   var { webSearchTool, webFetchTool, webResearchTool } = createUnityWebTools({
     getActiveModel,
@@ -40221,8 +40954,8 @@ ${initialAgentsFile}`);
   async function persistCurrentSessionForRecovery() {
     await serializeSessionPersistence(() => sessionRuntime.persistCurrentSessionForRecovery());
   }
-  async function persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId) {
-    await serializeSessionPersistence(() => sessionRuntime.persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId));
+  async function persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId, imageBlocks) {
+    await serializeSessionPersistence(() => sessionRuntime.persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId, imageBlocks));
   }
   function cancelActivePromptForSessionSwitch() {
     agent.abort();
@@ -40241,9 +40974,9 @@ ${initialAgentsFile}`);
     const message = error instanceof Error ? error.message : String(error || "");
     return /already processing a prompt/i.test(message) && !isAgentActivelyProcessing();
   }
-  async function promptAgentWithRecovery(input, displayContent, clientTurnId) {
+  async function promptAgentWithRecovery(input, displayContent, clientTurnId, imageBlocks) {
     let recoveredStaleLock = false;
-    const promptInput = displayContent !== void 0 || clientTurnId !== void 0 ? createRuntimeUserMessage(input, displayContent ?? input, clientTurnId ?? runtimeChat.activeClientTurnId) : input;
+    const promptInput = displayContent !== void 0 || clientTurnId !== void 0 ? createRuntimeUserMessage(input, displayContent ?? input, clientTurnId ?? runtimeChat.activeClientTurnId, Date.now(), imageBlocks) : input;
     while (true) {
       try {
         await agentSessionController.prompt(promptInput, {
@@ -40382,7 +41115,12 @@ ${initialAgentsFile}`);
       updatedAt: sourceRecord.updatedAt,
       messageCount: messages.length,
       messages,
-      timelineItems: buildRuntimeTimelineItems(sourceRecord.id, stateMessages, sourceRecord.createdAt),
+      timelineItems: buildRuntimeTimelineItems(
+        sourceRecord.id,
+        stateMessages,
+        sourceRecord.createdAt,
+        sourceRecord.id === _currentSession?.id ? runtimeChat.activeClientTurnId : void 0
+      ),
       todoState: Array.isArray(sourceRecord.todoState) ? sourceRecord.todoState : todoTool.getState()
     });
   }
@@ -40541,6 +41279,10 @@ ${initialAgentsFile}`);
       if (baseUrl !== void 0) _baseUrlOverride = String(baseUrl || "");
       _provider = nextProvider;
       _modelId = nextModelId;
+    },
+    setRuntimeWebSearchMode: (mode) => {
+      _runtimeWebSearchMode = normalizeRuntimeWebSearchMode(mode);
+      rebuildAgentSurface();
     }
   });
 })();

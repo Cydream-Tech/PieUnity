@@ -4,6 +4,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using UnityEngine;
 using UnityEditor;
 
@@ -54,6 +55,8 @@ namespace Pie.Editor
         private const string PREF_SHOW_LOGS    = "Pie_ShowLogs";
         private const string PREF_VERBOSE_LOGS = "Pie_VerboseLogs";
         private const string PREF_AUTO_RESUME  = "Pie_AutoResume";
+        private const string PREF_WEB_SEARCH_MODE = "Pie_WebSearchMode";
+        private const string PREF_AUTO_RESEND = "Pie_AutoResendInterrupted";
 
         private string _apiKey    = "";
         private string _provider  = "openai";
@@ -64,6 +67,11 @@ namespace Pie.Editor
         private bool   _showLogs = false;
         private bool   _verboseLogs = false;
         private bool   _autoResume = true;
+        private string _webSearchMode = "auto";
+        private bool   _autoResendInterrupted = false;
+        private string _pendingAutoResendText = null;
+        private string _pendingAutoResendSessionId = null;
+        private bool   _autoResendArmed;
 
         [Serializable]
         private class DevTextPayload
@@ -79,6 +87,7 @@ namespace Pie.Editor
             public string provider;
             public string model;
             public string baseUrl;
+            public string webSearchMode;
         }
 
         [Serializable]
@@ -222,6 +231,11 @@ namespace Pie.Editor
             {
                 window._provider = payload.provider;
                 EditorPrefs.SetString(PREF_PROVIDER, window._provider);
+            }
+            if (payload.webSearchMode != null)
+            {
+                window._webSearchMode = payload.webSearchMode;
+                EditorPrefs.SetString(PREF_WEB_SEARCH_MODE, window._webSearchMode);
             }
             if (payload.model != null)
             {
@@ -400,6 +414,8 @@ namespace Pie.Editor
             _showLogs = EditorPrefs.GetBool(PREF_SHOW_LOGS, false);
             _verboseLogs = EditorPrefs.GetBool(PREF_VERBOSE_LOGS, false);
             _autoResume = EditorPrefs.GetBool(PREF_AUTO_RESUME, true);
+            _webSearchMode = EditorPrefs.GetString(PREF_WEB_SEARCH_MODE, "auto");
+            _autoResendInterrupted = EditorPrefs.GetBool(PREF_AUTO_RESEND, false);
             PieDiagnostics.CurrentLevel = _verboseLogs ? PieLogLevel.Verbose : PieLogLevel.Info;
             AssemblyReloadEvents.beforeAssemblyReload -= HandleBeforeAssemblyReload;
             AssemblyReloadEvents.beforeAssemblyReload += HandleBeforeAssemblyReload;
@@ -419,6 +435,7 @@ namespace Pie.Editor
             PieHostBridge.Unregister("pie.interaction");
             if (_currentWindow == this)
                 _currentWindow = null;
+            ClearThumbnailCache();
             DisposeBridge();
         }
 
@@ -977,6 +994,25 @@ namespace Pie.Editor
                 _autoResume = newAutoResume;
                 EditorPrefs.SetBool(PREF_AUTO_RESUME, _autoResume);
             }
+            var newAutoResend = EditorGUILayout.ToggleLeft(
+                new GUIContent("Auto-resend interrupted turn", "After a C# reload interrupts a streaming response, automatically resend the last prompt once (opt-in; non-idempotent tools may run again)."),
+                _autoResendInterrupted);
+            if (newAutoResend != _autoResendInterrupted)
+            {
+                _autoResendInterrupted = newAutoResend;
+                EditorPrefs.SetBool(PREF_AUTO_RESEND, _autoResendInterrupted);
+            }
+            var webSearchLabels = new[] { "Web Search: Auto (models.json)", "Web Search: Built-in (responses)", "Web Search: Off" };
+            var webSearchValues = new[] { "auto", "responses", "off" };
+            var webSearchIndex = Array.IndexOf(webSearchValues, _webSearchMode);
+            if (webSearchIndex < 0) webSearchIndex = 0;
+            var newWebSearchIndex = EditorGUILayout.Popup(webSearchIndex, webSearchLabels);
+            if (newWebSearchIndex != webSearchIndex)
+            {
+                _webSearchMode = webSearchValues[newWebSearchIndex];
+                EditorPrefs.SetString(PREF_WEB_SEARCH_MODE, _webSearchMode);
+                PushSettings();
+            }
 
             _sessionsScrollPos = EditorGUILayout.BeginScrollView(_sessionsScrollPos, GUILayout.Height(140));
             if (_sessions.Count == 0)
@@ -1175,6 +1211,163 @@ namespace Pie.Editor
             GUILayout.Space(4f);
         }
 
+        // ─── Tool image thumbnails ─────────────────────────────────────────
+
+        private static readonly Dictionary<string, Texture2D> ThumbnailCache = new Dictionary<string, Texture2D>();
+        private static readonly List<string> ThumbnailOrder = new List<string>();
+        private const int ThumbnailCacheCap = 12;
+        private const float ThumbnailMaxWidth = 320f;
+
+        private static void ClearThumbnailCache()
+        {
+            foreach (var texture in ThumbnailCache.Values)
+                if (texture != null) UnityEngine.Object.DestroyImmediate(texture);
+            ThumbnailCache.Clear();
+            ThumbnailOrder.Clear();
+        }
+
+        private static Texture2D GetThumbnail(string path)
+        {
+            if (ThumbnailCache.TryGetValue(path, out var cached) && cached != null)
+            {
+                ThumbnailOrder.Remove(path);
+                ThumbnailOrder.Add(path);
+                return cached;
+            }
+            if (ThumbnailCache.ContainsKey(path)) ThumbnailCache.Remove(path);
+
+            byte[] bytes;
+            try { bytes = File.ReadAllBytes(path); }
+            catch { return null; }
+            var full = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+            if (!full.LoadImage(bytes))
+            {
+                UnityEngine.Object.DestroyImmediate(full);
+                return null;
+            }
+            var targetWidth = Mathf.Clamp(full.width, 1, (int)ThumbnailMaxWidth);
+            var targetHeight = Mathf.Max(1, Mathf.RoundToInt(full.height * (targetWidth / (float)full.width)));
+            var temp = RenderTexture.GetTemporary(targetWidth, targetHeight, 0, RenderTextureFormat.ARGB32);
+            var previous = RenderTexture.active;
+            Texture2D thumb = null;
+            try
+            {
+                Graphics.Blit(full, temp);
+                RenderTexture.active = temp;
+                thumb = new Texture2D(targetWidth, targetHeight, TextureFormat.RGBA32, false);
+                thumb.ReadPixels(new Rect(0, 0, targetWidth, targetHeight), 0, 0);
+                thumb.Apply(false);
+            }
+            catch
+            {
+                if (thumb != null) UnityEngine.Object.DestroyImmediate(thumb);
+                throw;
+            }
+            finally
+            {
+                RenderTexture.active = previous;
+                RenderTexture.ReleaseTemporary(temp);
+                UnityEngine.Object.DestroyImmediate(full);
+            }
+
+            ThumbnailCache[path] = thumb;
+            ThumbnailOrder.Add(path);
+            while (ThumbnailOrder.Count > ThumbnailCacheCap)
+            {
+                var oldest = ThumbnailOrder[0];
+                ThumbnailOrder.RemoveAt(0);
+                if (ThumbnailCache.TryGetValue(oldest, out var evicted))
+                {
+                    ThumbnailCache.Remove(oldest);
+                    if (evicted != null) UnityEngine.Object.DestroyImmediate(evicted);
+                }
+            }
+            return thumb;
+        }
+
+        private static void DrawMessageThumbnail(ChatMessage msg, float maxWidth)
+        {
+            if (string.IsNullOrEmpty(msg.ImagePath) || !File.Exists(msg.ImagePath))
+                return;
+            var thumb = GetThumbnail(msg.ImagePath);
+            if (thumb == null)
+                return;
+            var width = Mathf.Min(maxWidth, thumb.width);
+            var height = Mathf.Max(1f, thumb.height * (width / thumb.width));
+            var rect = GUILayoutUtility.GetRect(width, height, GUILayout.ExpandWidth(false));
+            GUI.DrawTexture(rect, thumb, ScaleMode.ScaleToFit);
+            var current = Event.current;
+            if (current != null && current.type == EventType.MouseDown && rect.Contains(current.mousePosition))
+            {
+                EditorUtility.RevealInFinder(msg.ImagePath);
+                current.Use();
+            }
+        }
+
+        /// <summary>
+        /// Resolves a local image for tool cards: unity_screenshot results carry
+        /// an absolutePath line; read_file image args carry a persistent-root
+        /// relative path.
+        /// </summary>
+        private static string TryExtractToolImagePath(string toolName, string argsJson, string resultText)
+        {
+            if (string.IsNullOrEmpty(toolName))
+                return null;
+            if (toolName == "unity_screenshot")
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(resultText ?? "", @"(?m)^absolutePath:\s*(.+?)\s*$");
+                if (match.Success)
+                {
+                    var candidate = match.Groups[1].Value;
+                    if (File.Exists(candidate)) return candidate;
+                }
+                return null;
+            }
+            if (toolName == "read_file")
+            {
+                var pathMatch = System.Text.RegularExpressions.Regex.Match(argsJson ?? "", @"""path""\s*:\s*""([^""]+)""");
+                var rootMatch = System.Text.RegularExpressions.Regex.Match(argsJson ?? "", @"""root""\s*:\s*""([^""]+)""");
+                if (!pathMatch.Success) return null;
+                var relative = pathMatch.Groups[1].Value;
+                var root = rootMatch.Success ? rootMatch.Groups[1].Value : "";
+                if (!(relative.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
+                    || relative.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase)
+                    || relative.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase)))
+                    return null;
+                if (!string.Equals(root, "persistent", StringComparison.OrdinalIgnoreCase))
+                    return null;
+                var absolute = ResolvePersistentRelativePath(relative);
+                return absolute != null && File.Exists(absolute) ? absolute : null;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Resolves a persistent-root relative path, rejecting traversal: the
+        /// canonical result must stay inside Application.persistentDataPath
+        /// (tool-provided paths are model output, not trusted input).
+        /// </summary>
+        private static string ResolvePersistentRelativePath(string relative)
+        {
+            if (string.IsNullOrEmpty(relative)) return null;
+            var normalized = relative.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+            if (Path.IsPathRooted(normalized)) return null;
+            string root;
+            string absolute;
+            try
+            {
+                root = Path.GetFullPath(Application.persistentDataPath);
+                absolute = Path.GetFullPath(Path.Combine(root, normalized));
+            }
+            catch
+            {
+                return null;
+            }
+            if (!root.EndsWith(Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal))
+                root += Path.DirectorySeparatorChar;
+            return absolute.StartsWith(root, StringComparison.OrdinalIgnoreCase) ? absolute : null;
+        }
+
         private void DrawMessage(ChatMessage msg)
         {
             var isTool = msg.Role == "tool" || msg.Role == "toolResult";
@@ -1222,6 +1415,7 @@ namespace Pie.Editor
                     if (summary.Length > 180) summary = summary.Substring(0, 177) + "…";
                     DrawSelectableText(summary, EditorStyles.wordWrappedMiniLabel);
                 }
+                DrawMessageThumbnail(msg, width);
                 if (msg.IsExpanded)
                 {
                     GUILayout.Space(8);
@@ -1255,6 +1449,7 @@ namespace Pie.Editor
 
             DrawInlineStatusBar();
             DrawPendingInteractionPanel();
+            DrawPendingImageAttachments();
 
             EditorGUILayout.BeginHorizontal();
             GUI.SetNextControlName("PieInput");
@@ -1268,6 +1463,13 @@ namespace Pie.Editor
             var estimatedInputTokens = EstimateTextTokens(_inputText);
 
             EditorGUILayout.BeginVertical(GUILayout.Width(60));
+            if (GUILayout.Button(new GUIContent("Img", "Attach images to the next message"), EditorStyles.miniButton, GUILayout.Width(55), GUILayout.Height(18)))
+            {
+                var picked = EditorUtility.OpenFilePanelWithFilters("Attach image", "", new[] { "Image files", "png,jpg,jpeg" });
+                if (!string.IsNullOrEmpty(picked) && _pendingImagePaths.Count < MaxImageAttachments)
+                    _pendingImagePaths.Add(picked);
+                GUI.FocusControl("PieInput");
+            }
             GUI.enabled = canSend;
             if (GUILayout.Button("Send", GUILayout.Width(55), GUILayout.Height(40)))
             {
@@ -1530,17 +1732,138 @@ namespace Pie.Editor
         }
 
         // ─── Messaging ────────────────────────────────────────────────────────
+        private const int MaxImageAttachments = 4;
+        private const int MaxImageEdge = 1568;
+        private readonly List<string> _pendingImagePaths = new List<string>();
+
+        private void DrawPendingImageAttachments()
+        {
+            if (_pendingImagePaths.Count == 0)
+                return;
+            EditorGUILayout.BeginHorizontal();
+            var snapshot = new List<string>(_pendingImagePaths);
+            foreach (var path in snapshot)
+            {
+                var name = System.IO.Path.GetFileName(path);
+                if (GUILayout.Button($"📎 {name} ✕", EditorStyles.miniButton))
+                    _pendingImagePaths.Remove(path);
+            }
+            EditorGUILayout.EndHorizontal();
+        }
+
+        private sealed class ImageAttachment
+        {
+            public string base64;
+            public string mimeType;
+            public int width;
+            public int height;
+        }
+
+        /// <summary>
+        /// Loads an image for sending: passes small images through untouched,
+        /// downscales oversized ones to the model-friendly edge and re-encodes
+        /// as JPEG to keep the bridge payload bounded.
+        /// </summary>
+        private static ImageAttachment PrepareImageAttachment(string path)
+        {
+            var bytes = File.ReadAllBytes(path);
+            var isJpeg = path.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase)
+                || path.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase);
+            var texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+            if (!texture.LoadImage(bytes))
+            {
+                UnityEngine.Object.DestroyImmediate(texture);
+                return null;
+            }
+            try
+            {
+                var longest = Mathf.Max(texture.width, texture.height);
+                if (bytes.Length <= 1_500_000 && longest <= MaxImageEdge)
+                {
+                    return new ImageAttachment
+                    {
+                        base64 = Convert.ToBase64String(bytes),
+                        mimeType = isJpeg ? "image/jpeg" : "image/png",
+                        width = texture.width,
+                        height = texture.height,
+                    };
+                }
+                var scale = Mathf.Min(1f, MaxImageEdge / (float)longest);
+                var w = Mathf.Max(1, Mathf.RoundToInt(texture.width * scale));
+                var h = Mathf.Max(1, Mathf.RoundToInt(texture.height * scale));
+                var temp = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32);
+                var previous = RenderTexture.active;
+                Texture2D resized = null;
+                try
+                {
+                    Graphics.Blit(texture, temp);
+                    RenderTexture.active = temp;
+                    resized = new Texture2D(w, h, TextureFormat.RGBA32, false);
+                    resized.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+                    resized.Apply(false);
+                    var encoded = resized.EncodeToJPG(85);
+                    return new ImageAttachment
+                    {
+                        base64 = Convert.ToBase64String(encoded),
+                        mimeType = "image/jpeg",
+                        width = w,
+                        height = h,
+                    };
+                }
+                finally
+                {
+                    // Encode runs inside the try so the temporary texture is
+                    // destroyed on every path, including encoding failures.
+                    if (resized != null) UnityEngine.Object.DestroyImmediate(resized);
+                    RenderTexture.active = previous;
+                    RenderTexture.ReleaseTemporary(temp);
+                }
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(texture);
+            }
+        }
+
         private void SendMessage()
         {
-            if (string.IsNullOrWhiteSpace(_inputText)) return;
+            if (string.IsNullOrWhiteSpace(_inputText) && _pendingImagePaths.Count == 0) return;
             if (_bridge?.IsInitialized != true) return;
 
-            var text = _inputText.Trim();
-            AddMessage("user", text);
+            var text = string.IsNullOrWhiteSpace(_inputText) ? "(see attached images)" : _inputText.Trim();
+            var attachments = new List<ImageAttachment>();
+            var failedAttachments = 0;
+            foreach (var path in _pendingImagePaths)
+            {
+                try
+                {
+                    var attachment = PrepareImageAttachment(path);
+                    if (attachment != null) attachments.Add(attachment);
+                    else failedAttachments += 1;
+                }
+                catch (Exception ex)
+                {
+                    PieDiagnostics.Warning($"[Chat] Failed to load image {path}: {ex.Message}");
+                    failedAttachments += 1;
+                }
+            }
+            _pendingImagePaths.Clear();
+
+            var displayText = attachments.Count > 0
+                ? $"{text}\n📎 {attachments.Count} image(s) attached"
+                : text;
+            AddMessage("user", displayText);
 
             var escaped = text.Replace("\\", "\\\\").Replace("\"", "\\\"")
                               .Replace("\n", "\\n").Replace("\r", "\\r");
-            var json = $"{{\"content\":\"{escaped}\"}}";
+            var json = $"{{\"content\":\"{escaped}\"";
+            if (attachments.Count > 0)
+            {
+                json += ",\"images\":";
+                json += "[" + string.Join(",", attachments.ConvertAll(a =>
+                    $"{{\"data\":\"{a.base64}\",\"mimeType\":\"{a.mimeType}\",\"width\":{a.width},\"height\":{a.height}}}")) + "]";
+            }
+            json += "}";
 
             _isStreaming = true;
             _statusText = "Thinking...";
@@ -1607,7 +1930,10 @@ namespace Pie.Editor
                 case "tool_start":      HandleToolStart(json);     break;
                 case "tool_end":        HandleToolEnd(json);       break;
                 case "turn_end":        HandleTurnEnd(json);        break;
-                case "session_sync":    HandleSessionSync(json);    break;
+                case "session_sync":
+                    HandleSessionSync(json);
+                    TryDispatchPendingAutoResend();
+                    break;
                 case "skills_list":     HandleSkillsList(json);     break;
                 case "config_applied":  HandleConfigApplied(json);  break;
                 case "error":           HandleError(json);          break;
@@ -1834,6 +2160,9 @@ namespace Pie.Editor
             }
 
             toolMessage.IsRunning = false;
+            var extractedImage = TryExtractToolImagePath(toolName, argsJson, resultText);
+            if (!string.IsNullOrEmpty(extractedImage))
+                toolMessage.ImagePath = extractedImage;
             if (HasMeaningfulArgs(argsJson))
             {
                 toolMessage.ArgsText = argsJson;
@@ -1909,6 +2238,12 @@ namespace Pie.Editor
 
                 if (payload?.messages != null)
                 {
+                    var toolResultCallIds = new HashSet<string>();
+                    foreach (var prior in payload.messages)
+                    {
+                        if (prior != null && prior.role == "toolResult" && !string.IsNullOrEmpty(prior.toolCallId))
+                            toolResultCallIds.Add(prior.toolCallId);
+                    }
                     foreach (var message in payload.messages)
                     {
                         var role = string.IsNullOrEmpty(message.role) ? "assistant" : message.role;
@@ -1920,7 +2255,13 @@ namespace Pie.Editor
                         if (role == "user" && !string.IsNullOrEmpty(message.displayContent))
                             content = message.displayContent;
                         if (role == "assistant" && string.IsNullOrEmpty(content) && message.stopReason == "toolUse")
+                        {
+                            // Tool-only assistant shells normally render through their
+                            // toolResult card. A call that never received a result
+                            // (interrupted run, reload) must stay visible.
+                            AddInterruptedToolCalls(message, toolResultCallIds);
                             continue;
+                        }
                         if (string.IsNullOrEmpty(content) && !string.IsNullOrEmpty(message.errorMessage))
                             content = $"⚠ {message.errorMessage}";
                         if (string.IsNullOrEmpty(content) && !string.IsNullOrEmpty(message.stopReason))
@@ -1930,6 +2271,7 @@ namespace Pie.Editor
                             Title = isToolResult ? message.toolName : "",
                             ToolName = message.toolName,
                             ToolCallId = message.toolCallId,
+                            ImagePath = isToolResult ? TryExtractToolImagePath(message.toolName, argsJson ?? "", content ?? "") : null,
                             ArgsText = argsJson ?? "",
                             ArgsSummary = BuildArgsSummary(argsJson ?? ""),
                             Summary = isToolResult
@@ -1945,6 +2287,13 @@ namespace Pie.Editor
                             TotalTokens = message.usage != null ? message.usage.totalTokens : (role == "user" ? EstimateTextTokens(content) : 0),
                             IsEstimatedUsage = message.usage != null && message.usage.estimated,
                         });
+                        if (role == "assistant")
+                        {
+                            // A streamed assistant message can carry text plus tool calls
+                            // whose run was interrupted before any result was recorded;
+                            // those calls must still be visible after the text card.
+                            AddInterruptedToolCalls(message, toolResultCallIds);
+                        }
                     }
                 }
 
@@ -2186,8 +2535,9 @@ namespace Pie.Editor
 
             var escaped = _apiKey.Replace("\\", "\\\\").Replace("\"", "\\\"");
             var escapedBaseUrl = _baseUrl.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            var escapedWebSearchMode = (_webSearchMode ?? "auto").Replace("\\", "\\\\").Replace("\"", "\\\"");
             var verboseLogs = _verboseLogs ? "true" : "false";
-            var json = $"{{\"apiKey\":\"{escaped}\",\"provider\":\"{_provider}\",\"model\":\"{_model}\",\"baseUrl\":\"{escapedBaseUrl}\",\"verboseLogs\":{verboseLogs}}}";
+            var json = $"{{\"apiKey\":\"{escaped}\",\"provider\":\"{_provider}\",\"model\":\"{_model}\",\"baseUrl\":\"{escapedBaseUrl}\",\"webSearchMode\":\"{escapedWebSearchMode}\",\"verboseLogs\":{verboseLogs}}}";
             _bridge.SendToJs("set_config", json);
         }
 
@@ -2776,6 +3126,53 @@ namespace Pie.Editor
             return false;
         }
 
+        private void TryDispatchPendingAutoResend()
+        {
+            if (!_autoResendArmed || string.IsNullOrEmpty(_pendingAutoResendText))
+                return;
+            if (_bridge?.IsInitialized != true || _isStreaming)
+                return;
+            // Only dispatch once the session we armed for is the active one:
+            // an early or foreign session_sync must not trigger the resend
+            // while the target session is still being restored.
+            if (!string.IsNullOrEmpty(_pendingAutoResendSessionId)
+                && _pendingAutoResendSessionId != _activeSessionId)
+                return;
+
+            // One automatic resend per session: repeated reloads during the
+            // resent turn fall back to restoring the input box instead of
+            // looping.
+            var alreadyResent = PieChatSessionRecovery.GetAutoResendSessionId();
+            var sessionId = PieChatSessionRecovery.GetLastKnownActiveSession();
+            if (!string.IsNullOrEmpty(alreadyResent) && alreadyResent == sessionId)
+            {
+                _inputText = _pendingAutoResendText;
+                _pendingAutoResendText = null;
+                _autoResendArmed = false;
+                _pendingRecoveryNotice = "Interrupted turn restored to the input box (auto-resend already used for this session).";
+                AddSystemMessage(_pendingRecoveryNotice);
+                _pendingRecoveryNotice = "";
+                return;
+            }
+
+            var text = _pendingAutoResendText;
+            _pendingAutoResendText = null;
+            _autoResendArmed = false;
+            _pendingAutoResendSessionId = null;
+            if (!string.IsNullOrEmpty(sessionId))
+                PieChatSessionRecovery.SetAutoResendSessionId(sessionId);
+            AddSystemMessage($"↻ Auto-resending interrupted prompt: {TruncateForSystem(text)}");
+            var escaped = text.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            _bridge.SendToJs("send_message", $"{{\"content\":\"{escaped}\"}}");
+            RefreshSessions();
+        }
+
+        private static string TruncateForSystem(string value)
+        {
+            var text = value ?? "";
+            return text.Length <= 120 ? text : text.Substring(0, 120) + "…";
+        }
+
         private void TryRestoreRecoverySnapshot()
         {
             try
@@ -2808,10 +3205,24 @@ namespace Pie.Editor
                     var restoredInput = IsRestorableInputText(snapshot.draftInputText)
                         ? snapshot.draftInputText
                         : (IsRestorableInputText(snapshot.lastUserMessageText) ? snapshot.lastUserMessageText : "");
-                    if (!string.IsNullOrEmpty(restoredInput))
+                    var autoResendAlreadyUsed = !string.IsNullOrEmpty(snapshot.activeSessionId)
+                        && PieChatSessionRecovery.GetAutoResendSessionId() == snapshot.activeSessionId;
+                    if (!string.IsNullOrEmpty(restoredInput) && _autoResendInterrupted && !autoResendAlreadyUsed)
+                    {
+                        // Defer dispatching until the session restore finishes
+                        // (the next session_sync), so the resent prompt lands in
+                        // the restored session instead of a fresh one.
+                        _pendingAutoResendText = restoredInput;
+                        _autoResendArmed = true;
+                        _pendingAutoResendSessionId = snapshot.activeSessionId;
+                        _pendingRecoveryNotice = "Previous response was interrupted by C# compilation; the prompt will be resent automatically once the session is restored.";
+                    }
+                    else if (!string.IsNullOrEmpty(restoredInput))
                     {
                         _inputText = restoredInput;
-                        _pendingRecoveryNotice = "Previous response was interrupted by C# compilation. The last prompt has been restored to the input box.";
+                        _pendingRecoveryNotice = autoResendAlreadyUsed
+                            ? "Previous response was interrupted by C# compilation. The prompt was restored to the input box (auto-resend already used for this session)."
+                            : "Previous response was interrupted by C# compilation. The last prompt has been restored to the input box.";
                     }
                     else
                     {
@@ -2872,6 +3283,28 @@ namespace Pie.Editor
             return "";
         }
 
+        private void AddInterruptedToolCalls(SessionSyncMessage message, HashSet<string> toolResultCallIds)
+        {
+            if (message?.content == null) return;
+            foreach (var block in message.content)
+            {
+                if (block == null || block.type != "toolCall") continue;
+                if (!string.IsNullOrEmpty(block.toolCallId) && toolResultCallIds.Contains(block.toolCallId))
+                    continue;
+                var toolName = string.IsNullOrEmpty(block.toolName) ? "tool" : block.toolName;
+                _messages.Add(new ChatMessage("tool", "⚠ Interrupted — the run ended before this tool reported a result.")
+                {
+                    Title = toolName,
+                    ToolName = toolName,
+                    ToolCallId = block.toolCallId ?? "",
+                    ArgsText = block.argsJson ?? "",
+                    ArgsSummary = BuildArgsSummary(block.argsJson ?? ""),
+                    Summary = "Interrupted",
+                    IsError = true,
+                });
+            }
+        }
+
         private string FlattenSessionContent(SessionSyncMessage message)
         {
             if (message?.content == null || message.content.Length == 0)
@@ -2901,6 +3334,7 @@ namespace Pie.Editor
             public string ArgsSummary;
             public string ToolName;
             public string ToolCallId;
+            public string ImagePath;
             public int InputTokens;
             public int OutputTokens;
             public int CacheReadTokens;
@@ -3033,6 +3467,9 @@ namespace Pie.Editor
         {
             public string type;
             public string text;
+            public string toolCallId;
+            public string toolName;
+            public string argsJson;
         }
 
         private class PendingInteraction

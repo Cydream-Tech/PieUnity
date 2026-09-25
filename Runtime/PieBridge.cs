@@ -242,6 +242,31 @@ namespace Pie
 
         private string LoadCoreJs()
         {
+#if UNITY_EDITOR
+            // In the editor, prefer reading the package source file directly:
+            // content edits to file: package assets (which live outside the
+            // project folder) do not reliably trigger re-import, so the
+            // imported TextAsset can lag behind the built bundle.
+            var editorPackageInfo = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(PieBridge).Assembly);
+            var editorPackagePath = editorPackageInfo != null ? editorPackageInfo.resolvedPath : "";
+            if (!string.IsNullOrEmpty(editorPackagePath))
+            {
+                var sourcePath = Path.Combine(editorPackagePath, "Resources", "pie", "core.bytes");
+                if (File.Exists(sourcePath))
+                {
+                    try
+                    {
+                        var sourceContent = File.ReadAllText(sourcePath);
+                        PieDiagnostics.Verbose($"Loaded bundled Pie runtime from package source: {sourcePath}");
+                        return sourceContent;
+                    }
+                    catch (Exception ex)
+                    {
+                        PieDiagnostics.Warning($"Failed to read package source {sourcePath}: {ex.Message}");
+                    }
+                }
+            }
+#endif
             var textAsset = Resources.Load<TextAsset>("pie/core");
             if (textAsset != null)
             {
