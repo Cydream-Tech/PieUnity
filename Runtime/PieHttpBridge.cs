@@ -422,7 +422,10 @@ namespace Pie
             };
             var client = new HttpClient(handler)
             {
-                Timeout = TimeSpan.FromSeconds(180)
+                // SSE streams can legitimately run for many minutes on long
+                // LLM turns; the JS readSSELines enforces its own per-chunk
+                // idle timeout, so the transport cap just needs to be generous.
+                Timeout = TimeSpan.FromSeconds(600)
             };
             client.DefaultRequestHeaders.Accept.Add(
                 new MediaTypeWithQualityHeaderValue("application/json"));
@@ -885,7 +888,7 @@ namespace Pie
                 request.disposeDownloadHandlerOnDispose = true;
                 request.disposeUploadHandlerOnDispose = true;
                 request.useHttpContinue = false;
-                request.timeout = 180;
+                request.timeout = 600;
 
                 foreach (var kv in parsedHeaders)
                 {
@@ -1176,8 +1179,8 @@ namespace Pie
             request.Method = method;
             request.ProtocolVersion = HttpVersion.Version10;
             request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
-            request.Timeout = (int)TimeSpan.FromSeconds(180).TotalMilliseconds;
-            request.ReadWriteTimeout = (int)TimeSpan.FromSeconds(180).TotalMilliseconds;
+            request.Timeout = (int)TimeSpan.FromSeconds(600).TotalMilliseconds;
+            request.ReadWriteTimeout = (int)TimeSpan.FromSeconds(600).TotalMilliseconds;
             request.KeepAlive = false;
             request.Proxy = null;
             request.ServicePoint.Expect100Continue = false;

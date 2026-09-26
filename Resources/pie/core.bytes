@@ -39843,12 +39843,172 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }
   }
 
-  // src/unity-public-api.ts
+  // src/session-message-utils.ts
   function isRecord12(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  }
+  function hasRealUsage(usage) {
+    if (!isRecord12(usage)) return false;
+    return Number(usage.input || 0) > 0 || Number(usage.output || 0) > 0 || Number(usage.cacheRead || 0) > 0 || Number(usage.cacheWrite || 0) > 0 || Number(usage.totalTokens || 0) > 0;
+  }
+  function estimateTokensFromText(text) {
+    const normalized = (text || "").trim();
+    if (!normalized) return 0;
+    return Math.max(1, Math.ceil(normalized.length / 4));
+  }
+  function collectMessageText(message) {
+    if (!message) return "";
+    if (!isRecord12(message)) return "";
+    const content = message.content;
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content.map((block) => {
+      if (!isRecord12(block)) return "";
+      if (block.type === "text") return typeof block.text === "string" ? block.text : "";
+      if (block.type === "thinking") return typeof block.thinking === "string" ? block.thinking : "";
+      if (block.type === "toolCall") {
+        const name = typeof block.name === "string" ? block.name : "";
+        const args = block.arguments !== void 0 ? JSON.stringify(block.arguments) : "";
+        return `${name}${args}`;
+      }
+      return "";
+    }).join("");
+  }
+  function buildUsagePayload(messages, message, fallbackIndex) {
+    const messageRecord = isRecord12(message) ? message : {};
+    const usage = messageRecord.usage;
+    if (hasRealUsage(usage) && isRecord12(usage)) {
+      return {
+        input: Number(usage.input || 0),
+        output: Number(usage.output || 0),
+        cacheRead: Number(usage.cacheRead || 0),
+        cacheWrite: Number(usage.cacheWrite || 0),
+        totalTokens: Number(usage.totalTokens || 0),
+        estimated: false
+      };
+    }
+    if ((messageRecord.role || "") !== "assistant") {
+      return null;
+    }
+    const resolvedIndex = typeof fallbackIndex === "number" ? fallbackIndex : Math.max(0, messages.lastIndexOf(message));
+    let inputTokens = 0;
+    for (let i2 = resolvedIndex - 1; i2 >= 0; i2--) {
+      const candidate = messages[i2];
+      if ((candidate?.role || "") !== "user") continue;
+      inputTokens = estimateTokensFromText(collectMessageText(candidate));
+      if (inputTokens > 0) break;
+    }
+    const outputTokens = estimateTokensFromText(collectMessageText(message));
+    const totalTokens = inputTokens + outputTokens;
+    if (totalTokens <= 0) return null;
+    return {
+      input: inputTokens,
+      output: outputTokens,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens,
+      estimated: true
+    };
+  }
+  function extractToolText(result) {
+    if (!result) return "";
+    if (typeof result === "string") return result;
+    if (isRecord12(result) && Array.isArray(result.content)) {
+      return result.content.filter((item) => isRecord12(item) && item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
+    }
+    return "";
+  }
+  function extractEffectiveArgs(toolName, args, details) {
+    const argRecord = isRecord12(args) ? args : {};
+    const detailRecord = isRecord12(details) ? details : {};
+    if (toolName === "find_files") {
+      return {
+        rawPattern: detailRecord.rawPattern ?? argRecord.pattern ?? argRecord.query ?? argRecord.name ?? argRecord.file_name ?? "",
+        pattern: detailRecord.effectivePattern ?? argRecord.pattern ?? argRecord.query ?? argRecord.name ?? argRecord.file_name ?? "",
+        path: detailRecord.searchPath ?? argRecord.path ?? ".",
+        limit: argRecord.limit
+      };
+    }
+    if (toolName === "grep_text") {
+      return {
+        pattern: detailRecord.effectivePattern ?? argRecord.pattern ?? "",
+        glob: detailRecord.glob ?? argRecord.glob ?? "",
+        path: detailRecord.searchPath ?? argRecord.path ?? ".",
+        literal: detailRecord.literal ?? argRecord.literal,
+        ignoreCase: detailRecord.ignoreCase ?? argRecord.ignoreCase,
+        limit: argRecord.limit
+      };
+    }
+    return argRecord;
+  }
+  function buildSessionSyncMessages(stateMessages) {
+    const argsByCallId = /* @__PURE__ */ new Map();
+    return stateMessages.map((message, index) => {
+      const messageRecord = isRecord12(message) ? message : {};
+      if (messageRecord.role === "assistant" && Array.isArray(messageRecord.content)) {
+        for (const block of messageRecord.content) {
+          if (isRecord12(block) && block.type === "toolCall" && typeof block.id === "string")
+            argsByCallId.set(block.id, block.arguments);
+        }
+      }
+      const isToolResult = messageRecord.role === "toolResult";
+      const args = argsByCallId.get(String(messageRecord.toolCallId || ""));
+      const serializedContent = typeof messageRecord.content === "string" ? [{ type: "text", text: messageRecord.content }] : Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord12(block)).map((block) => block.type === "toolCall" ? {
+        type: "toolCall",
+        text: typeof block.text === "string" ? block.text : "",
+        // Editor history uses these to render calls that never
+        // received a toolResult (interrupted runs).
+        toolCallId: typeof block.id === "string" ? block.id : "",
+        toolName: typeof block.name === "string" ? block.name : "",
+        argsJson: JSON.stringify(block.arguments ?? {})
+      } : {
+        type: String(block.type || "text"),
+        text: typeof block.text === "string" ? block.text : ""
+      }) : [];
+      return {
+        role: String(messageRecord.role || "assistant"),
+        timestamp: typeof messageRecord.timestamp === "number" ? messageRecord.timestamp : 0,
+        displayContent: typeof messageRecord.displayContent === "string" ? messageRecord.displayContent : "",
+        clientTurnId: typeof messageRecord.clientTurnId === "string" ? messageRecord.clientTurnId : "",
+        toolCallId: typeof messageRecord.toolCallId === "string" ? messageRecord.toolCallId : "",
+        toolName: typeof messageRecord.toolName === "string" ? messageRecord.toolName : "",
+        isError: messageRecord.isError === true,
+        argsJson: isToolResult ? JSON.stringify(args ?? {}) : "",
+        effectiveArgsJson: isToolResult ? JSON.stringify(extractEffectiveArgs(String(messageRecord.toolName || ""), args, messageRecord.details)) : "",
+        detailsJson: isToolResult ? JSON.stringify(messageRecord.details ?? {}) : "",
+        content: serializedContent,
+        errorMessage: typeof messageRecord.errorMessage === "string" ? messageRecord.errorMessage : "",
+        stopReason: typeof messageRecord.stopReason === "string" ? messageRecord.stopReason : "",
+        usage: buildUsagePayload(stateMessages, message, index)
+      };
+    });
+  }
+  function truncateMessagesAroundTurn(messages, clientTurnId, keep) {
+    const needle = String(clientTurnId || "").trim();
+    if (!needle) return null;
+    const turnStart = messages.findIndex((message) => {
+      const record = isRecord12(message) ? message : {};
+      return record.role === "user" && record.clientTurnId === needle;
+    });
+    if (turnStart === -1) return null;
+    if (keep === "before") return messages.slice(0, turnStart);
+    let turnEnd = messages.length;
+    for (let index = turnStart + 1; index < messages.length; index += 1) {
+      const record = isRecord12(messages[index]) ? messages[index] : {};
+      if (record.role === "user") {
+        turnEnd = index;
+        break;
+      }
+    }
+    return messages.slice(0, turnEnd);
+  }
+
+  // src/unity-public-api.ts
+  function isRecord13(value) {
     return typeof value === "object" && value !== null;
   }
   function stringField(value, key) {
-    return isRecord12(value) && typeof value[key] === "string" ? value[key] : void 0;
+    return isRecord13(value) && typeof value[key] === "string" ? value[key] : void 0;
   }
   var MAX_IMAGE_ATTACHMENTS = 4;
   var ALLOWED_IMAGE_MIME_TYPES = /* @__PURE__ */ new Set(["image/png", "image/jpeg"]);
@@ -39868,7 +40028,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       if (images.length >= MAX_IMAGE_ATTACHMENTS) {
         return { images, error: `too many image attachments (max ${MAX_IMAGE_ATTACHMENTS})` };
       }
-      if (!isRecord12(image) || typeof image.data !== "string" || typeof image.mimeType !== "string") {
+      if (!isRecord13(image) || typeof image.data !== "string" || typeof image.mimeType !== "string") {
         return { images, error: `images[${index}] must be { data: string, mimeType: string }` };
       }
       if (!ALLOWED_IMAGE_MIME_TYPES.has(image.mimeType)) {
@@ -39950,11 +40110,17 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               const provider = stringField(data2, "provider") || "";
               const model = stringField(data2, "model") || "";
               const baseUrl = stringField(data2, "baseUrl");
-              const verboseLogs = isRecord12(data2) && data2.verboseLogs === true;
+              const verboseLogs = isRecord13(data2) && data2.verboseLogs === true;
               const webSearchMode = stringField(data2, "webSearchMode");
-              if (isRecord12(data2) && data2.verboseLogs !== void 0) host.setVerboseLogs(verboseLogs);
+              const thinkingLevel = stringField(data2, "thinkingLevel");
+              if (isRecord13(data2) && data2.verboseLogs !== void 0) host.setVerboseLogs(verboseLogs);
               host.setModelSelection(provider, model, apiKey, baseUrl);
               if (webSearchMode !== void 0) host.setRuntimeWebSearchMode(webSearchMode);
+              if (thinkingLevel !== void 0) {
+                const valid = ["off", "minimal", "low", "medium", "high", "xhigh"];
+                if (valid.includes(thinkingLevel)) host.agent.state.thinkingLevel = thinkingLevel;
+                else host.bridge.log("warn", `[pie/index] Invalid thinkingLevel: ${thinkingLevel}`);
+              }
               host.applyModelSelectionSync(provider, model);
               host.bridge.sendToUnity("config_applied", host.getModelStatus());
               host.persistCurrentSessionSafely();
@@ -39981,7 +40147,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               host.bridge.log("info", `[pie/index] resume_session ${sessionId}`);
               const loaded = await host.loadSession(host.projectRoot, sessionId);
               if (loaded) {
-                const recoverInterrupted = isRecord12(data2) && data2.recoverInterrupted === true;
+                const recoverInterrupted = isRecord13(data2) && data2.recoverInterrupted === true;
                 const lastUserText = stringField(data2, "lastUserText") || "";
                 host.restoreSessionRecord(recoverInterrupted ? host.trimInterruptedTail(loaded, lastUserText) : loaded);
               } else {
@@ -40012,6 +40178,50 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 loaded: result.loaded || [],
                 errors: result.errors || []
               });
+              break;
+            }
+            case "rewind_turn":
+            case "fork_turn": {
+              const isFork = action === "fork_turn";
+              const clientTurnId = stringField(data2, "clientTurnId")?.trim() || "";
+              host.bridge.log("info", `[pie/index] ${action} turn=${clientTurnId || "<empty>"}`);
+              if (!clientTurnId) {
+                host.bridge.sendToUnity("error", { message: "A clientTurnId is required." });
+                break;
+              }
+              if (host.isRuntimeChatTurnActive()) {
+                host.bridge.sendToUnity("error", { message: "Cannot rewind or fork while a turn is streaming. Abort it first." });
+                break;
+              }
+              await host.persistCurrentSession();
+              const record = host.getCurrentSession();
+              const truncated = truncateMessagesAroundTurn(
+                record.messages || [],
+                clientTurnId,
+                isFork ? "turn" : "before"
+              );
+              if (!truncated) {
+                host.bridge.sendToUnity("error", { message: `Turn not found in this session: ${clientTurnId}` });
+                break;
+              }
+              const next = { ...record, messages: truncated };
+              if (isFork) {
+                await host.forkFromRecord(next);
+                host.bridge.sendToUnity("session_forked", {
+                  parentSessionId: record.id,
+                  clientTurnId,
+                  forkedAtTurn: true
+                });
+              } else {
+                host.restoreSessionRecord(next);
+                await host.persistCurrentSession();
+                await host.persistCurrentSessionForRecovery();
+                host.bridge.sendToUnity("session_rewound", {
+                  sessionId: record.id,
+                  clientTurnId,
+                  messageCount: truncated.length
+                });
+              }
               break;
             }
             case "abort":
@@ -40098,7 +40308,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   }
 
   // src/unity-local-commands.ts
-  function isRecord13(value) {
+  function isRecord14(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function tryExplainExternalSessionId(host, sessionId) {
@@ -40114,7 +40324,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }
     try {
       const registry2 = JSON.parse(String(CS.System.IO.File.ReadAllText(registryPath) || "{}"));
-      const entries = Object.values(isRecord13(registry2) ? registry2 : {});
+      const entries = Object.values(isRecord14(registry2) ? registry2 : {});
       const matched = entries.find((entry) => String(entry.id || "") === trimmed);
       if (!matched) {
         return null;
@@ -40126,7 +40336,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         for (let index = 0; index < Math.min(files.Length, 8); index += 1) {
           try {
             const parsed = JSON.parse(String(CS.System.IO.File.ReadAllText(files[index]) || "{}"));
-            const metadata = isRecord13(parsed) && isRecord13(parsed.metadata) ? parsed.metadata : parsed;
+            const metadata = isRecord14(parsed) && isRecord14(parsed.metadata) ? parsed.metadata : parsed;
             const id = String(metadata.id || "").trim();
             if (!id) continue;
             const title = String(metadata.name || metadata.title || "Untitled Session");
@@ -40723,147 +40933,6 @@ ${initialAgentsFile}`);
     return { webSearchTool: webSearchTool2, webFetchTool: webFetchTool2, webResearchTool: webResearchTool2 };
   }
 
-  // src/session-message-utils.ts
-  function isRecord14(value) {
-    return !!value && typeof value === "object" && !Array.isArray(value);
-  }
-  function hasRealUsage(usage) {
-    if (!isRecord14(usage)) return false;
-    return Number(usage.input || 0) > 0 || Number(usage.output || 0) > 0 || Number(usage.cacheRead || 0) > 0 || Number(usage.cacheWrite || 0) > 0 || Number(usage.totalTokens || 0) > 0;
-  }
-  function estimateTokensFromText(text) {
-    const normalized = (text || "").trim();
-    if (!normalized) return 0;
-    return Math.max(1, Math.ceil(normalized.length / 4));
-  }
-  function collectMessageText(message) {
-    if (!message) return "";
-    if (!isRecord14(message)) return "";
-    const content = message.content;
-    if (typeof content === "string") return content;
-    if (!Array.isArray(content)) return "";
-    return content.map((block) => {
-      if (!isRecord14(block)) return "";
-      if (block.type === "text") return typeof block.text === "string" ? block.text : "";
-      if (block.type === "thinking") return typeof block.thinking === "string" ? block.thinking : "";
-      if (block.type === "toolCall") {
-        const name = typeof block.name === "string" ? block.name : "";
-        const args = block.arguments !== void 0 ? JSON.stringify(block.arguments) : "";
-        return `${name}${args}`;
-      }
-      return "";
-    }).join("");
-  }
-  function buildUsagePayload(messages, message, fallbackIndex) {
-    const messageRecord = isRecord14(message) ? message : {};
-    const usage = messageRecord.usage;
-    if (hasRealUsage(usage) && isRecord14(usage)) {
-      return {
-        input: Number(usage.input || 0),
-        output: Number(usage.output || 0),
-        cacheRead: Number(usage.cacheRead || 0),
-        cacheWrite: Number(usage.cacheWrite || 0),
-        totalTokens: Number(usage.totalTokens || 0),
-        estimated: false
-      };
-    }
-    if ((messageRecord.role || "") !== "assistant") {
-      return null;
-    }
-    const resolvedIndex = typeof fallbackIndex === "number" ? fallbackIndex : Math.max(0, messages.lastIndexOf(message));
-    let inputTokens = 0;
-    for (let i2 = resolvedIndex - 1; i2 >= 0; i2--) {
-      const candidate = messages[i2];
-      if ((candidate?.role || "") !== "user") continue;
-      inputTokens = estimateTokensFromText(collectMessageText(candidate));
-      if (inputTokens > 0) break;
-    }
-    const outputTokens = estimateTokensFromText(collectMessageText(message));
-    const totalTokens = inputTokens + outputTokens;
-    if (totalTokens <= 0) return null;
-    return {
-      input: inputTokens,
-      output: outputTokens,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens,
-      estimated: true
-    };
-  }
-  function extractToolText(result) {
-    if (!result) return "";
-    if (typeof result === "string") return result;
-    if (isRecord14(result) && Array.isArray(result.content)) {
-      return result.content.filter((item) => isRecord14(item) && item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
-    }
-    return "";
-  }
-  function extractEffectiveArgs(toolName, args, details) {
-    const argRecord = isRecord14(args) ? args : {};
-    const detailRecord = isRecord14(details) ? details : {};
-    if (toolName === "find_files") {
-      return {
-        rawPattern: detailRecord.rawPattern ?? argRecord.pattern ?? argRecord.query ?? argRecord.name ?? argRecord.file_name ?? "",
-        pattern: detailRecord.effectivePattern ?? argRecord.pattern ?? argRecord.query ?? argRecord.name ?? argRecord.file_name ?? "",
-        path: detailRecord.searchPath ?? argRecord.path ?? ".",
-        limit: argRecord.limit
-      };
-    }
-    if (toolName === "grep_text") {
-      return {
-        pattern: detailRecord.effectivePattern ?? argRecord.pattern ?? "",
-        glob: detailRecord.glob ?? argRecord.glob ?? "",
-        path: detailRecord.searchPath ?? argRecord.path ?? ".",
-        literal: detailRecord.literal ?? argRecord.literal,
-        ignoreCase: detailRecord.ignoreCase ?? argRecord.ignoreCase,
-        limit: argRecord.limit
-      };
-    }
-    return argRecord;
-  }
-  function buildSessionSyncMessages(stateMessages) {
-    const argsByCallId = /* @__PURE__ */ new Map();
-    return stateMessages.map((message, index) => {
-      const messageRecord = isRecord14(message) ? message : {};
-      if (messageRecord.role === "assistant" && Array.isArray(messageRecord.content)) {
-        for (const block of messageRecord.content) {
-          if (isRecord14(block) && block.type === "toolCall" && typeof block.id === "string")
-            argsByCallId.set(block.id, block.arguments);
-        }
-      }
-      const isToolResult = messageRecord.role === "toolResult";
-      const args = argsByCallId.get(String(messageRecord.toolCallId || ""));
-      const serializedContent = typeof messageRecord.content === "string" ? [{ type: "text", text: messageRecord.content }] : Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord14(block)).map((block) => block.type === "toolCall" ? {
-        type: "toolCall",
-        text: typeof block.text === "string" ? block.text : "",
-        // Editor history uses these to render calls that never
-        // received a toolResult (interrupted runs).
-        toolCallId: typeof block.id === "string" ? block.id : "",
-        toolName: typeof block.name === "string" ? block.name : "",
-        argsJson: JSON.stringify(block.arguments ?? {})
-      } : {
-        type: String(block.type || "text"),
-        text: typeof block.text === "string" ? block.text : ""
-      }) : [];
-      return {
-        role: String(messageRecord.role || "assistant"),
-        timestamp: typeof messageRecord.timestamp === "number" ? messageRecord.timestamp : 0,
-        displayContent: typeof messageRecord.displayContent === "string" ? messageRecord.displayContent : "",
-        clientTurnId: typeof messageRecord.clientTurnId === "string" ? messageRecord.clientTurnId : "",
-        toolCallId: typeof messageRecord.toolCallId === "string" ? messageRecord.toolCallId : "",
-        toolName: typeof messageRecord.toolName === "string" ? messageRecord.toolName : "",
-        isError: messageRecord.isError === true,
-        argsJson: isToolResult ? JSON.stringify(args ?? {}) : "",
-        effectiveArgsJson: isToolResult ? JSON.stringify(extractEffectiveArgs(String(messageRecord.toolName || ""), args, messageRecord.details)) : "",
-        detailsJson: isToolResult ? JSON.stringify(messageRecord.details ?? {}) : "",
-        content: serializedContent,
-        errorMessage: typeof messageRecord.errorMessage === "string" ? messageRecord.errorMessage : "",
-        stopReason: typeof messageRecord.stopReason === "string" ? messageRecord.stopReason : "",
-        usage: buildUsagePayload(stateMessages, message, index)
-      };
-    });
-  }
-
   // src/index.ts
   var bridge = getPieBridge();
   installDevRpcBridge(bridge);
@@ -41358,6 +41427,9 @@ ${initialAgentsFile}`);
     restoreSessionRecord,
     startFreshSession,
     trimInterruptedTail,
+    getCurrentSession: () => _currentSession,
+    forkFromRecord,
+    isRuntimeChatTurnActive: () => agent.state.isStreaming === true,
     getTodoLoopState: () => todoLoopState,
     setTodoLoopState: (loop) => {
       todoLoopState = loop;

@@ -61,6 +61,11 @@ namespace Pie.Editor
         private string _apiKey    = "";
         private string _provider  = "openai";
         private string _model     = "gpt-4.1-mini";
+        private string _thinkingLevel = "off";
+        private List<string> _queuedMessages = new List<string>();
+        private List<(string provider, string modelId, string displayName, string baseUrl, string apiKey)> _availableModels
+            = new List<(string, string, string, string, string)>();
+        private int _selectedModelPopupIndex = -1; // -1 = custom
         private string _baseUrl   = "";
         private bool   _showApiKey = false;
         private bool   _showSettings = true;
@@ -876,7 +881,7 @@ namespace Pie.Editor
 
             _showSettings = GUILayout.Toggle(_showSettings, "Settings", EditorStyles.toolbarButton, GUILayout.Width(60));
             _showSkills   = GUILayout.Toggle(_showSkills,   "Skills",   EditorStyles.toolbarButton, GUILayout.Width(50));
-            _showSessions = GUILayout.Toggle(_showSessions, "Sessions", EditorStyles.toolbarButton, GUILayout.Width(65));
+            _showSessions = GUILayout.Toggle(_showSessions, "Sessions", EditorStyles.toolbarButton, GUILayout.Width(85));
             _showLogs     = GUILayout.Toggle(_showLogs,     "Logs",     EditorStyles.toolbarButton, GUILayout.Width(40));
 
             GUILayout.FlexibleSpace();
@@ -910,59 +915,126 @@ namespace Pie.Editor
             EditorGUILayout.EndHorizontal();
         }
 
+        // JsonUtility can't deserialize dictionaries; parse models.json with a
+        // lightweight scan for provider→model pairs instead.
+        private void LoadAvailableModels()
+        {
+            _availableModels.Clear();
+            try
+            {
+                var modelsPath = System.IO.Path.Combine(
+                    System.IO.Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile), ".pie"),
+                    "models.json");
+                if (!System.IO.File.Exists(modelsPath)) return;
+                var json = System.IO.File.ReadAllText(modelsPath);
+
+                // Scan for "profiles": { "providerName": { "models": [ { "id": "x", "name": "y" } ...
+                // This is a simple regex-based extraction sufficient for the fixed models.json shape.
+                var profileRegex = new System.Text.RegularExpressions.Regex(
+                    @"\""([^""]+)\"":\s*\{[^{}]*?\""models\"":\s*\[([^\]]*)\]",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                // Extract baseUrl + apiKey per profile
+                var connRegex = new System.Text.RegularExpressions.Regex(
+                    @"\""([^""]+)\"":\s*\{[^{}]*?\""baseUrl\"":\s*\""([^""]*)\""[^{}]*?\""apiKey\"":\s*\""([^""]*)\""",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                var connByProvider = new Dictionary<string, (string baseUrl, string apiKey)>();
+                foreach (System.Text.RegularExpressions.Match connMatch in connRegex.Matches(json))
+                {
+                    connByProvider[connMatch.Groups[1].Value] = (connMatch.Groups[2].Value, connMatch.Groups[3].Value);
+                }
+                foreach (System.Text.RegularExpressions.Match profileMatch in profileRegex.Matches(json))
+                {
+                    var providerName = profileMatch.Groups[1].Value;
+                    (string baseUrl, string apiKey) conn = connByProvider.TryGetValue(providerName, out var c) ? c : (baseUrl: "", apiKey: "");
+                    var modelsBlock = profileMatch.Groups[2].Value;
+                    var modelRegex = new System.Text.RegularExpressions.Regex(
+                        @"\""id\"":\s*\""([^""]+)\""(?:[^}]*?\""name\"":\s*\""([^""]*)\"")?",
+                        System.Text.RegularExpressions.RegexOptions.Singleline);
+                    foreach (System.Text.RegularExpressions.Match modelMatch in modelRegex.Matches(modelsBlock))
+                    {
+                        var id = modelMatch.Groups[1].Value;
+                        var name = modelMatch.Groups[2].Success ? modelMatch.Groups[2].Value : id;
+                        if (!string.IsNullOrEmpty(id))
+                            _availableModels.Add((providerName, id, $"{providerName}/{id}  ({name})", conn.baseUrl, conn.apiKey));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                PieDiagnostics.Verbose($"[PieChatWindow] Failed to load models.json: {ex.Message}");
+            }
+        }
+
+        private int FindDefaultModelIndex()
+        {
+            try
+            {
+                var modelsPath = System.IO.Path.Combine(
+                    System.IO.Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile), ".pie"),
+                    "models.json");
+                if (!System.IO.File.Exists(modelsPath)) return -1;
+                var json = System.IO.File.ReadAllText(modelsPath);
+                var defRegex = new System.Text.RegularExpressions.Regex(
+                    @"""defaults""\s*:\s*\{[^}]*?""provider""\s*:\s*""([^""]+)""[^}]*?""modelId""\s*:\s*""([^""]+)""",
+                    System.Text.RegularExpressions.RegexOptions.Singleline);
+                var m = defRegex.Match(json);
+                if (!m.Success) return -1;
+                var defProvider = m.Groups[1].Value;
+                var defModel = m.Groups[2].Value;
+                var idx = _availableModels.FindIndex(a => a.provider == defProvider && a.modelId == defModel);
+                if (idx >= 0)
+                {
+                    var sel = _availableModels[idx];
+                    _provider = sel.provider;
+                    _model = sel.modelId;
+                    _baseUrl = sel.baseUrl;
+                    _apiKey = sel.apiKey;
+                    EditorPrefs.SetString(PREF_PROVIDER, _provider);
+                    EditorPrefs.SetString(PREF_MODEL, _model);
+                    EditorPrefs.SetString(PREF_BASE_URL, _baseUrl);
+                    EditorPrefs.SetString(PREF_API_KEY, _apiKey);
+                }
+                return idx;
+            }
+            catch { return -1; }
+        }
+
         private void DrawSettings()
         {
             EditorGUILayout.BeginVertical("box");
-            EditorGUILayout.LabelField("Settings", EditorStyles.boldLabel);
 
-            // API Key
             EditorGUILayout.BeginHorizontal();
-            _showApiKey = EditorGUILayout.Toggle("Show", _showApiKey, GUILayout.Width(80));
-            var newKey = _showApiKey
-                ? EditorGUILayout.TextField("API Key", _apiKey)
-                : EditorGUILayout.PasswordField("API Key", _apiKey);
-            if (newKey != _apiKey)
-            {
-                _apiKey = newKey;
-                EditorPrefs.SetString(PREF_API_KEY, _apiKey);
-                PushSettings();
-            }
+            EditorGUILayout.LabelField("API Key", GUILayout.Width(60));
+            _showApiKey = EditorGUILayout.Toggle(_showApiKey, GUILayout.Width(16));
+            var newKey = _showApiKey ? EditorGUILayout.TextField(_apiKey) : EditorGUILayout.PasswordField(_apiKey);
+            if (newKey != _apiKey) { _apiKey = newKey; EditorPrefs.SetString(PREF_API_KEY, _apiKey); PushSettings(); }
             EditorGUILayout.EndHorizontal();
 
-            // Provider
             EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField("Provider", GUILayout.Width(80));
-            var newProvider = EditorGUILayout.TextField(_provider);
-            if (newProvider != _provider)
-            {
-                _provider = newProvider;
-                EditorPrefs.SetString(PREF_PROVIDER, _provider);
-                PushSettings();
-            }
+            EditorGUILayout.LabelField("Provider", GUILayout.Width(52));
+            var newProvider = EditorGUILayout.TextField(_provider, GUILayout.MinWidth(60));
+            if (newProvider != _provider) { _provider = newProvider; EditorPrefs.SetString(PREF_PROVIDER, _provider); PushSettings(); }
+            EditorGUILayout.LabelField("Model", GUILayout.Width(36));
+            var newModel = EditorGUILayout.TextField(_model, GUILayout.MinWidth(60));
+            if (newModel != _model) { _model = newModel; EditorPrefs.SetString(PREF_MODEL, _model); PushSettings(); }
+
+            var thinkingLabels = new[] { "Off", "Min", "Low", "Med", "High", "XHigh" };
+            var thinkingValues = new[] { "off", "minimal", "low", "medium", "high", "xhigh" };
+            var thinkingIndex = Math.Max(0, Array.IndexOf(thinkingValues, _thinkingLevel));
+            var newThinkingIndex = EditorGUILayout.Popup(thinkingIndex, thinkingLabels, GUILayout.Width(55));
+            if (newThinkingIndex != thinkingIndex) { _thinkingLevel = thinkingValues[newThinkingIndex]; PushSettings(); }
+
+            var wsLabels = new[] { "Search:Auto", "Search:On", "Search:Off" };
+            var wsValues = new[] { "auto", "responses", "off" };
+            var wsIndex = Math.Max(0, Array.IndexOf(wsValues, _webSearchMode));
+            var newWsIndex = EditorGUILayout.Popup(wsIndex, wsLabels, GUILayout.Width(85));
+            if (newWsIndex != wsIndex) { _webSearchMode = wsValues[newWsIndex]; EditorPrefs.SetString(PREF_WEB_SEARCH_MODE, _webSearchMode); PushSettings(); }
             EditorGUILayout.EndHorizontal();
 
-            // Model
             EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField("Model", GUILayout.Width(80));
-            var newModel = EditorGUILayout.TextField(_model);
-            if (newModel != _model)
-            {
-                _model = newModel;
-                EditorPrefs.SetString(PREF_MODEL, _model);
-                PushSettings();
-            }
-            EditorGUILayout.EndHorizontal();
-
-            // Base URL
-            EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField("Base URL", GUILayout.Width(80));
+            EditorGUILayout.LabelField("Base URL", GUILayout.Width(60));
             var newBaseUrl = EditorGUILayout.TextField(_baseUrl);
-            if (newBaseUrl != _baseUrl)
-            {
-                _baseUrl = newBaseUrl;
-                EditorPrefs.SetString(PREF_BASE_URL, _baseUrl);
-                PushSettings();
-            }
+            if (newBaseUrl != _baseUrl) { _baseUrl = newBaseUrl; EditorPrefs.SetString(PREF_BASE_URL, _baseUrl); PushSettings(); }
             EditorGUILayout.EndHorizontal();
 
             var newVerboseLogs = EditorGUILayout.ToggleLeft("Verbose Logs", _verboseLogs);
@@ -1002,18 +1074,6 @@ namespace Pie.Editor
                 _autoResendInterrupted = newAutoResend;
                 EditorPrefs.SetBool(PREF_AUTO_RESEND, _autoResendInterrupted);
             }
-            var webSearchLabels = new[] { "Web Search: Auto (models.json)", "Web Search: Built-in (responses)", "Web Search: Off" };
-            var webSearchValues = new[] { "auto", "responses", "off" };
-            var webSearchIndex = Array.IndexOf(webSearchValues, _webSearchMode);
-            if (webSearchIndex < 0) webSearchIndex = 0;
-            var newWebSearchIndex = EditorGUILayout.Popup(webSearchIndex, webSearchLabels);
-            if (newWebSearchIndex != webSearchIndex)
-            {
-                _webSearchMode = webSearchValues[newWebSearchIndex];
-                EditorPrefs.SetString(PREF_WEB_SEARCH_MODE, _webSearchMode);
-                PushSettings();
-            }
-
             _sessionsScrollPos = EditorGUILayout.BeginScrollView(_sessionsScrollPos, GUILayout.Height(140));
             if (_sessions.Count == 0)
             {
@@ -1402,8 +1462,22 @@ namespace Pie.Editor
             }
             else if (msg.Role == "assistant" && msg.TotalTokens > 0)
                 GUILayout.Label($"{(msg.IsEstimatedUsage ? "~" : "")}{FormatTokenCount(msg.TotalTokens)} tok", EditorStyles.miniLabel);
-            if (GUILayout.Button("Copy", EditorStyles.miniButton, GUILayout.Width(44)))
-                EditorGUIUtility.systemCopyBuffer = msg.Content ?? "";
+            if (isTool || isThinking)
+            {
+                if (GUILayout.Button("Copy", EditorStyles.miniButton, GUILayout.Width(44)))
+                    EditorGUIUtility.systemCopyBuffer = msg.Content ?? "";
+            }
+            else
+            {
+                if (GUILayout.Button("⋯", EditorStyles.miniButton, GUILayout.Width(24)))
+                {
+                    // GetLastRect is unreliable inside scroll views (returns
+                    // content-space coordinates); the mouse position at click
+                    // time is always in the correct GUI space.
+                    var clickPos = Event.current.mousePosition;
+                    ShowTurnDetailsMenu(msg, clickPos);
+                }
+            }
             EditorGUILayout.EndHorizontal();
 
             if (isTool)
@@ -1436,6 +1510,53 @@ namespace Pie.Editor
             GUILayout.Space(isTool || isThinking ? 2 : 6);
         }
 
+        private void ShowTurnDetailsMenu(ChatMessage msg, Vector2 clickGuiPos)
+        {
+            var menu = new GenericMenu();
+            menu.AddItem(new GUIContent("Copy"), false, () =>
+                EditorGUIUtility.systemCopyBuffer = msg.Content ?? "");
+            var turnId = msg.ClientTurnId ?? "";
+            var hasTurnId = !string.IsNullOrEmpty(turnId);
+            var hasTurn = hasTurnId && !_isStreaming;
+            if (hasTurnId)
+                menu.AddItem(new GUIContent("Copy Turn ID"), false, () =>
+                    EditorGUIUtility.systemCopyBuffer = turnId);
+            else
+                menu.AddDisabledItem(new GUIContent("Copy Turn ID"), true);
+            if (!string.IsNullOrEmpty(_activeSessionId))
+                menu.AddItem(new GUIContent("Copy Session ID"), false, () =>
+                    EditorGUIUtility.systemCopyBuffer = _activeSessionId);
+            menu.AddSeparator("");
+            if (hasTurn)
+            {
+                menu.AddItem(new GUIContent("Rewind to Here"), false, () =>
+                    RewindOrForkTurn(turnId, fork: false));
+                menu.AddItem(new GUIContent("Fork from Here"), false, () =>
+                    RewindOrForkTurn(turnId, fork: true));
+            }
+            else
+            {
+                var hint = _isStreaming ? " (turn still streaming)" : " (no turn id)";
+                menu.AddDisabledItem(new GUIContent("Rewind to Here" + hint), true);
+                menu.AddDisabledItem(new GUIContent("Fork from Here" + hint), true);
+            }
+            // position + window-local mouse position, shifted up ~100px to
+            // compensate for the EditorWindow title/tab chrome offset.
+            var screenPos = new Vector2(position.x + clickGuiPos.x, position.y + clickGuiPos.y - 100f);
+            menu.DropDown(new Rect(screenPos, Vector2.zero));
+        }
+
+        private void RewindOrForkTurn(string clientTurnId, bool fork)
+        {
+            if (_bridge?.IsInitialized != true || string.IsNullOrEmpty(clientTurnId)) return;
+            var action = fork ? "fork_turn" : "rewind_turn";
+            var escaped = clientTurnId.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            _statusText = fork ? "Forking…" : "Rewinding…";
+            PieDiagnostics.Verbose($"[PieChatWindow] {action} {clientTurnId}");
+            _bridge.SendToJs(action, $"{{\"clientTurnId\":\"{escaped}\"}}");
+            RefreshSessions();
+        }
+
         private void DrawInput()
         {
             CheckInteractionTimeout();
@@ -1448,6 +1569,7 @@ namespace Pie.Editor
             }
 
             DrawInlineStatusBar();
+            DrawQueuedMessages();
             DrawPendingInteractionPanel();
             DrawPendingImageAttachments();
 
@@ -1457,7 +1579,6 @@ namespace Pie.Editor
             _inputText = EditorGUILayout.TextArea(_inputText, GUILayout.Height(60), GUILayout.ExpandWidth(true));
 
             var canSend = (_pendingInteraction == null || _pendingInteraction.completed)
-                && !_isStreaming
                 && !string.IsNullOrWhiteSpace(_inputText)
                 && _bridge?.IsInitialized == true;
             var estimatedInputTokens = EstimateTextTokens(_inputText);
@@ -1471,10 +1592,21 @@ namespace Pie.Editor
                 GUI.FocusControl("PieInput");
             }
             GUI.enabled = canSend;
-            if (GUILayout.Button("Send", GUILayout.Width(55), GUILayout.Height(40)))
+            var sendLabel = _isStreaming ? "Queue" : "Send";
+            if (GUILayout.Button(sendLabel, GUILayout.Width(55), GUILayout.Height(40)))
             {
-                SendMessage();
-                GUI.FocusControl("PieInput");
+                if (_isStreaming)
+                {
+                    _queuedMessages.Add(_inputText.Trim());
+                    _inputText = "";
+                    _statusText = $"Queued ({_queuedMessages.Count} pending)";
+                    GUI.FocusControl("PieInput");
+                }
+                else
+                {
+                    SendMessage();
+                    GUI.FocusControl("PieInput");
+                }
             }
             GUI.enabled = true;
             if (_isStreaming)
@@ -1501,6 +1633,45 @@ namespace Pie.Editor
                 SendMessage();
                 e.Use();
             }
+        }
+
+        private void DrawQueuedMessages()
+        {
+            if (_queuedMessages.Count == 0) return;
+            EditorGUILayout.BeginVertical("box");
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField($"Queue ({_queuedMessages.Count})", EditorStyles.miniBoldLabel, GUILayout.Width(80));
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("Clear", EditorStyles.miniButton, GUILayout.Width(40)))
+            {
+                _queuedMessages.Clear();
+                _statusText = "Queue cleared";
+            }
+            EditorGUILayout.EndHorizontal();
+            for (int i = 0; i < _queuedMessages.Count; i++)
+            {
+                EditorGUILayout.BeginHorizontal();
+                var preview = _queuedMessages[i];
+                if (preview.Length > 80) preview = preview.Substring(0, 77) + "…";
+                EditorGUILayout.LabelField($"  {i + 1}. {preview}", EditorStyles.miniLabel);
+                if (GUILayout.Button("✕", EditorStyles.miniButton, GUILayout.Width(18)))
+                {
+                    _queuedMessages.RemoveAt(i);
+                    i--;
+                }
+                EditorGUILayout.EndHorizontal();
+            }
+            EditorGUILayout.EndVertical();
+        }
+
+        private void TryDequeueNextMessage()
+        {
+            if (_isStreaming || _queuedMessages.Count == 0) return;
+            var next = _queuedMessages[0];
+            _queuedMessages.RemoveAt(0);
+            _statusText = _queuedMessages.Count > 0 ? $"Sending queued ({_queuedMessages.Count} more)" : "Sending queued message";
+            _inputText = next; // Route through SendMessage so attachments etc. are handled
+            SendMessage();
         }
 
         private void DrawInlineStatusBar()
@@ -1934,12 +2105,20 @@ namespace Pie.Editor
                     HandleSessionSync(json);
                     TryDispatchPendingAutoResend();
                     break;
+                case "session_rewound":
+                    _statusText = $"Rewound ({ExtractJsonInt(json, "messageCount")} msgs kept)";
+                    break;
+                case "session_forked":
+                    _statusText = "Forked";
+                    _statusText = "Forked from turn";
+                    break;
                 case "skills_list":     HandleSkillsList(json);     break;
                 case "config_applied":  HandleConfigApplied(json);  break;
                 case "error":           HandleError(json);          break;
                 case "agent_end":
                     _isStreaming = false;
                     _statusText = "Idle";
+                    TryDequeueNextMessage();
                     break;
             }
             ScheduleRepaint();
@@ -2065,6 +2244,7 @@ namespace Pie.Editor
                 case "agent_end":
                     _isStreaming = false;
                     _statusText = "Idle";
+                    TryDequeueNextMessage();
                     break;
                 default:
                     if (!string.IsNullOrEmpty(detail))
@@ -2268,6 +2448,7 @@ namespace Pie.Editor
                             content = $"[{message.stopReason}]";
                         _messages.Add(new ChatMessage(role, content ?? "")
                         {
+                            ClientTurnId = message.clientTurnId ?? "",
                             Title = isToolResult ? message.toolName : "",
                             ToolName = message.toolName,
                             ToolCallId = message.toolCallId,
@@ -3328,6 +3509,7 @@ namespace Pie.Editor
         {
             public string Role;
             public string Content;
+            public string ClientTurnId;
             public string Title;
             public string Summary;
             public string ArgsText;
@@ -3430,6 +3612,7 @@ namespace Pie.Editor
         [Serializable]
         private class SessionSyncMessage
         {
+            public string clientTurnId;
             public string role;
             public string displayContent;
             public string toolName;
