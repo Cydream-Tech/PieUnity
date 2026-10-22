@@ -172,6 +172,7 @@ namespace Pie
             // Cancel all background bridge work before tearing down JsEnv so old-domain
             // tasks do not block assembly reload.
             PieHttpBridge.CancelAllRequests();
+            PieWebSocketBridge.CancelAll();
             PieFileBridge.CancelAllRequests();
 
             DestroyJsEnvironment();

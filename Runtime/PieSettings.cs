@@ -133,30 +133,36 @@ namespace Pie
             public static string InvokeHostCall(string argsJson)
             {
                 var request = JsonUtility.FromJson<PieDevRpcRequest>(argsJson ?? "{}") ?? new PieDevRpcRequest();
-                return InvokeMethod(request.method, request.argsJson ?? "{}");
+                return InvokeMethod(request.method, request.argsJson ?? "{}", "pie.dev_rpc");
             }
 
-            public static string InvokeMethod(string method, string argsJson = "{}")
+            public static string InvokeMethod(string method, string argsJson = "{}", string origin = null)
             {
                 method = method ?? "";
 
                 if (string.IsNullOrWhiteSpace(method))
                     return PieDevRpcResponse.Failure(method, "RPC method is required.");
 
-                var toolFound = PieUnityCapabilityRegistry.HasTool(method);
-                if (toolFound)
+                // A registry lookup can claim a capability exists while dispatch
+                // cannot find it (observed live: every interaction.* call failed
+                // "Capability not found" while the legacy handlers were registered,
+                // hanging the agent). Fall through to the next dispatch layer ONLY
+                // when no handler ran; a handler failure fails immediately so side
+                // effects are never re-run.
+                if (PieUnityCapabilityRegistry.HasTool(method))
                 {
-                    if (PieUnityCapabilityRegistry.TryInvokeTool(method, argsJson, out var capabilityResultJson, out var capabilityToolError))
+                    if (PieUnityCapabilityRegistry.TryInvokeTool(method, argsJson, out var capabilityResultJson, out var capabilityToolError, out var toolHandlerInvoked))
                         return PieDevRpcResponse.Success(method, capabilityResultJson);
-                    return PieDevRpcResponse.Failure(method, capabilityToolError);
+                    if (toolHandlerInvoked)
+                        return PieDevRpcResponse.Failure(method, capabilityToolError);
                 }
 
-                var rpcFound = PieUnityCapabilityRegistry.HasRpc(method);
-                if (rpcFound)
+                if (PieUnityCapabilityRegistry.HasRpc(method))
                 {
-                    if (PieUnityCapabilityRegistry.TryInvokeRpc(method, argsJson, out var capabilityRpcResultJson, out var capabilityRpcError))
+                    if (PieUnityCapabilityRegistry.TryInvokeRpc(method, argsJson, out var capabilityRpcResultJson, out var capabilityRpcError, out var rpcHandlerInvoked))
                         return PieDevRpcResponse.Success(method, capabilityRpcResultJson);
-                    return PieDevRpcResponse.Failure(method, capabilityRpcError);
+                    if (rpcHandlerInvoked)
+                        return PieDevRpcResponse.Failure(method, capabilityRpcError);
                 }
 
                 if (string.Equals(method, "rpc.list", StringComparison.Ordinal))
@@ -171,7 +177,7 @@ namespace Pie
 
                 if (!Methods.TryGetValue(method, out var handler))
                 {
-                    PieDiagnostics.Warning($"[PieDevRpc] RPC method not found: {method}");
+                    PieDiagnostics.Warning($"[PieDevRpc] RPC method not found{FormatOrigin(origin)}: {method}");
                     return PieDevRpcResponse.Failure(method, $"RPC method not found: {method}");
                 }
 
@@ -182,9 +188,14 @@ namespace Pie
                 }
                 catch (Exception ex)
                 {
-                    PieDiagnostics.Warning($"[PieDevRpc] {method} failed: {ex.Message}");
+                    PieDiagnostics.Warning($"[PieDevRpc] {method} failed{FormatOrigin(origin)}: {ex.Message}");
                     return PieDevRpcResponse.Failure(method, ex.Message);
                 }
+            }
+
+            private static string FormatOrigin(string origin)
+            {
+                return string.IsNullOrEmpty(origin) ? "" : $" via {origin}";
             }
         }
 }
@@ -678,13 +689,20 @@ namespace Pie
             {
                 string resultJson;
                 string error;
+                bool handlerInvoked;
                 var ok = string.Equals(kind, "tool", StringComparison.OrdinalIgnoreCase)
-                    ? PieUnityCapabilityRegistry.TryInvokeTool(name, argsJson, out resultJson, out error)
-                    : PieUnityCapabilityRegistry.TryInvokeRpc(name, argsJson, out resultJson, out error);
+                    ? PieUnityCapabilityRegistry.TryInvokeTool(name, argsJson, out resultJson, out error, out handlerInvoked)
+                    : PieUnityCapabilityRegistry.TryInvokeRpc(name, argsJson, out resultJson, out error, out handlerInvoked);
 
-                if (!ok && string.Equals(kind, "rpc", StringComparison.OrdinalIgnoreCase))
+                // The registry could not dispatch this name (never registered, or a
+                // stale entry claimed it): fall back to the legacy method table so
+                // editor-window RPCs such as interaction.* keep working through
+                // both HTTP routes. The fallback runs ONLY when no handler executed
+                // (structured dispatch outcome) — handler failures never re-run, so
+                // side effects cannot double-execute regardless of error text.
+                if (!ok && !handlerInvoked)
                 {
-                    var legacy = PieDevRpc.InvokeMethod(name, argsJson);
+                    var legacy = PieDevRpc.InvokeMethod(name, argsJson, "http:/" + kind);
                     var legacyResponse = JsonUtility.FromJson<PieDevRpcResponse>(legacy);
                     if (legacyResponse != null && legacyResponse.ok)
                     {
@@ -992,6 +1010,13 @@ namespace Pie
             public static string ApplicationIdentifier => _applicationIdentifier;
 
             [Serializable]
+            private sealed class RuntimeInstallSkillPayload
+            {
+                public string name;
+                public string content;
+            }
+
+            [Serializable]
             private sealed class TextPayload
             {
                 public string text;
@@ -1122,6 +1147,7 @@ namespace Pie
                     return;
 
                 PieUnityInstanceRegistry.Unregister(_runtimeInstanceId);
+                PieUnityCapabilityRegistry.UnregisterRuntimeRunnerCapabilities();
                 _runtimeInstanceId = "";
                 _runtimeProjectPath = "";
                 _nextRuntimeHeartbeatUtc = DateTime.MinValue;
@@ -1269,14 +1295,13 @@ namespace Pie
             {
                 if (runner == null)
                     return;
-
                 PieUnityCapabilityRegistry.RegisterRpc(
                     "runner.get_state",
                     "runtime",
                     "Get current runtime runner state.",
                     "runtime",
                     true,
-                    true,
+                    false,
                     null,
                     new PieUnityParameterDescriptor[0],
                     _ => runner.BuildRuntimeRpcStateJson());
@@ -1299,6 +1324,50 @@ namespace Pie
                         new PieUnityParameterDescriptor { name = "text", type = "string", required = true },
                     },
                     runner.DevRpcChatSend);
+
+                PieUnityCapabilityRegistry.RegisterTool(
+                    "chat_abort",
+                    "chat",
+                    "Abort the active runtime runner turn and return the runner state.",
+                    "runtime",
+                    false,
+                    false,
+                    null,
+                    new PieUnityParameterDescriptor[0],
+                    _ => { runner.Abort(); return runner.BuildRuntimeRpcStateJson(); });
+
+                // Tool kind (not rpc) so editor- and player-side callers use the
+                // same `tool skills_install` syntax; runner-exclusive registration
+                // unchanged (UnregisterRuntimeRunnerCapabilities still removes them).
+                PieUnityCapabilityRegistry.RegisterTool(
+                    "skills_reload",
+                    "skills",
+                    "Rescan skill sources (filesystem layers + baked manifest) and re-emit the skill list.",
+                    "runtime",
+                    false,
+                    false,
+                    null,
+                    new PieUnityParameterDescriptor[0],
+                    _ => "{\"dispatched\":" + (runner.ReloadSkills() ? "true" : "false") + "}");
+
+                PieUnityCapabilityRegistry.RegisterTool(
+                    "skills_install",
+                    "skills",
+                    "Install a skill into the player-writable layer (persistentDataPath/.agents/skills) and reload.",
+                    "runtime",
+                    false,
+                    false,
+                    null,
+                    new[]
+                    {
+                        new PieUnityParameterDescriptor { name = "name", type = "string", required = true },
+                        new PieUnityParameterDescriptor { name = "content", type = "string", required = true },
+                    },
+                    argsJson =>
+                    {
+                        var payload = JsonUtility.FromJson<RuntimeInstallSkillPayload>(argsJson ?? "{}") ?? new RuntimeInstallSkillPayload();
+                        return runner.InstallSkill(payload.name, payload.content);
+                    });
 
                 PieUnityCapabilityRegistry.RegisterTool(
                     "chat_get_state",
@@ -1773,7 +1842,7 @@ namespace Pie
     // Merged from Runtime/UnityCapabilities/PieUnityCapabilitiesConstants.cs
     public static class PieUnityCapabilitiesConstants
         {
-            public const string Version = "0.1.37";
+            public const string Version = "0.1.38";
             public const string ManifestSchemaVersion = "2";
             public const string SkillProtocolVersion = "pie-unity-rpc/2";
             public const int DefaultPort = 8091;
@@ -2354,6 +2423,30 @@ namespace Pie
                 }
             }
 
+            /// <summary>
+            /// Entries registered by the bootstrap's RegisterRuntimeCapabilities
+            /// close over the PieRunner instance; leaving them in the static
+            /// registry after the runner is destroyed would serve stale handlers
+            /// through the manifest. Only runner-exclusive names are removed:
+            /// chat_send / chat_get_state / chat_get_messages also have
+            /// editor-window registrations under the same names (last
+            /// registration wins) and must survive runtime shutdown — that dual
+            /// registration is a pre-existing design to revisit.
+            /// </summary>
+            public static void UnregisterRuntimeRunnerCapabilities()
+            {
+                lock (SyncRoot)
+                {
+                    RpcMethods.Remove("runner.get_state");
+                    RpcMethods.Remove("runner.get_policy");
+                    // skills_reload / skills_install moved to tool kind for
+                    // editor/player call-syntax parity.
+                    ToolMethods.Remove("skills_reload");
+                    ToolMethods.Remove("skills_install");
+                    ToolMethods.Remove("chat_abort");
+                }
+            }
+
             public static void UnregisterRuntimeHost(string hostNamespace)
             {
                 lock (SyncRoot)
@@ -2402,14 +2495,14 @@ namespace Pie
                     return RuntimeHostDiagnostics.ToArray();
             }
 
-            public static bool TryInvokeRpc(string name, string argsJson, out string resultJson, out string error)
+            public static bool TryInvokeRpc(string name, string argsJson, out string resultJson, out string error, out bool handlerInvoked)
             {
-                return TryInvoke("rpc", RpcMethods, name, argsJson, out resultJson, out error);
+                return TryInvoke("rpc", RpcMethods, name, argsJson, out resultJson, out error, out handlerInvoked);
             }
 
-            public static bool TryInvokeTool(string name, string argsJson, out string resultJson, out string error)
+            public static bool TryInvokeTool(string name, string argsJson, out string resultJson, out string error, out bool handlerInvoked)
             {
-                return TryInvoke("tool", ToolMethods, name, argsJson, out resultJson, out error);
+                return TryInvoke("tool", ToolMethods, name, argsJson, out resultJson, out error, out handlerInvoked);
             }
 
             public static bool HasTool(string name)
@@ -2501,10 +2594,17 @@ namespace Pie
                 string name,
                 string argsJson,
                 out string resultJson,
-                out string error)
+                out string error,
+                out bool handlerInvoked)
             {
                 lock (SyncRoot)
                 {
+                    // Structured dispatch outcome: a lookup miss (nothing executed)
+                    // is reported separately from a handler failure, so callers can
+                    // safely fall through to another dispatch layer only when no
+                    // handler ran — handler error text can never spoof a miss and
+                    // cause a side-effecting handler to re-run.
+                    handlerInvoked = false;
                     if (!source.TryGetValue(name ?? "", out var registration))
                     {
                         resultJson = "null";
@@ -2515,6 +2615,7 @@ namespace Pie
 
                     try
                     {
+                        handlerInvoked = true;
                         resultJson = registration.Handler(argsJson ?? "{}") ?? "null";
                         error = "";
                         return true;
@@ -2941,7 +3042,13 @@ namespace Pie
                 if (string.Equals(action, "set_component_property", StringComparison.OrdinalIgnoreCase))
                     return SetComponentPropertyJson(payload, argsJson ?? "{}");
 
-                throw new InvalidOperationException("Unsupported action: " + action);
+                // Unknown actions are almost always model guesses; list the
+                // valid set so the next call can succeed without a manifest
+                // round-trip.
+                throw new InvalidOperationException(
+                    "Unsupported action: " + action + ". Valid actions: create_scene_object, destroy_scene_object, " +
+                    "set_transform, set_active, set_parent, set_name, set_tag_layer, add_component, remove_component, " +
+                    "set_component_enabled, set_component_property.");
             }
 
             public static string RefreshJson()
@@ -3622,6 +3729,16 @@ namespace Pie
                 if (string.IsNullOrWhiteSpace(requested))
                     throw new InvalidOperationException("componentType is required.");
 
+                // Accept assembly-qualified forms ("Pie.PieRunner, Pie.Runtime")
+                // by matching on the type-name part; models routinely emit the
+                // qualified spelling even though only FullName/ShortName are
+                // compared below.
+                var typeNameOnly = requested;
+                var asmIndex = requested.IndexOf(',');
+                if (asmIndex > 0) typeNameOnly = requested.Substring(0, asmIndex).Trim();
+                if (string.IsNullOrWhiteSpace(typeNameOnly))
+                    throw new InvalidOperationException("Component type not found: " + requested);
+
                 var matches = new List<Type>();
                 var assemblies = AppDomain.CurrentDomain.GetAssemblies();
                 for (var i = 0; i < assemblies.Length; i++)
@@ -3641,8 +3758,8 @@ namespace Pie
                         var type = types[j];
                         if (type == null || !typeof(Component).IsAssignableFrom(type) || type.IsAbstract)
                             continue;
-                        if (string.Equals(type.FullName, requested, StringComparison.Ordinal)
-                            || string.Equals(type.Name, requested, StringComparison.Ordinal))
+                        if (string.Equals(type.FullName, typeNameOnly, StringComparison.Ordinal)
+                            || string.Equals(type.Name, typeNameOnly, StringComparison.Ordinal))
                         {
                             matches.Add(type);
                         }
@@ -4210,7 +4327,7 @@ namespace Pie
                     return;
                 if (!Directory.Exists(PieUnityCapabilitiesConstants.InstancesDirectory))
                     return;
-                var pattern = instanceId + "*.json";
+                var pattern = instanceId + "_" + System.Diagnostics.Process.GetCurrentProcess().Id + "_*.json";
                 var filePaths = Directory.GetFiles(PieUnityCapabilitiesConstants.InstancesDirectory, pattern);
                 for (var i = 0; i < filePaths.Length; i++)
                     TryDeleteStaleFile(filePaths[i]);

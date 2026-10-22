@@ -33,6 +33,7 @@ namespace Pie.Editor
         private Vector2 _sessionsScrollPos;
         private readonly List<SkillInfo> _skills = new List<SkillInfo>();
         private readonly List<SessionInfo> _sessions = new List<SessionInfo>();
+        private string _sessionListRequestId;
         private readonly List<TodoStateItem> _todoItems = new List<TodoStateItem>();
         private string _selectedSkillPath = "";
         private string _selectedSkillName = "";
@@ -40,6 +41,11 @@ namespace Pie.Editor
         private string _newSkillName = "";
         private bool _isCreatingSkill = false;
         private string _activeSessionId = "";
+        /** Last session_sync applied to the window projection; used to skip
+         *  no-delta rebuilds that would wipe transient local-command bubbles. */
+        private string _lastSessionSyncId = "";
+        private int _lastSessionSyncMessageCount = -1;
+        private int _lastSessionSyncTodoCount = -1;
         private string _lastSubmittedInputText = "";
         private string _pendingRecoveryNotice = "";
         private bool _recoveryRestoreScheduled = false;
@@ -65,7 +71,6 @@ namespace Pie.Editor
         private List<string> _queuedMessages = new List<string>();
         private List<(string provider, string modelId, string displayName, string baseUrl, string apiKey)> _availableModels
             = new List<(string, string, string, string, string)>();
-        private int _selectedModelPopupIndex = -1; // -1 = custom
         private string _baseUrl   = "";
         private bool   _showApiKey = false;
         private bool   _showSettings = true;
@@ -115,7 +120,10 @@ namespace Pie.Editor
         {
             public string sessionsDir;
             public string sessionPath;
+            // Physical files only; validity and recovery belong to the TS session store.
             public bool exists;
+            public bool backupExists;
+            public bool previousExists;
         }
 
         [Serializable]
@@ -266,15 +274,17 @@ namespace Pie.Editor
             var sessionId = payload.sessionId ?? "";
             var sessionsDir = Pie.PieProjectPaths.GetSessionsDirectory();
             var safeId = System.Text.RegularExpressions.Regex.Replace(sessionId, "[^a-zA-Z0-9_-]", "_");
-            var sessionPath = string.IsNullOrEmpty(safeId)
+            var sessionPath = string.IsNullOrEmpty(safeId) || safeId.StartsWith("__pie-staging-", StringComparison.Ordinal)
                 ? ""
-                : System.IO.Path.Combine(sessionsDir, safeId + ".json").Replace("\\", "/");
+                : System.IO.Path.Combine(sessionsDir, safeId, "head.json").Replace("\\", "/");
             var exists = !string.IsNullOrEmpty(sessionPath) && System.IO.File.Exists(sessionPath);
             return JsonUtility.ToJson(new DevSessionPathResult
             {
                 sessionsDir = sessionsDir,
                 sessionPath = sessionPath,
                 exists = exists,
+                backupExists = !string.IsNullOrEmpty(sessionPath) && System.IO.File.Exists(sessionPath + ".bak"),
+                previousExists = !string.IsNullOrEmpty(sessionPath) && System.IO.File.Exists(sessionPath + ".prev"),
             });
         }
 
@@ -385,7 +395,7 @@ namespace Pie.Editor
             PieUnityCapabilityRegistry.RegisterRpc("pie_chat.reconnect", "chat", "Reconnect the Pie Chat bridge.", "editor", false, false, null, new PieUnityParameterDescriptor[0], _ => DevRpcReconnect());
             PieUnityCapabilityRegistry.RegisterRpc("pie_chat.get_session_path_info", "chat", "Inspect the active session path.", "editor", true, false, null, new PieUnityParameterDescriptor[0], DevRpcGetSessionPathInfo);
             PieUnityCapabilityRegistry.RegisterRpc("pie_chat.get_recovery_state", "chat", "Inspect the chat recovery state.", "editor", true, false, null, new PieUnityParameterDescriptor[0], _ => DevRpcGetRecoveryState());
-            PieUnityCapabilityRegistry.RegisterRpc("pie_chat.send", "chat", "Legacy Pie Chat send RPC.", "editor", false, true, null, new[]
+            PieUnityCapabilityRegistry.RegisterRpc("pie_chat.send", "chat", "Send the Pie Chat input as a user turn.", "editor", false, false, null, new[]
             {
                 new PieUnityParameterDescriptor { name = "text", type = "string", required = true },
             }, DevRpcSend);
@@ -406,11 +416,25 @@ namespace Pie.Editor
         }
 
         // ─── Lifecycle ────────────────────────────────────────────────────────
+        private bool _recoveryResumeInFlight = false;
+        private string _recoveryResumeSessionId = "";
+
         private void OnEnable()
         {
             _currentWindow = this;
             _recoveryRestoreScheduled = false;
             _recoveryRestoreNotBeforeAt = -1;
+            _recoveryResumeInFlight = false;
+            _recoveryResumeSessionId = "";
+            // EditorWindow field state can survive a domain reload while the
+            // rendered message list does not; a stale no-delta gate would then
+            // suppress the transcript-rebuilding sync. Reset it when empty.
+            if (_messages.Count == 0)
+            {
+                _lastSessionSyncId = "";
+                _lastSessionSyncMessageCount = -1;
+                _lastSessionSyncTodoCount = -1;
+            }
             EnsureDevRpcReady();
             _apiKey   = EditorPrefs.GetString(PREF_API_KEY, "");
             _provider = EditorPrefs.GetString(PREF_PROVIDER, "openai");
@@ -807,6 +831,12 @@ namespace Pie.Editor
         {
             PieDiagnostics.Info("[PieChatWindow] beforeAssemblyReload");
             SaveRecoverySnapshotIfNeeded();
+            // A stale in-flight flag must never pair with the snapshot just
+            // saved: the abort-finalize sync emitted by the abort below would
+            // otherwise consume it in this (dying) domain and disarm the
+            // reloaded domain's recovery restore.
+            _recoveryResumeInFlight = false;
+            _recoveryResumeSessionId = "";
             InterruptActiveTurnForAssemblyReload();
             DisposeBridge();
         }
@@ -840,6 +870,7 @@ namespace Pie.Editor
 
         private void DisposeBridge()
         {
+            _sessionListRequestId = null;
             if (_bridge == null) return;
             _bridge.OnJsEvent -= HandleJsEvent;
             _bridge.Dispose();
@@ -2112,6 +2143,7 @@ namespace Pie.Editor
                     _statusText = "Forked";
                     _statusText = "Forked from turn";
                     break;
+                case "sessions_list":   HandleSessionsList(json);   break;
                 case "skills_list":     HandleSkillsList(json);     break;
                 case "config_applied":  HandleConfigApplied(json);  break;
                 case "error":           HandleError(json);          break;
@@ -2410,7 +2442,50 @@ namespace Pie.Editor
             try
             {
                 var payload = JsonUtility.FromJson<SessionSyncPayload>(json);
+
+                // Same session with unchanged message/todo counts carries no
+                // transcript delta: local-command turns ("/self-check",
+                // "/skills", …) emit bubbles that are intentionally NOT part of
+                // the persisted session, yet their finalize path still sends a
+                // session_sync. Rebuilding from the payload would wipe those
+                // bubbles (and the DevRpc get_messages projection with them).
+                // Gated against the LAST SYNCED counts, not the live bubble
+                // list: session↔bubble mapping is not 1:1 (thinking bubbles,
+                // tool-only shells). Session switches, compaction, resume,
+                // rewind, and todo changes all alter the gated fields.
+                var payloadTodoCount = payload?.todoState?.Length ?? 0;
+                // An attached-but-empty projection (e.g. after a domain reload
+                // that preserved the gate fields but not the rendered list)
+                // must re-apply even a no-delta sync, or the transcript stays
+                // empty forever.
+                if (payload != null
+                    && _messages.Count > 0
+                    && string.Equals(payload.id, _lastSessionSyncId, StringComparison.Ordinal)
+                    && payload.messageCount == _lastSessionSyncMessageCount
+                    && payloadTodoCount == _lastSessionSyncTodoCount)
+                {
+                    // A no-delta sync that answers a pending recovery resume must
+                    // still consume the in-flight flag: leaving it set lets the
+                    // NEXT content sync for the same session be misread as the
+                    // recovery answer (forced Idle status + a redundant snapshot
+                    // clear). The snapshot itself was already cleared when the
+                    // resume was dispatched; only the flag pairing needs care.
+                    if (_recoveryResumeInFlight
+                        && !string.IsNullOrEmpty(payload.id)
+                        && payload.id == _recoveryResumeSessionId)
+                    {
+                        _recoveryResumeInFlight = false;
+                        _recoveryResumeSessionId = "";
+                        _statusText = "Idle";
+                    }
+                    ScheduleRepaint();
+                    return;
+                }
+
                 _activeSessionId = payload?.id ?? "";
+                _lastSessionSyncId = payload?.id ?? "";
+                _lastSessionSyncMessageCount = payload?.messageCount ?? 0;
+                _lastSessionSyncTodoCount = payloadTodoCount;
                 if (!string.IsNullOrEmpty(_activeSessionId))
                     PieChatSessionRecovery.SetLastKnownActiveSession(_activeSessionId);
                 _messages.Clear();
@@ -2482,22 +2557,29 @@ namespace Pie.Editor
                     _todoItems.AddRange(payload.todoState);
 
                 _isStreaming = false;
-                var pendingRecoverySessionId = PieChatSessionRecovery.Read().activeSessionId;
-                var expectedRecoverySessionId = !string.IsNullOrEmpty(pendingRecoverySessionId)
-                    ? pendingRecoverySessionId
-                    : "";
-                var isRecoverySync = !string.IsNullOrEmpty(payload?.id)
-                    && payload.id == _activeSessionId
-                    && (
-                        payload.id == expectedRecoverySessionId
-                        || HasRecoverySnapshot()
-                    );
+                // Only a sync that answers an in-flight recovery resume may
+                // consume the snapshot. The abort-finalize sync emitted during
+                // beforeAssemblyReload used to match this predicate (its id is
+                // assigned to _activeSessionId earlier in this same handler),
+                // clearing the snapshot before the reloaded domain could run
+                // its recovery restore — leaving the window attached but empty.
+                // NOTE: TryRestoreRecoverySnapshot clears the snapshot right
+                // after dispatching the resume, so no snapshot check can
+                // identify the answer — the flag+id match alone does. The flag
+                // is also reset in HandleBeforeAssemblyReload, so a fresh
+                // snapshot can never pair with a stale flag (the abort-finalize
+                // sync is emitted only after that reset).
+                var isRecoverySync = _recoveryResumeInFlight
+                    && !string.IsNullOrEmpty(payload?.id)
+                    && payload.id == _recoveryResumeSessionId;
                 _statusText = payload == null
                     ? "Session synced"
                     : $"Session: {payload.title} ({payload.id})";
                 if (isRecoverySync)
                 {
                     ClearRecoverySnapshot();
+                    _recoveryResumeInFlight = false;
+                    _recoveryResumeSessionId = "";
                     _statusText = "Idle";
                 }
                 if (!string.IsNullOrEmpty(_pendingRecoveryNotice))
@@ -2735,6 +2817,8 @@ namespace Pie.Editor
             if (_bridge?.IsInitialized != true || snapshot == null || string.IsNullOrEmpty(snapshot.activeSessionId))
                 return;
 
+            _recoveryResumeInFlight = true;
+            _recoveryResumeSessionId = snapshot.activeSessionId;
             PieDiagnostics.Verbose($"[PieChatWindow] Sending recovery resume_session for {snapshot.activeSessionId}");
             _bridge.SendToJs(
                 "resume_session",
@@ -2743,77 +2827,32 @@ namespace Pie.Editor
 
         private void RefreshSessions()
         {
-            try
+            if (_bridge?.IsInitialized != true) return;
+            _sessionListRequestId = Guid.NewGuid().ToString("N");
+            _bridge.SendToJs("list_sessions", JsonUtility.ToJson(new SessionsPayload
             {
-                var projectRoot = System.IO.Directory.GetParent(Application.dataPath).FullName;
-                var sessionsDir = Pie.PieProjectPaths.GetSessionsDirectory();
-                _sessions.Clear();
-                if (!System.IO.Directory.Exists(sessionsDir)) return;
-
-                foreach (var file in System.IO.Directory.GetFiles(sessionsDir, "*.json"))
-                {
-                    try
-                    {
-                        var json = System.IO.File.ReadAllText(file);
-                        var session = ReadSessionInfoFromJson(json);
-                        if (session != null && !string.IsNullOrEmpty(session.id) && session.messageCount > 0)
-                            _sessions.Add(session);
-                    }
-                    catch
-                    {
-                        // Ignore malformed session files
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                PieDiagnostics.Warning($"[PieChatWindow] RefreshSessions: {ex.Message}");
-            }
+                requestId = _sessionListRequestId,
+            }));
         }
 
-        private static SessionInfo ReadSessionInfoFromJson(string json)
+        private void HandleSessionsList(string json)
         {
-            if (string.IsNullOrWhiteSpace(json))
-                return null;
-
-            var legacy = JsonUtility.FromJson<SessionInfo>(json);
-            if (legacy != null && !string.IsNullOrEmpty(legacy.id))
-                return legacy;
-
-            var framework = JsonUtility.FromJson<FrameworkSessionFile>(json);
-            var metadata = framework?.metadata;
-            if (metadata == null || string.IsNullOrEmpty(metadata.id))
-                return null;
-
-            var messageCount = metadata.messageCount;
-            if (messageCount <= 0 && framework.messages != null)
-                messageCount = framework.messages.Length;
-
-            return new SessionInfo
+            var payload = JsonUtility.FromJson<SessionsPayload>(json ?? "{}");
+            // A prior refresh or a disposed bridge must not replace the current list.
+            if (_bridge?.IsInitialized != true || payload == null ||
+                string.IsNullOrEmpty(_sessionListRequestId) || payload.requestId != _sessionListRequestId)
+                return;
+            if (!string.IsNullOrEmpty(payload.error))
             {
-                id = metadata.id,
-                title = !string.IsNullOrEmpty(metadata.name) ? metadata.name : "Untitled Session",
-                createdAt = UnixMillisToIsoString(metadata.createdAt),
-                updatedAt = UnixMillisToIsoString(metadata.updatedAt),
-                parentSessionId = metadata.parentSessionId,
-                provider = !string.IsNullOrEmpty(metadata.provider) ? metadata.provider : "openai",
-                modelId = !string.IsNullOrEmpty(metadata.modelId) ? metadata.modelId : "unknown",
-                messageCount = messageCount,
-            };
-        }
-
-        private static string UnixMillisToIsoString(double value)
-        {
-            if (value <= 0 || double.IsNaN(value) || double.IsInfinity(value))
-                return "";
-
-            try
-            {
-                return DateTimeOffset.FromUnixTimeMilliseconds((long)value).UtcDateTime.ToString("O");
+                PieDiagnostics.Warning($"[PieChatWindow] RefreshSessions: {payload.error}");
+                return;
             }
-            catch
+
+            _sessions.Clear();
+            foreach (var session in payload.sessions ?? Array.Empty<SessionInfo>())
             {
-                return "";
+                if (session != null && !string.IsNullOrEmpty(session.id) && session.messageCount > 0)
+                    _sessions.Add(session);
             }
         }
 
@@ -3560,23 +3599,11 @@ namespace Pie.Editor
         }
 
         [Serializable]
-        private class FrameworkSessionFile
+        private class SessionsPayload
         {
-            public FrameworkSessionMetadata metadata;
-            public SessionSyncMessage[] messages;
-        }
-
-        [Serializable]
-        private class FrameworkSessionMetadata
-        {
-            public string id;
-            public string name;
-            public double createdAt;
-            public double updatedAt;
-            public string parentSessionId;
-            public string provider;
-            public string modelId;
-            public int messageCount;
+            public string requestId;
+            public string error;
+            public SessionInfo[] sessions;
         }
 
         [Serializable]

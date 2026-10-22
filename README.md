@@ -11,6 +11,10 @@ It uses a runtime-first architecture: the agent core runs in Runtime, while the 
 - Runtime state lives under `Application.persistentDataPath/Pie`
 - Project skills, project extensions, and project AGENTS.md context are first-class package concepts
 
+## Attention consumer caveat
+
+Unity forwards shared `attention_requested` / `attention_resolved` events through `PieBridge.OnJsEvent`. This is a semantic bridge, **not a native attention presenter**: consumers must supply any in-game bubbles, badges, audio or OS notifications. Ordinary completion is explicitly **OFF** in production, with no supported host toggle. The low-level `user-initiated` coordinator policy requires caller-owned accepted-delivery bookkeeping not supplied by the production controller. Generic confirmation is input (explicit `false` is an answer); timeout, skipped, unavailable and missing responses cancel attention consistently with CLI. Only the interaction owner resolves requests; suppressing presentation must not resolve them. See the [Unity host contract](../../docs/public-api/unity-host-adapter.md#attention-events-experimental).
+
 ## Unity RPC Host
 
 `com.pie.agent` exposes a local RPC/REST host for agent-driven Unity work.
@@ -157,12 +161,10 @@ After installation:
 4. Run a Unity scene query through PieChat.
 5. Trigger an assembly reload and confirm PieChat reconnects without duplicating the interrupted prompt.
 
-Release candidates should also run:
+Optional local package checks (no Unity Editor or live RPC required):
 
 ```bash
 npm run verify:unity:package-release
-UNITY_EDITOR="/path/to/Unity" npm run verify:unity:reliability
-PIE_UNITY_REAL_RPC=1 UNITY_EDITOR="/path/to/Unity" npm run verify:unity:reliability
 ```
 
 ## Generated Runtime Bundle Policy
@@ -175,7 +177,7 @@ The shipped runtime bridge is a tracked Unity `TextAsset` contract, not an ad-ho
 - `core.js` is not a supported shipped runtime asset and must not appear in source or exported packages
 - Run `npm run build:unity` after changing `src/` or the Unity bundle build pipeline
 - Run `npm run check:unity-bundle-drift` to confirm the tracked generated bundle stays stable after rebuild
-- Run `npm run verify:unity:package-release` as the authoritative package release gate; it builds, checks bundle policy/drift, exports a standalone package, validates payload contents, and runs the clean-install dry-run verifier against the exported package
+- `npm run verify:unity:package-release` is an optional local package check: it builds, checks bundle policy/drift, exports a standalone package, and checks static payload/dependency contracts. It does not launch Unity or resolve UPM dependencies.
 
 `unity_script_run` is a cooperative step-bounded runner: define `export async function run(ctx, args)`, await frame boundaries and host calls, and expect long synchronous loops to fail with `STEP_TIMEOUT` after a guard check rather than being arbitrarily preempted.
 
@@ -377,13 +379,26 @@ module or inline dependencies for now.
 - `apiKey` or `apiKeyEnv`
 - `models`
 
+Responses profiles may use `api: "openai-responses"` with optional profile/model
+`transport: "sse" | "websocket" | "auto"` (default SSE). Enable
+`compat.responsesContinuation: true` for verified same-connection WS continuation.
+Model transport overrides the profile. Editor and native Player both use
+`PieWebSocketBridge` / `UnityWebSocketClient`; WebGL is unsupported. Runtime
+pause and bridge disposal cancel native connections. Unknown native handshake
+failures are surfaced because ClientWebSocket does not reliably expose an HTTP
+status for safe auto fallback. See the [transport validation record](../../docs/maintenance/responses-transport.md)
+for tested platforms, isolated smoke commands and live-test limitations.
+
 If no valid profile is configured, Unity starts in an unconfigured model state and asks you to configure `~/.pie/models.json` before sending messages.
 
 Android runtime discovery and Pie logs are also stored below `Application.persistentDataPath`; Android's `UserProfile` location is not assumed to be writable. For Player builds, the package's Editor linker processor explicitly supplies `Runtime/link.xml` to UnityLinker, preserving the PuerTS-visible bridge surface that embedded JavaScript calls through `CS.Pie.*` on IL2CPP.
 
 PuerTS 2.2.2 enables its IL2CPP optimization on desktop and Android by default.
 Before an IL2CPP build, generate the project's PuerTS IL2CPP glue through
-**Tools > PuerTS > Generate il2cpp > Reflection Mode** (or Static Wrapper Mode).
+**Tools > PuerTS > Generate For xIl2cpp mode (all in one without wrapper)**
+(or the corresponding full-wrapper command). For batch validation, the installed
+2.2.2 generator exposes `PuertsIl2cpp.Editor.Generator.UnityMenu.GenV2WithoutWrapper`;
+run generation before starting the separate Player build invocation.
 For a project using the regular reflection bridge, add
 `PUERTS_DISABLE_IL2CPP_OPTIMIZATION` to the target's Scripting Define Symbols
 instead. Without either configuration, native linking fails with missing symbols
@@ -459,6 +474,52 @@ Supported layouts:
 - `Assets/Pie/Skills/<skill-name>.md`
 
 Skills are listed in the system prompt with ordinary `entry` and `baseDir` paths. Read the entry with `read_file`; resolve skill-local relative paths against `baseDir` and use ordinary file or bash tools.
+
+### Player builds
+
+Player builds bake skills into `Assets/Resources/Pie/SkillManifest.asset` at
+build time (`pie-delivery:` frontmatter selects all / player-only /
+editor-only). The runtime inlines the SKILL.md body into the system prompt
+and, when the skill directory carries companion files (scripts,
+references — caps: 32 files, 96KB each, 512KB per skill), serves them as
+virtual files under `pie-skill/<name>/<relative-path>`; `read_file` and the
+other file tools resolve those paths normally.
+
+Skills can also be installed at runtime into the player-writable layer
+(`<persistentDataPath>/.agents/skills/<name>/SKILL.md`) and picked up with
+`reload_skills` — via the dev-RPC tools `skills_install` /
+`skills_reload` (tool kind: `pie-unity-rpc.js tool --tool skills_install
+--data '{"name":...,"content":...}'`), or `CS.Pie.PieRunner.ActiveRunner.InstallSkill`
+from C#. These register only when a runtime host (PieRunner) is present.
+Filesystem entries win over baked manifest entries with the same name, so a
+hot-installed skill overrides the baked one.
+
+Lint skills before shipping them to a build:
+
+```bash
+node products/pie-unity/Skills/pie-unity-rpc/pie-unity-rpc.js skill-lint \
+  --file Assets/Pie/Skills/my-skill/SKILL.md            # static checks
+node products/pie-unity/Skills/pie-unity-rpc/pie-unity-rpc.js skill-lint \
+  --file Assets/Pie/Skills/my-skill/SKILL.md --probe --project .  # + live runtime path check
+```
+
+The baker also warns (build log) when a skill calls `runtime.call` without
+the required `CS.` prefix.
+
+### Player model configuration
+
+Player builds resolve their model endpoint, left to right by priority:
+
+1. `SetConfig(apiKey, provider, model, baseUrl)` on the active runner — C#
+   method; call it from your own bootstrap/UI code (in the editor the
+   `pie_chat.set_config` RPC reaches the same path). Configuration pushed
+   this way lives for the process lifetime.
+2. `~/.pie/models.json` on the machine running the player — the same
+   profiles the CLI uses (`profiles` with `baseUrl`/`apiKey`/`models`).
+
+Distribution stays open by design: decide yourself whether shipped players
+embed a gateway URL/key via `SetConfig` at startup or read the local
+`models.json`.
 
 ## Project Extensions
 

@@ -346,7 +346,7 @@ namespace Pie
                 return;
             if (!Directory.Exists(PieUnityCapabilitiesConstants.InstancesDirectory))
                 return;
-            var pattern = instanceId + "*.json";
+            var pattern = instanceId + "_" + System.Diagnostics.Process.GetCurrentProcess().Id + "_*.json";
             var filePaths = Directory.GetFiles(PieUnityCapabilitiesConstants.InstancesDirectory, pattern);
             for (var i = 0; i < filePaths.Length; i++)
                 TryDeleteStaleFile(filePaths[i]);

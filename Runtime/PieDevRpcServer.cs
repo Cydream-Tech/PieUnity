@@ -405,13 +405,20 @@ namespace Pie
         {
             string resultJson;
             string error;
+            bool handlerInvoked;
             var ok = string.Equals(kind, "tool", StringComparison.OrdinalIgnoreCase)
-                ? PieUnityCapabilityRegistry.TryInvokeTool(name, argsJson, out resultJson, out error)
-                : PieUnityCapabilityRegistry.TryInvokeRpc(name, argsJson, out resultJson, out error);
+                ? PieUnityCapabilityRegistry.TryInvokeTool(name, argsJson, out resultJson, out error, out handlerInvoked)
+                : PieUnityCapabilityRegistry.TryInvokeRpc(name, argsJson, out resultJson, out error, out handlerInvoked);
 
-            if (!ok && string.Equals(kind, "rpc", StringComparison.OrdinalIgnoreCase))
+            // The registry could not dispatch this name (never registered, or a
+            // stale entry claimed it): fall back to the legacy method table so
+            // editor-window RPCs such as interaction.* keep working through
+            // both HTTP routes. The fallback runs ONLY when no handler executed
+            // (structured dispatch outcome) — handler failures never re-run, so
+            // side effects cannot double-execute regardless of error text.
+            if (!ok && !handlerInvoked)
             {
-                var legacy = PieDevRpc.InvokeMethod(name, argsJson);
+                var legacy = PieDevRpc.InvokeMethod(name, argsJson, "http:/" + kind);
                 var legacyResponse = JsonUtility.FromJson<PieDevRpcResponse>(legacy);
                 if (legacyResponse != null && legacyResponse.ok)
                 {

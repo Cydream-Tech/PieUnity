@@ -78,30 +78,36 @@ namespace Pie
         public static string InvokeHostCall(string argsJson)
         {
             var request = JsonUtility.FromJson<PieDevRpcRequest>(argsJson ?? "{}") ?? new PieDevRpcRequest();
-            return InvokeMethod(request.method, request.argsJson ?? "{}");
+            return InvokeMethod(request.method, request.argsJson ?? "{}", "pie.dev_rpc");
         }
 
-        public static string InvokeMethod(string method, string argsJson = "{}")
+        public static string InvokeMethod(string method, string argsJson = "{}", string origin = null)
         {
             method = method ?? "";
 
             if (string.IsNullOrWhiteSpace(method))
                 return PieDevRpcResponse.Failure(method, "RPC method is required.");
 
-            var toolFound = PieUnityCapabilityRegistry.HasTool(method);
-            if (toolFound)
+            // A registry lookup can claim a capability exists while dispatch
+            // cannot find it (observed live: every interaction.* call failed
+            // "Capability not found" while the legacy handlers were registered,
+            // hanging the agent). Fall through to the next dispatch layer ONLY
+            // when no handler ran; a handler failure fails immediately so side
+            // effects are never re-run.
+            if (PieUnityCapabilityRegistry.HasTool(method))
             {
-                if (PieUnityCapabilityRegistry.TryInvokeTool(method, argsJson, out var capabilityResultJson, out var capabilityToolError))
+                if (PieUnityCapabilityRegistry.TryInvokeTool(method, argsJson, out var capabilityResultJson, out var capabilityToolError, out var toolHandlerInvoked))
                     return PieDevRpcResponse.Success(method, capabilityResultJson);
-                return PieDevRpcResponse.Failure(method, capabilityToolError);
+                if (toolHandlerInvoked)
+                    return PieDevRpcResponse.Failure(method, capabilityToolError);
             }
 
-            var rpcFound = PieUnityCapabilityRegistry.HasRpc(method);
-            if (rpcFound)
+            if (PieUnityCapabilityRegistry.HasRpc(method))
             {
-                if (PieUnityCapabilityRegistry.TryInvokeRpc(method, argsJson, out var capabilityRpcResultJson, out var capabilityRpcError))
+                if (PieUnityCapabilityRegistry.TryInvokeRpc(method, argsJson, out var capabilityRpcResultJson, out var capabilityRpcError, out var rpcHandlerInvoked))
                     return PieDevRpcResponse.Success(method, capabilityRpcResultJson);
-                return PieDevRpcResponse.Failure(method, capabilityRpcError);
+                if (rpcHandlerInvoked)
+                    return PieDevRpcResponse.Failure(method, capabilityRpcError);
             }
 
             if (string.Equals(method, "rpc.list", StringComparison.Ordinal))
@@ -116,7 +122,7 @@ namespace Pie
 
             if (!Methods.TryGetValue(method, out var handler))
             {
-                PieDiagnostics.Warning($"[PieDevRpc] RPC method not found: {method}");
+                PieDiagnostics.Warning($"[PieDevRpc] RPC method not found{FormatOrigin(origin)}: {method}");
                 return PieDevRpcResponse.Failure(method, $"RPC method not found: {method}");
             }
 
@@ -127,9 +133,14 @@ namespace Pie
             }
             catch (Exception ex)
             {
-                PieDiagnostics.Warning($"[PieDevRpc] {method} failed: {ex.Message}");
+                PieDiagnostics.Warning($"[PieDevRpc] {method} failed{FormatOrigin(origin)}: {ex.Message}");
                 return PieDevRpcResponse.Failure(method, ex.Message);
             }
+        }
+
+        private static string FormatOrigin(string origin)
+        {
+            return string.IsNullOrEmpty(origin) ? "" : $" via {origin}";
         }
     }
 }

@@ -18,6 +18,8 @@ namespace Pie.Editor
 
         static PieDevRpcEditorBootstrap()
         {
+            if (AssetDatabase.IsAssetImportWorkerProcess())
+                return;
             if (!_registeredUpdate)
             {
                 EditorApplication.update += Tick;

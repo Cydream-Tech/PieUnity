@@ -131,6 +131,7 @@ namespace Pie.Editor
             }
 
             var delivery = ParseDelivery(content);
+            WarnOnSuspiciousRuntimePaths(name, content);
             // EditorOnly entries are kept (not skipped here) so a later
             // EditorOnly skill can override an earlier layer's All entry —
             // exactly like the filesystem loader's name resolution.
@@ -141,6 +142,7 @@ namespace Pie.Editor
                 description = ParseDescription(content, name),
                 content = content,
                 delivery = delivery,
+                files = CollectCompanionFiles(baseDir, skillMdPath),
             };
 
             if (byName.TryGetValue(name, out var index))
@@ -153,6 +155,133 @@ namespace Pie.Editor
                 byName[name] = entries.Count;
                 entries.Add(entry);
             }
+        }
+
+        /// <summary>
+        /// Warn-only mirror of scripts/skill-lint.mjs's RUNTIME_PATH_MISSING_CS
+        /// rule: the last line of defense before a bad path ships in a player
+        /// build. Skills calling .NET through ctx.runtime.call must root the
+        /// path at 'CS.' — bare type paths fail at runtime with
+        /// RUNTIME_PATH_NOT_FOUND (hit by the pie-sigil-forge E2E).
+        /// </summary>
+        private static void WarnOnSuspiciousRuntimePaths(string name, string content)
+        {
+            if (string.IsNullOrEmpty(content)) return;
+            var matches = System.Text.RegularExpressions.Regex.Matches(
+                content,
+                @"runtime\.call\(\s*['""]([^'""\n]+)['""]");
+            foreach (System.Text.RegularExpressions.Match match in matches)
+            {
+                var runtimePath = match.Groups[1].Value;
+                if (runtimePath.StartsWith("CS.", StringComparison.Ordinal)) continue;
+                var root = runtimePath.Split('.')[0];
+                if (root == "pie" || root == "bridge") continue;
+                Debug.LogWarning($"[Pie] Skill manifest: skill '{name}' calls runtime.call('{runtimePath}') without the 'CS.' prefix; this will fail at runtime. Run pie-unity-rpc skill-lint for details.");
+            }
+        }
+
+        private const int MaxCompanionFiles = 32;
+        private const long MaxCompanionFileBytes = 96 * 1024;
+        private const long MaxCompanionTotalBytes = 512 * 1024;
+
+        /// <summary>
+        /// Companion files under a skill directory, baked as virtual files so
+        /// player builds can read_file them (pie-skill/&lt;name&gt;/&lt;rel&gt;).
+        /// Text-only with hard caps: one oversized or binary file must never
+        /// bloat the manifest or break the build. baseDir is the skill
+        /// directory for dir-based skills; for loose *.md skills it is the
+        /// skills directory itself, whose other files belong to other skills —
+        /// companions are collected only when baseDir ends with the skill name
+        /// (dir-based layout).
+        /// </summary>
+        private static PieSkillFileEntry[] CollectCompanionFiles(string baseDir, string skillMdPath)
+        {
+            if (string.IsNullOrWhiteSpace(baseDir) || !Directory.Exists(baseDir))
+                return Array.Empty<PieSkillFileEntry>();
+            // Only dir-based skills (Skills/<name>/SKILL.md) carry companions.
+            // Loose *.md skills live directly in the skills directory, whose
+            // other files belong to other skills — never collect for them.
+            if (!string.Equals(Path.GetFileName(skillMdPath), "SKILL.md", StringComparison.OrdinalIgnoreCase))
+                return Array.Empty<PieSkillFileEntry>();
+
+            var root = Path.GetFullPath(baseDir);
+            var skillMdFull = Path.GetFullPath(skillMdPath);
+            var rootPrefix = root + Path.DirectorySeparatorChar;
+            var files = new List<PieSkillFileEntry>();
+            long total = 0;
+            foreach (var filePath in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            {
+                if (files.Count >= MaxCompanionFiles) break;
+                var full = Path.GetFullPath(filePath);
+                // AllDirectories enumeration follows directory symlinks, and
+                // Path.GetFullPath is purely lexical: a link planted inside the
+                // skill directory yields paths that still pass a prefix check
+                // while reading content from outside. Containment plus a
+                // reparse-point walk along the chain keeps the manifest sealed.
+                if (!full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase)) continue;
+                if (HasReparsePointBelow(root, full))
+                {
+                    Debug.LogWarning($"[Pie] Skill manifest: skipping symlinked companion '{filePath}'");
+                    continue;
+                }
+                if (string.Equals(full, skillMdFull, StringComparison.OrdinalIgnoreCase)) continue;
+                if (full.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)) continue;
+                var info = new FileInfo(full);
+                if (info.Length > MaxCompanionFileBytes)
+                {
+                    Debug.LogWarning($"[Pie] Skill manifest: skipping oversized companion '{filePath}' ({info.Length}B > {MaxCompanionFileBytes}B)");
+                    continue;
+                }
+                if (total + info.Length > MaxCompanionTotalBytes)
+                {
+                    Debug.LogWarning($"[Pie] Skill manifest: companion budget exhausted for '{baseDir}'; remaining files skipped");
+                    break;
+                }
+                string text;
+                try { text = File.ReadAllText(full); }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"[Pie] Skill manifest: skipping unreadable companion '{filePath}': {ex.Message}");
+                    continue;
+                }
+                if (text.IndexOf('\0') >= 0)
+                {
+                    Debug.LogWarning($"[Pie] Skill manifest: skipping binary companion '{filePath}'");
+                    continue;
+                }
+                var relative = full.Substring(root.Length + 1).Replace('\\', '/');
+                files.Add(new PieSkillFileEntry { path = relative, content = text });
+                total += info.Length;
+            }
+            return files.ToArray();
+        }
+
+        /// <summary>
+        /// True when any component of <paramref name="full" strictly below
+        /// <paramref name="root"/> (the file itself included) is a reparse
+        /// point, meaning the bytes would be read from outside the skill
+        /// directory through a symlink/junction.
+        /// </summary>
+        private static bool HasReparsePointBelow(string root, string full)
+        {
+            var current = full;
+            while (current.Length > root.Length)
+            {
+                try
+                {
+                    if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                        return true;
+                }
+                catch (Exception)
+                {
+                    // Vanished mid-enumeration; the read attempt below will
+                    // surface a warning instead.
+                }
+                var parent = Path.GetDirectoryName(current);
+                if (string.IsNullOrEmpty(parent) || parent.Length <= root.Length) break;
+                current = parent;
+            }
+            return false;
         }
 
         internal static PieSkillDelivery ParseDelivery(string content)
@@ -239,6 +368,23 @@ namespace Pie.Editor
                 if (!string.Equals(a.description, b.description, StringComparison.Ordinal)) return false;
                 if (!string.Equals(a.content, b.content, StringComparison.Ordinal)) return false;
                 if (a.delivery != b.delivery) return false;
+                if (!FilesEqual(a.files, b.files)) return false;
+            }
+            return true;
+        }
+
+        private static bool FilesEqual(PieSkillFileEntry[] a, PieSkillFileEntry[] b)
+        {
+            var left = a ?? Array.Empty<PieSkillFileEntry>();
+            var right = b ?? Array.Empty<PieSkillFileEntry>();
+            if (left.Length != right.Length) return false;
+            for (var i = 0; i < left.Length; i++)
+            {
+                var fa = left[i];
+                var fb = right[i];
+                if (fa == null || fb == null) return fa == fb;
+                if (!string.Equals(fa.path, fb.path, StringComparison.Ordinal)) return false;
+                if (!string.Equals(fa.content, fb.content, StringComparison.Ordinal)) return false;
             }
             return true;
         }

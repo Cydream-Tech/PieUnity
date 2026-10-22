@@ -79,6 +79,8 @@ namespace NPBehave
             else
             {
                 this.clock.RemoveTimer(this.mainNode.Start);
+                this.blackboard.Disable();
+                Stopped(false);
             }
         }
 

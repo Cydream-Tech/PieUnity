@@ -306,12 +306,14 @@ namespace Pie
             {
                 if (!payload.replaceExisting)
                     throw new InvalidOperationException("Behavior tree already exists: " + treeId);
-                Destroy(treeId);
             }
 
             var instance = new BehaviorTreeInstance(treeId, string.IsNullOrWhiteSpace(payload.name) ? treeId : payload.name.Trim());
-            SetBlackboardEntries(instance, payload.blackboard);
             instance.Root = new NPRoot(instance.Blackboard, instance.Clock, CompileNode(instance, payload.root));
+            SetBlackboardEntries(instance, payload.blackboard);
+            // Validate the replacement before removing the current strategy and its receivers.
+            if (Trees.ContainsKey(treeId))
+                Destroy(treeId);
             Trees[treeId] = instance;
             instance.Log("created");
             if (payload.start)
@@ -410,7 +412,7 @@ namespace Pie
         private static void Stop(string treeId)
         {
             var instance = RequireTree(treeId);
-            if (instance.Root.CurrentState == NPNode.State.ACTIVE || instance.Root.CurrentState == NPNode.State.STOP_REQUESTED)
+            if (instance.Root.CurrentState == NPNode.State.ACTIVE)
             {
                 instance.Root.Stop();
                 instance.Log("stopped");
@@ -423,8 +425,9 @@ namespace Pie
                 throw new InvalidOperationException("treeId is required.");
             if (!Trees.TryGetValue(treeId, out var instance))
                 return;
-            if (instance.Root != null && (instance.Root.CurrentState == NPNode.State.ACTIVE || instance.Root.CurrentState == NPNode.State.STOP_REQUESTED))
+            if (instance.Root != null && instance.Root.CurrentState == NPNode.State.ACTIVE)
                 instance.Root.Stop();
+            instance.Blackboard.Disable();
             Trees.Remove(treeId);
             PieBehaviorTreeActionRegistry.UnregisterTree(treeId);
             instance.Log("destroyed");
@@ -650,6 +653,7 @@ namespace Pie
                     node = new NPBehave.Wait(Math.Max(0f, spec.seconds));
                     break;
                 case "action":
+                    RequireText(spec.action, "action.action");
                     node = new NPAction(() => ExecuteAction(instance, spec));
                     break;
                 case "succeed":
@@ -1127,7 +1131,7 @@ namespace Pie
             public readonly NPBehave.Clock Clock;
             public readonly NPBlackboard Blackboard;
             public readonly Dictionary<string, PieBehaviorTreeBlackboardEntry> BlackboardMirror =
-                new Dictionary<string, PieBehaviorTreeBlackboardEntry>(StringComparer.OrdinalIgnoreCase);
+                new Dictionary<string, PieBehaviorTreeBlackboardEntry>(StringComparer.Ordinal);
             public readonly Dictionary<string, ActionThrottleState> ActionThrottleStates =
                 new Dictionary<string, ActionThrottleState>(StringComparer.OrdinalIgnoreCase);
             public readonly List<string> Logs = new List<string>();
@@ -1343,7 +1347,27 @@ namespace Pie
                 index += 4;
                 if (!int.TryParse(hex, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var codePoint))
                     throw new InvalidOperationException("Invalid JSON unicode escape: " + hex + ".");
-                return char.ConvertFromUtf32(codePoint);
+                // Standard JSON UTF-16 semantics: a high surrogate must be paired
+                // with a low surrogate escape; lone halves would inject invalid
+                // UTF-16 into behavior-tree strings.
+                if (codePoint >= 0xD800 && codePoint <= 0xDBFF)
+                {
+                    // index already points past the first escape, so the low half
+                    // must be another \uXXXX escape starting right here.
+                    if (index + 2 > json.Length || json[index] != '\\' || json[index + 1] != 'u')
+                        throw new InvalidOperationException("Unpaired JSON unicode escape: high surrogate \\u" + hex + " must be followed by a low surrogate escape.");
+                    if (index + 6 > json.Length)
+                        throw new InvalidOperationException("Incomplete JSON unicode escape.");
+                    var lowHex = json.Substring(index + 2, 4);
+                    if (!int.TryParse(lowHex, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var lowCodePoint)
+                        || lowCodePoint < 0xDC00 || lowCodePoint > 0xDFFF)
+                        throw new InvalidOperationException("Unpaired JSON unicode escape: high surrogate \\u" + hex + " must be followed by a low surrogate escape, got \\u" + lowHex + ".");
+                    index += 6;
+                    return char.ConvertFromUtf32(0x10000 + ((codePoint - 0xD800) << 10) + (lowCodePoint - 0xDC00));
+                }
+                if (codePoint >= 0xDC00 && codePoint <= 0xDFFF)
+                    throw new InvalidOperationException("Unpaired JSON unicode escape: low surrogate \\u" + hex + " without a preceding high surrogate.");
+                return ((char)codePoint).ToString();
             }
 
             private object ParseLiteral(string literal, object value)

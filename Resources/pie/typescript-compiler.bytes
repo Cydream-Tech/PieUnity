@@ -6,7 +6,74 @@ if(typeof fetch==="undefined"){
   globalThis.Headers=function Headers(init){var h={};this.append=function(k,v){h[k.toLowerCase()]=v;};this.get=function(k){return h[k.toLowerCase()]||null;};this.set=function(k,v){h[k.toLowerCase()]=v;};this.has=function(k){return k.toLowerCase() in h;};this.delete=function(k){delete h[k.toLowerCase()];};this.forEach=function(fn){Object.keys(h).forEach(function(k){fn(h[k],k);});};};
 }
 if(typeof URL==="undefined"){
-  globalThis.URL=function URL(input,base){var value=String(input||"");if(base&&!/^https?:\/\//i.test(value)){value=String(base).replace(/\/+$/,"")+"/"+value.replace(/^\/+/, "");}this.href=value;var m=value.match(/^([a-z]+:)\/\/([^\/\?#]*)([^\?#]*)(\?[^#]*)?/i);this.protocol=m?m[1]:"";this.hostname=m?m[2].split("@").pop().split(":")[0]:"";this.pathname=m?m[3]||"/":value;this.search=m&&m[4]?m[4]:"";};
+  globalThis.URL=function URL(input,base){
+    var value=String(input==null?"":input);
+    // Special-scheme normalization (WHATWG): lowercase the scheme and treat
+    // backslashes as slashes, so "HTTP://a\@b/" cannot smuggle an
+    // authority past the host parser and "\\evil.com" behaves like
+    // "//evil.com". Non-special schemes keep their opaque form.
+    var BS=String.fromCharCode(92);
+    var sm=value.match(/^([a-z][a-z0-9+.\-]*:)(.*)$/i);
+    if(sm){
+      var sl=sm[1].toLowerCase();
+      if(sl==="http:"||sl==="https:"||sl==="ws:"||sl==="wss:"||sl==="ftp:")value=sl+sm[2].split(BS).join("/");
+    }else if(value.substring(0,2)===BS+BS){
+      value=value.split(BS).join("/");
+    }
+    if(base&&!/^[a-z][a-z0-9+.\-]*:/i.test(value)){
+      var b=String(base).split("#")[0];
+      var scheme=b.match(/^[a-z][a-z0-9+.\-]*:/i);
+      if(value.substring(0,2)==="//"){
+        value=(scheme?scheme[0]:"http:")+value;
+      }else if(value.charAt(0)==="#"){
+        value=b+value;
+      }else if(value.charAt(0)==="?"){
+        value=b.split("?")[0]+value;
+      }else if(value.charAt(0)==="/"){
+        var origin=b.match(/^[a-z][a-z0-9+.\-]*:\/\/[^\/?#]*/i);
+        value=(origin?origin[0]:"")+value;
+      }else{
+        var dir=b.split("?")[0];
+        if(/^[a-z][a-z0-9+.\-]*:\/\/[^\/?#]*$/i.test(dir))dir+="/";
+        dir=dir.replace(/[^\/]*$/,"");
+        var joined=dir+value;
+        var jo=joined.match(/^[a-z][a-z0-9+.\-]*:\/\/[^\/?#]*/i);
+        var rest=jo?joined.substring(jo[0].length):joined;
+        var q=rest.indexOf("?");
+        var pathOnly=q>=0?rest.substring(0,q):rest;
+        var out=[];
+        var segs=pathOnly.split("/");
+        for(var i=0;i<segs.length;i++){
+          var s=segs[i];
+          if(s===".")continue;
+          if(s===".."){if(out.length>1)out.pop();continue;}
+          out.push(s);
+        }
+        if((segs[segs.length-1]==="."||segs[segs.length-1]==="..")&&out[out.length-1]!=="")out.push("");
+        value=(jo?jo[0]:"")+(out.join("/")||"/")+(q>=0?rest.substring(q):"");
+      }
+    }
+    this.href=value;
+    var m=value.match(/^([a-z][a-z0-9+.\-]*:)\/\/([^\/?#]*)([^\?#]*)(\?[^#]*)?/i);
+    this.protocol=m?m[1].toLowerCase():"";
+    this.hostname=m?(function(host){
+      // Userinfo is stripped FIRST: checking for a leading "[" before the
+      // "@" split let "http://user@[::1]/" collapse the host to "[".
+      // Percent-decode like the WHATWG host parser so policy checks see
+      // "127.0.0.1" for "http://%31%32%37%2e%30%2e%30%2e%31/"; sequences
+      // that cannot decode keep their raw form (native WHATWG URLs reject
+      // such hosts outright).
+      var at=host.split("@");
+      var raw=at[at.length-1];
+      var bare;
+      try{bare=decodeURIComponent(raw);}catch(e){bare=raw;}
+      var v6=bare.match(/^\[([^\]]*)\]/);
+      if(v6)return ("["+v6[1]+"]").toLowerCase();
+      return bare.split(":")[0].toLowerCase();
+    })(m[2]):"";
+    this.pathname=m?(m[3]||"/"):value;
+    this.search=m&&m[4]?m[4]:"";
+  };
   globalThis.URL.prototype.toString=function(){return this.href;};
 }
 if(typeof Buffer==="undefined"){
@@ -20,11 +87,11 @@ if(typeof Buffer==="undefined"){
 }
 if(typeof AbortController==="undefined"){
   globalThis.AbortSignal=function AbortSignal(){this.aborted=false;this.reason=undefined;this._listeners=[];this.onabort=null;};
-  globalThis.AbortSignal.prototype.addEventListener=function(t,fn){if(t==="abort")this._listeners.push(fn);};
+  globalThis.AbortSignal.prototype.addEventListener=function(t,fn){if(t!=="abort"||typeof fn!=="function")return;if(this._listeners.indexOf(fn)>=0)return;this._listeners.push(fn);};
   globalThis.AbortSignal.prototype.removeEventListener=function(t,fn){this._listeners=this._listeners.filter(function(l){return l!==fn;});};
   globalThis.AbortSignal.prototype.throwIfAborted=function(){if(this.aborted){var e=new Error("This operation was aborted");e.name="AbortError";throw e;}};
   globalThis.AbortController=function AbortController(){this.signal=new AbortSignal();};
-  globalThis.AbortController.prototype.abort=function(reason){if(this.signal.aborted)return;this.signal.aborted=true;this.signal.reason=reason||"AbortError";if(this.signal.onabort)this.signal.onabort({type:"abort"});this.signal._listeners.forEach(function(fn){fn({type:"abort"});});};
+  globalThis.AbortController.prototype.abort=function(reason){if(this.signal.aborted)return;this.signal.aborted=true;this.signal.reason=reason||"AbortError";var ls=this.signal._listeners.slice();this.signal._listeners.length=0;if(this.signal.onabort){try{this.signal.onabort({type:"abort"});}catch(e){}}for(var i=0;i<ls.length;i++){try{ls[i]({type:"abort"});}catch(e){}}};
 }
 "use strict";var _PieTypeScriptCompilerBundle=(()=>{var Ppt=Object.create;var YX=Object.defineProperty;var wpt=Object.getOwnPropertyDescriptor;var Npt=Object.getOwnPropertyNames;var Apt=Object.getPrototypeOf,Ipt=Object.prototype.hasOwnProperty;var _ge=(Vs=>typeof require<"u"?require:typeof Proxy<"u"?new Proxy(Vs,{get:(to,$c)=>(typeof require<"u"?require:to)[$c]}):Vs)(function(Vs){if(typeof require<"u")return require.apply(this,arguments);throw Error('Dynamic require of "'+Vs+'" is not supported')});var Rw=(Vs,to,$c)=>()=>{if($c)throw $c[0];try{return Vs&&(to=Vs(Vs=0)),to}catch(nd){throw $c=[nd],nd}};var Fpt=(Vs,to)=>()=>{try{return to||Vs((to={exports:{}}).exports,to),to.exports}catch($c){throw to=0,$c}},jw=(Vs,to)=>{for(var $c in to)YX(Vs,$c,{get:to[$c],enumerable:!0})},M5e=(Vs,to,$c,nd)=>{if(to&&typeof to=="object"||typeof to=="function")for(let kd of Npt(to))!Ipt.call(Vs,kd)&&kd!==$c&&YX(Vs,kd,{get:()=>to[kd],enumerable:!(nd=wpt(to,kd))||nd.enumerable});return Vs};var Opt=(Vs,to,$c)=>($c=Vs!=null?Ppt(Apt(Vs)):{},M5e(to||!Vs||!Vs.__esModule?YX($c,"default",{value:Vs,enumerable:!0}):$c,Vs)),X6=Vs=>M5e(YX({},"__esModule",{value:!0}),Vs);var j5e={};jw(j5e,{default:()=>Lpt,performance:()=>R5e});var R5e,Lpt,B5e=Rw(()=>{R5e={now:()=>Date.now()},Lpt={performance:R5e}});var fge={};jw(fge,{appendFileSync:()=>Mpt,default:()=>Gpt,existsSync:()=>Rpt,mkdirSync:()=>jpt,opendirSync:()=>Upt,promises:()=>Hpt,readFileSync:()=>zpt,readdirSync:()=>Wpt,renameSync:()=>Bpt,statSync:()=>qpt,unlinkSync:()=>Vpt,writeFileSync:()=>Jpt});var Mpt,Rpt,jpt,Bpt,Jpt,zpt,Wpt,Upt,Vpt,qpt,Hpt,Gpt,pge=Rw(()=>{Mpt=()=>{},Rpt=()=>!1,jpt=()=>{},Bpt=()=>{},Jpt=()=>{},zpt=()=>"",Wpt=()=>[],Upt=()=>({readSync:()=>null,closeSync:()=>{}}),Vpt=()=>{},qpt=()=>({isFile:()=>!1,isDirectory:()=>!1,size:0}),Hpt={},Gpt={}});var $5e={};jw($5e,{basename:()=>W5e,default:()=>Xpt,dirname:()=>z5e,extname:()=>U5e,isAbsolute:()=>H5e,join:()=>J5e,normalize:()=>q5e,relative:()=>G5e,resolve:()=>V5e,sep:()=>$pt});var $pt,J5e,z5e,W5e,U5e,V5e,q5e,H5e,G5e,Xpt,X5e=Rw(()=>{$pt="/",J5e=(...Vs)=>Vs.filter(Boolean).join("/").replace(/\/+/g,"/"),z5e=Vs=>Vs.split("/").slice(0,-1).join("/")||"/",W5e=(Vs,to)=>{let $c=Vs.split("/").pop()||"";return to&&$c.endsWith(to)?$c.slice(0,-to.length):$c},U5e=Vs=>{let to=Vs.split("/").pop()||"",$c=to.lastIndexOf(".");return $c>0?to.slice($c):""},V5e=(...Vs)=>Vs.join("/"),q5e=Vs=>Vs.replace(/\/+/g,"/"),H5e=Vs=>Vs.startsWith("/"),G5e=(Vs,to)=>to,Xpt={sep:"/",join:J5e,dirname:z5e,basename:W5e,extname:U5e,resolve:V5e,normalize:q5e,isAbsolute:H5e,relative:G5e}});var eFe={};jw(eFe,{EOL:()=>Qpt,arch:()=>Y5e,default:()=>Ypt,homedir:()=>Z5e,platform:()=>Q5e,tmpdir:()=>K5e});var Q5e,Y5e,Z5e,K5e,Qpt,Ypt,tFe=Rw(()=>{Q5e=()=>"neutral",Y5e=()=>"x64",Z5e=()=>"/",K5e=()=>"/tmp",Qpt=`
 `,Ypt={platform:Q5e,arch:Y5e,homedir:Z5e,tmpdir:K5e,EOL:`

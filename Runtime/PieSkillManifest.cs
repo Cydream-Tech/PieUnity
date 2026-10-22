@@ -18,6 +18,17 @@ namespace Pie
     }
 
     [Serializable]
+    public sealed class PieSkillFileEntry
+    {
+        /// Path relative to the skill directory, '/'-separated (e.g.
+        /// "references/api.md"). Served by the JS runtime as a virtual file
+        /// under pie-skill/<name>/<path> so player builds can read_file
+        /// companion files that no longer exist on disk.
+        public string path = "";
+        public string content = "";
+    }
+
+    [Serializable]
     public sealed class PieSkillManifestEntry
     {
         public string name = "";
@@ -25,17 +36,32 @@ namespace Pie
         /// Full SKILL.md content, inlined so player builds need no filesystem.
         public string content = "";
         public PieSkillDelivery delivery = PieSkillDelivery.All;
+        /// Companion files (scripts, references) baked alongside SKILL.md.
+        /// Empty for loose-file skills and skills with no extra files.
+        public PieSkillFileEntry[] files = Array.Empty<PieSkillFileEntry>();
 
         public PieSkillManifestEntry Clone()
         {
-            return new PieSkillManifestEntry
+            var clone = new PieSkillManifestEntry
             {
                 name = name,
                 description = description,
                 content = content,
                 delivery = delivery,
+            };
+            if (files != null && files.Length > 0)
+            {
+                clone.files = new PieSkillFileEntry[files.Length];
+                for (var i = 0; i < files.Length; i++)
+                {
+                    var file = files[i];
+                    clone.files[i] = file == null
+                        ? new PieSkillFileEntry()
+                        : new PieSkillFileEntry { path = file.path, content = file.content };
+                }
             }
-;        }
+            return clone;
+        }
     }
 
     /// <summary>
@@ -91,7 +117,22 @@ namespace Pie
                 builder.Append("{\"name\":").Append(Escape(entry.name));
                 builder.Append(",\"description\":").Append(Escape(entry.description));
                 builder.Append(",\"content\":").Append(Escape(entry.content));
-                builder.Append(",\"delivery\":\"").Append(entry.delivery).Append("\"}");
+                builder.Append(",\"delivery\":\"").Append(entry.delivery).Append("\"");
+                if (entry.files != null && entry.files.Length > 0)
+                {
+                    builder.Append(",\"files\":[");
+                    var firstFile = true;
+                    foreach (var file in entry.files)
+                    {
+                        if (file == null || string.IsNullOrEmpty(file.path)) continue;
+                        if (!firstFile) builder.Append(",");
+                        firstFile = false;
+                        builder.Append("{\"path\":").Append(Escape(file.path));
+                        builder.Append(",\"content\":").Append(Escape(file.content)).Append("}");
+                    }
+                    builder.Append("]");
+                }
+                builder.Append("}");
             }
             builder.Append("]");
             return builder.ToString();

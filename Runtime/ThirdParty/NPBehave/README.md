@@ -7,3 +7,5 @@ This directory contains a source vendor copy of NPBehave runtime scripts.
 - License: MIT, preserved in `LICENSE.NPBehave.txt`
 
 pie-unity intentionally vendors the source instead of depending on future upstream package updates. Do not update this copy casually; behavior-tree integration depends on the current public `NPBehave` namespace and runtime node semantics.
+
+Local fix: stopping a Root after an instant child completes cancels its pending restart timer, disables its blackboard, and settles the Root to INACTIVE. This keeps Stop/Start/Destroy valid between child evaluations.

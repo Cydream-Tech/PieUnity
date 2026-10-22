@@ -28,6 +28,94 @@ namespace Pie.Editor
         private string _source;
         private List<Block> _blocks;
         private static Font _codeFont;
+        private static bool _codeFontIsOsCreated;
+
+        // GUIStyles are cached, not rebuilt per OnGUI repaint: allocating them
+        // per block per frame churned GC and, combined with a DontSave-flagged
+        // font below, surfaced as editor assertions (see ReleaseCachedGuiResources).
+        private static bool _stylesDark = true;
+        private static GUIStyle _body;
+        private static GUIStyle _heading1;
+        private static GUIStyle _heading2;
+        private static GUIStyle _heading3;
+        private static GUIStyle _quote;
+        private static GUIStyle _code;
+        private static GUIStyle _codePanel;
+        private static GUIStyle _tableHeader;
+        private static GUIStyle _tableCell;
+
+        static PieChatMarkdown()
+        {
+            // The dynamic OS font has NO DontSave hide flags: TextCore grows its
+            // glyph atlas via AssetDatabase.AddObjectToAsset, which asserts on
+            // kDontSaveInEditor objects (the "CalcHeight" assertion spam).
+            // Without the flag the resource manager owns the atlas cleanly; we
+            // destroy the font explicitly before a domain reload instead.
+            AssemblyReloadEvents.beforeAssemblyReload += ReleaseCachedGuiResources;
+        }
+
+        private static void ReleaseCachedGuiResources()
+        {
+            // Only the OS-created font is ours to destroy; the builtin
+            // LegacyRuntime.ttf fallback is a shared engine resource.
+            if (_codeFont != null && _codeFontIsOsCreated)
+            {
+                UnityEngine.Object.DestroyImmediate(_codeFont);
+            }
+            _codeFont = null;
+            _codeFontIsOsCreated = false;
+            _body = null;
+            _heading1 = null;
+            _heading2 = null;
+            _heading3 = null;
+            _quote = null;
+            _code = null;
+            _codePanel = null;
+            _tableHeader = null;
+            _tableCell = null;
+        }
+
+        private static Font ResolveCodeFont()
+        {
+            if (_codeFont != null) return _codeFont;
+            // CreateDynamicFontFromOSFont returns null when none of the OS
+            // fonts are available instead of throwing; probe candidates
+            // one by one and fall back to the built-in font so code blocks
+            // never take the chat window down with a NullReferenceException.
+            foreach (var fontName in new[] { "Menlo", "Consolas", "Liberation Mono", "Courier New", "Monospace" })
+            {
+                var candidate = Font.CreateDynamicFontFromOSFont(fontName, 12);
+                if (candidate == null) continue;
+                _codeFont = candidate;
+                _codeFontIsOsCreated = true;
+                break;
+            }
+            if (_codeFont == null)
+                _codeFont = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+            return _codeFont;
+        }
+
+        private static void EnsureStyles(bool dark)
+        {
+            var font = ResolveCodeFont();
+            if (_body != null && _stylesDark == dark && _code != null && _code.font == font) return;
+            _stylesDark = dark;
+            _body = new GUIStyle(EditorStyles.wordWrappedLabel)
+            {
+                fontSize = 13, richText = true, wordWrap = true,
+                padding = new RectOffset(0, 0, 2, 2), margin = new RectOffset(0, 0, 0, 0)
+            };
+            _body.normal.textColor = dark ? new Color(.84f, .85f, .87f) : new Color(.16f, .17f, .19f);
+            _heading1 = new GUIStyle(_body) { fontSize = 21, fontStyle = FontStyle.Bold };
+            _heading2 = new GUIStyle(_body) { fontSize = 17, fontStyle = FontStyle.Bold };
+            _heading3 = new GUIStyle(_body) { fontSize = 14, fontStyle = FontStyle.Bold };
+            _quote = new GUIStyle(_body);
+            _quote.normal.textColor = dark ? new Color(.65f, .69f, .75f) : new Color(.36f, .4f, .45f);
+            _codePanel = new GUIStyle(EditorStyles.helpBox) { padding = new RectOffset(10, 10, 8, 8) };
+            _code = new GUIStyle(EditorStyles.wordWrappedLabel) { font = font, fontSize = 12, richText = false, wordWrap = true };
+            _tableHeader = new GUIStyle(_body) { padding = new RectOffset(7, 7, 6, 6), fontStyle = FontStyle.Bold };
+            _tableCell = new GUIStyle(_body) { padding = new RectOffset(7, 7, 6, 6) };
+        }
 
         internal static List<Block> Parse(string source)
         {
@@ -165,47 +253,38 @@ namespace Pie.Editor
         {
             if (_blocks == null || _source != source) { _source = source; _blocks = Parse(source); }
             var dark = EditorGUIUtility.isProSkin;
-            var body = new GUIStyle(EditorStyles.wordWrappedLabel)
-            {
-                fontSize = 13, richText = true, wordWrap = true,
-                padding = new RectOffset(0, 0, 2, 2), margin = new RectOffset(0, 0, 0, 0)
-            };
-            body.normal.textColor = dark ? new Color(.84f, .85f, .87f) : new Color(.16f, .17f, .19f);
+            EnsureStyles(dark);
             for (var i = 0; i < _blocks.Count; i++)
             {
                 var block = _blocks[i];
                 if (i > 0) GUILayout.Space(block.Kind == "list" && _blocks[i - 1].Kind == "list" ? 2 : 9);
                 if (block.Kind == "code") { DrawCode(block.Text, block.Marker, width); continue; }
-                if (block.Kind == "table") { DrawTable(block.Rows, body, width, dark); continue; }
+                if (block.Kind == "table") { DrawTable(block.Rows, width, dark); continue; }
                 if (block.Kind == "divider")
                 {
                     var rule = GUILayoutUtility.GetRect(0, 1, GUILayout.ExpandWidth(true));
                     EditorGUI.DrawRect(rule, dark ? new Color(1, 1, 1, .15f) : new Color(0, 0, 0, .15f));
                     continue;
                 }
-                var style = new GUIStyle(body);
-                if (block.Kind == "heading")
-                {
-                    style.fontSize = block.Level == 1 ? 21 : block.Level == 2 ? 17 : 14;
-                    style.fontStyle = FontStyle.Bold;
-                }
+                var style = block.Kind == "heading"
+                    ? (block.Level == 1 ? _heading1 : block.Level == 2 ? _heading2 : _heading3)
+                    : _body;
                 var text = FormatInline(block.Text, dark);
                 if (block.Kind == "list")
                 {
                     var indent = block.Level * 14f;
                     var height = style.CalcHeight(new GUIContent(text), Mathf.Max(40, width - indent - 30));
                     var rect = GUILayoutUtility.GetRect(0, height, GUILayout.ExpandWidth(true));
-                    GUI.Label(new Rect(rect.x + indent, rect.y, 26, rect.height), block.Marker, body);
+                    GUI.Label(new Rect(rect.x + indent, rect.y, 26, rect.height), block.Marker, _body);
                     rect.xMin += indent + 26;
                     EditorGUI.SelectableLabel(rect, text, style);
                 }
                 else if (block.Kind == "quote")
                 {
-                    style.normal.textColor = dark ? new Color(.65f, .69f, .75f) : new Color(.36f, .4f, .45f);
-                    var rect = GUILayoutUtility.GetRect(0, style.CalcHeight(new GUIContent(text), Math.Max(40, width - 16)), GUILayout.ExpandWidth(true));
+                    var rect = GUILayoutUtility.GetRect(0, _quote.CalcHeight(new GUIContent(text), Math.Max(40, width - 16)), GUILayout.ExpandWidth(true));
                     EditorGUI.DrawRect(new Rect(rect.x, rect.y, 3, rect.height), new Color(.45f, .55f, .7f, .7f));
                     rect.xMin += 14;
-                    EditorGUI.SelectableLabel(rect, text, style);
+                    EditorGUI.SelectableLabel(rect, text, _quote);
                 }
                 else DrawText(text, style, width);
             }
@@ -219,44 +298,26 @@ namespace Pie.Editor
 
         internal static void DrawCode(string text, string language, float width)
         {
-            var panel = new GUIStyle(EditorStyles.helpBox) { padding = new RectOffset(10, 10, 8, 8) };
-            EditorGUILayout.BeginVertical(panel);
+            EnsureStyles(EditorGUIUtility.isProSkin);
+            EditorGUILayout.BeginVertical(_codePanel);
             EditorGUILayout.BeginHorizontal();
             GUILayout.Label(string.IsNullOrEmpty(language) ? "Code" : language, EditorStyles.miniLabel);
             GUILayout.FlexibleSpace();
             if (GUILayout.Button("Copy", EditorStyles.miniButton, GUILayout.Width(44))) EditorGUIUtility.systemCopyBuffer = text;
             EditorGUILayout.EndHorizontal();
             GUILayout.Space(4);
-            if (_codeFont == null)
-            {
-                // CreateDynamicFontFromOSFont returns null when none of the OS
-                // fonts are available instead of throwing; probe candidates
-                // one by one and fall back to the built-in font so code blocks
-                // never take the chat window down with a NullReferenceException.
-                foreach (var fontName in new[] { "Menlo", "Consolas", "Liberation Mono", "Courier New", "Monospace" })
-                {
-                    var candidate = Font.CreateDynamicFontFromOSFont(fontName, 12);
-                    if (candidate == null) continue;
-                    _codeFont = candidate;
-                    _codeFont.hideFlags = HideFlags.HideAndDontSave;
-                    break;
-                }
-                if (_codeFont == null)
-                    _codeFont = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
-            }
-            var codeStyle = new GUIStyle(EditorStyles.wordWrappedLabel) { font = _codeFont, fontSize = 12, richText = false, wordWrap = true };
-            DrawText(text, codeStyle, width - 24);
+            DrawText(text, _code, width - 24);
             EditorGUILayout.EndVertical();
         }
 
-        private static void DrawTable(List<string[]> rows, GUIStyle body, float width, bool dark)
+        private static void DrawTable(List<string[]> rows, float width, bool dark)
         {
             var columns = rows[0].Length;
             foreach (var row in rows) columns = Math.Max(columns, row.Length);
             var cellWidth = Mathf.Max(30, width / columns);
             for (var r = 0; r < rows.Count; r++)
             {
-                var style = new GUIStyle(body) { padding = new RectOffset(7, 7, 6, 6), fontStyle = r == 0 ? FontStyle.Bold : FontStyle.Normal };
+                var style = r == 0 ? _tableHeader : _tableCell;
                 var height = 24f;
                 for (var c = 0; c < columns; c++)
                     height = Mathf.Max(height, style.CalcHeight(new GUIContent(c < rows[r].Length ? FormatInline(rows[r][c], dark) : ""), cellWidth));

@@ -11,7 +11,7 @@ const DEFAULT_WAIT_MS = 600;
 const DEFAULT_RETRIES = 30;
 const ACTIVE_INSTANCE_MAX_AGE_SEC = 120;
 const EXPECTED_SKILL_PROTOCOL_VERSION = "pie-unity-rpc/2";
-const KNOWN_FLAGS = new Set(["project", "instance", "port", "namespace", "name", "data", "tool", "method", "token", "retries", "waitMs", "configSettleMs", "json", "full", "help"]);
+const KNOWN_FLAGS = new Set(["project", "instance", "port", "namespace", "name", "data", "tool", "method", "file", "probe", "token", "retries", "waitMs", "configSettleMs", "json", "full", "help"]);
 let outputFlags = {};
 
 class InstanceSelectionError extends Error {
@@ -473,7 +473,7 @@ export async function runCli(argv = process.argv) {
 	const { command, flags } = parseArgs(argv);
 	outputFlags = flags;
 	if (flags.help === "true" || command === "help") {
-		writeJson({ description: "Inspect and operate the current pie-unity host.", commands: ["instances", "health", "manifest", "query", "inspect", "edit", "log-read", "script-run", "tool", "rpc"], help: ["Use --project <path> to select a Unity project.", "Use --json for machine JSON or --full for untruncated TOON."] });
+		writeJson({ description: "Inspect and operate the current pie-unity host.", commands: ["instances", "health", "manifest", "query", "inspect", "edit", "log-read", "script-run", "tool", "rpc", "skill-lint"], help: ["Use --project <path> to select a Unity project.", "Use --json for machine JSON or --full for untruncated TOON.", "skill-lint --file <SKILL.md|dir> [--probe] static checks; --probe also live-verifies runtime.call paths against the selected instance."] });
 		return;
 	}
 	if (command === "instances") {
@@ -488,6 +488,37 @@ export async function runCli(argv = process.argv) {
 	}
 
 	switch (command) {
+		case "skill-lint": {
+			const target = String(flags.file || "").trim();
+			if (!target) throw new Error("--file <SKILL.md or skill dir> is required");
+			const { lintSkillPath, extractRuntimeCallPaths } = await import(new URL("../../scripts/skill-lint.mjs", import.meta.url));
+			const { readFile } = await import("node:fs/promises");
+			const result = lintSkillPath(target);
+			let probes = [];
+			if (flags.probe === "true") {
+				const content = await readFile(result.file, "utf8");
+				const runtimePaths = extractRuntimeCallPaths(content);
+				if (runtimePaths.length > 0) {
+					const probeScript = `export async function run(ctx, args) { const out = {}; for (const p of args.paths) { try { out[p] = Boolean(await ctx.runtime.has(p)); } catch (e) { out[p] = "error:" + String(e && e.message || e).slice(0, 60); } } return out; }`;
+					const selection = flags.instance || flags.project;
+				const extra = selection ? (flags.instance ? ["--instance", flags.instance] : ["--project", flags.project]) : [];
+					const child = await import("node:child_process");
+					const { promisify } = await import("node:util");
+					const execFile = promisify(child.execFile);
+					const payload = JSON.stringify({ script: probeScript, args: { paths: runtimePaths }, totalTimeoutMs: 30000, perStepTimeoutMs: 10000, maxFrames: 600 });
+					try {
+						const { stdout } = await execFile(process.execPath, [fileURLToPath(import.meta.url), "script-run", ...extra.map((v) => String(v)), "--data", payload, "--json"], { timeout: 60000, maxBuffer: 4e6 });
+						const parsed = JSON.parse(stdout);
+						const probed = parsed?.result?.result ?? {};
+						probes = runtimePaths.map((p) => ({ runtimePath: p, resolvable: probed[p] === true }));
+					} catch (error) {
+						probes = [{ runtimePath: "(probe failed)", resolvable: false, error: String(error?.message || error).slice(0, 120) }];
+					}
+				}
+			}
+			writeJson({ target, findings: result.findings, probes });
+			return;
+		}
 		case "health": {
 			const instance = await selectReadyInstance(loadRegistry(), flags);
 			const baseUrl = `http://127.0.0.1:${instance.port}`;

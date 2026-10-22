@@ -30,12 +30,103 @@ namespace Pie
     /// </summary>
     public static class PieHttpBridge
     {
-        private static readonly HttpClient _httpClient = CreateHttpClient();
+        private static readonly HttpClient _httpClient = CreateHttpClient(allowAutoRedirect: true);
+
+    /// <summary>
+    /// Fetch client with automatic redirects DISABLED. Shared fetch callers
+    /// (web_fetch) follow redirects manually so every hop is validated before
+    /// the request is issued (private-network redirect safety); this client
+    /// surfaces the 3xx response — including the Location header — instead of
+    /// following it internally. Kept as a separate instance because provider
+    /// SSE/upload traffic on <see cref="_httpClient"/> keeps standard
+    /// auto-follow behavior.
+    /// </summary>
+    private static readonly HttpClient _manualRedirectHttpClient = CreateHttpClient(allowAutoRedirect: false);
 
         private static readonly ConcurrentDictionary<int, RequestState> _requests =
             new ConcurrentDictionary<int, RequestState>();
 
         private static int _nextRequestId = 1;
+
+        // ─────────────────────────────────────────────────────────────────
+        // Buffered fetch bounds
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Hard native backstop for buffered fetch reads (FetchTextAsync and the
+        /// UnityWebRequest TLS fallback). The managed text bridge used to call
+        /// ReadAsStringAsync() (and the fallback used DownloadHandlerBuffer),
+        /// which buffers the whole body in the native heap with no limit; a
+        /// runaway response could take down the Unity player. The shared
+        /// web_fetch tool applies its own (smaller, configurable) limit on the
+        /// JS side; this cap only bounds native buffering. Bodies at or above
+        /// the cap are reported (bodyTruncated + bodyBytes/declaredBodyBytes)
+        /// so JS must surface an explicit limit error instead of reading the
+        /// truncated remainder as complete content.
+        /// Validation note: this bound is exercised by host-neutral adapter
+        /// tests (products/pie-unity/test/unity-fetch-adapter.test.ts) with a
+        /// simulated bridge; it has NOT been validated inside a live Unity
+        /// player/editor run in this change.
+        /// </summary>
+        private const int MaxBufferedFetchBytes = 16 * 1024 * 1024;
+
+        /// <summary>
+        /// Hard cap for error bodies read on the provider SSE non-2xx path. The
+        /// body only feeds state.Error and a clipped log line, so the cap is
+        /// small: bytes past it are read-and-counted, never buffered, and the
+        /// kept text is truncated with an explicit marker. Mirrors the bounded
+        /// FetchTextAsync read instead of ReadAsStringAsync, which would buffer
+        /// an arbitrarily large error body in native memory.
+        /// </summary>
+        private const int MaxErrorBodyBytes = 1024 * 1024; // 1 MiB
+
+        // ─────────────────────────────────────────────────────────────────
+        // SSE line-queue flow control (backpressure + hard caps)
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Backpressure watermarks for the SSE line queue shared between the
+        /// background read loop (producer) and the main-thread pump
+        /// (consumer; up to 3 lines/frame through PieBridge.PushSSEData).
+        /// When the queue passes the high watermark the producer pauses its
+        /// network reads by awaiting a resume signal; the pump releases that
+        /// signal once its forwarding drains the queue back to the low
+        /// watermark. Queue depth is tracked in UTF-16 chars, a close proxy
+        /// for bytes: SSE payloads are ASCII-dominated and any single line is
+        /// itself capped by MaxSseLineChars, so the char/byte gap can never
+        /// unbound the queue between checks.
+        /// Closed loop for abandoned responses: a stream nobody reads stops
+        /// pulling from the network at the high watermark and goes idle; the
+        /// JS-side per-chunk idle timeout then errors its iterator (whose
+        /// cleanup cancels the native request), and if no iterator ever ran,
+        /// the JS SSEBuffer hard cap fails the stream and cancels the request
+        /// directly. Either way the request and its queued lines are released
+        /// - nothing grows without bound and no producer waits forever on a
+        /// flow gate that will never be released.
+        /// </summary>
+        private const int LineQueueHighWatermarkLines = 1024;
+        private const int LineQueueLowWatermarkLines = 256;
+        private const long LineQueueHighWatermarkChars = 4L * 1024 * 1024;
+        private const long LineQueueLowWatermarkChars = 1L * 1024 * 1024;
+
+        /// <summary>
+        /// Hard backstop for the line queue. With backpressure working the
+        /// queue never approaches these numbers; if it still does (a consumer
+        /// racing the pump), the request fails with the explicit
+        /// sse_line_queue_overflow error and is cancelled instead of
+        /// buffering without bound.
+        /// </summary>
+        private const int LineQueueHardCapLines = 8192;
+        private const long LineQueueHardCapChars = 32L * 1024 * 1024;
+
+        /// <summary>
+        /// Single-line cap enforced by every SSE line buffer. A longer line
+        /// fails the request with the explicit sse_line_too_long error: a
+        /// JSON/SSE line past this size is a protocol violation, and
+        /// truncating it would deliver a corrupt payload as a complete line.
+        /// </summary>
+        private const int MaxSseLineChars = 2 * 1024 * 1024; // managed char paths
+        private const int MaxSseLineBytes = 2 * 1024 * 1024; // native byte-line path
 
         // ─────────────────────────────────────────────────────────────────────
         // Public API (called from JS via PuerTS)
@@ -119,12 +210,55 @@ namespace Pie
                 form.Add(new StringContent(string.IsNullOrWhiteSpace(purpose) ? "file-extract" : purpose), "purpose");
                 request.Content = form;
 
-                using var response = await _httpClient.SendAsync(request);
-                var body = await response.Content.ReadAsStringAsync();
+                // Headers-only completion (mirrors the buffered-fetch path):
+                // HttpClient must NOT buffer a runaway error body whole before
+                // the bounded reader below. A linked CTS owns the deadline
+                // across SendAsync and every body read and is disposed on all
+                // terminal paths.
+                using var timeoutCts = new CancellationTokenSource();
+                if (_httpClient.Timeout != Timeout.InfiniteTimeSpan)
+                    timeoutCts.CancelAfter(_httpClient.Timeout);
+
+                using var response = await _httpClient.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    timeoutCts.Token);
                 if (!response.IsSuccessStatusCode)
-                    throw new Exception($"HTTP {(int)response.StatusCode}: {body}");
+                {
+                    // Bounded like the SSE non-2xx path: a runaway error body
+                    // must never be buffered whole just to build an exception
+                    // message (ReadAsStringAsync would do exactly that).
+                    var errorBody = await ReadErrorBodyBoundedAsync(response.Content, timeoutCts.Token);
+                    throw new Exception($"HTTP {(int)response.StatusCode}: {errorBody}");
+                }
+                var body = await ReadBodyTextAsync(response.Content, timeoutCts.Token);
                 return body;
             });
+        }
+
+        /// <summary>
+        /// Cancellation-aware success-body read. ReadAsStringAsync's
+        /// (CancellationToken) overload does not exist on Unity's .NET profile
+        /// (CS1501, which fails the whole Pie.Runtime assembly in-editor), and
+        /// the parameterless overload ignores the deadline CTS — read the
+        /// stream manually with the token, bounded by MaxBufferedFetchBytes.
+        /// </summary>
+        private static async Task<string> ReadBodyTextAsync(HttpContent content, CancellationToken cancellationToken)
+        {
+            if (content == null) return string.Empty;
+            var charset = content.Headers?.ContentType?.CharSet;
+            using var stream = await content.ReadAsStreamAsync();
+            using var buffered = new MemoryStream();
+            var buffer = new byte[64 * 1024];
+            while (true)
+            {
+                var read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                if (read <= 0) break;
+                buffered.Write(buffer, 0, read);
+                if (buffered.Length > MaxBufferedFetchBytes)
+                    throw new Exception($"Response body exceeded {MaxBufferedFetchBytes} bytes");
+            }
+            return DecodeBodyText(buffered, charset);
         }
 
         /// <summary>
@@ -137,7 +271,8 @@ namespace Pie
             string url,
             string body,
             string bearerToken,
-            string headersJson = null)
+            string headersJson = null,
+            bool manualRedirect = false)
         {
             return Task.Run(async () =>
             {
@@ -183,13 +318,78 @@ namespace Pie
                     request.Content = new StringContent(body, Encoding.UTF8, contentType);
                 }
 
-                using var response = await _httpClient.SendAsync(
+                // Headers-only completion: HttpClient must NOT buffer the whole
+                // body before the bounded loop below. With ResponseHeadersRead,
+                // HttpClient.Timeout no longer covers the body phase, so a linked
+                // CTS owns the deadline across SendAsync and every body read.
+                // The CTS is disposed (timer released) on every terminal path:
+                // completion, truncation, fault, and cancellation.
+                using var timeoutCts = new CancellationTokenSource();
+                var client = manualRedirect ? _manualRedirectHttpClient : _httpClient;
+                if (client.Timeout != Timeout.InfiniteTimeSpan)
+                    timeoutCts.CancelAfter(client.Timeout);
+
+                using var response = await client.SendAsync(
                     request,
-                    HttpCompletionOption.ResponseContentRead);
-                var responseText = response.Content != null
-                    ? await response.Content.ReadAsStringAsync()
-                    : string.Empty;
-                var contentTypeHeader = response.Content?.Headers?.ContentType?.ToString() ?? string.Empty;
+                    HttpCompletionOption.ResponseHeadersRead,
+                    timeoutCts.Token);
+
+                // Manual-redirect callers need the response headers (Location
+                // above all) to validate and follow hops themselves; collect
+                // the non-content headers and hand them to JS verbatim.
+                Dictionary<string, string> responseHeaders = null;
+                if (manualRedirect)
+                {
+                    responseHeaders = new Dictionary<string, string>();
+                    foreach (var header in response.Headers)
+                    {
+                        if (header.Value == null) continue;
+                        responseHeaders[header.Key.ToLowerInvariant()] = string.Join(", ", header.Value);
+                    }
+                }
+
+                string responseText;
+                long observedBytes;
+                long declaredBodyBytes;
+                bool bodyTruncated;
+                var contentTypeHeader = response.Content?.Headers?.ContentType;
+                if (response.Content == null)
+                {
+                    responseText = string.Empty;
+                    observedBytes = 0;
+                    declaredBodyBytes = -1;
+                    bodyTruncated = false;
+                }
+                else
+                {
+                    // Bounded read: keep at most MaxBufferedFetchBytes bytes (plus
+                    // one detecting byte) so truncation is observable while native
+                    // buffering stays capped. observedBytes is the byte count the
+                    // native read actually received (the minimum body size);
+                    // declaredBodyBytes carries the server-declared Content-Length
+                    // when present. For a truncated body without Content-Length the
+                    // true complete size is unknown.
+                    declaredBodyBytes = response.Content.Headers?.ContentLength ?? -1;
+                    using var stream = await response.Content.ReadAsStreamAsync();
+                    using var buffered = new MemoryStream();
+                    var buffer = new byte[64 * 1024];
+                    long totalRead = 0;
+                    while (totalRead <= MaxBufferedFetchBytes)
+                    {
+                        var read = await stream.ReadAsync(buffer, 0, buffer.Length, timeoutCts.Token);
+                        if (read <= 0) break;
+                        var remaining = MaxBufferedFetchBytes + 1 - totalRead;
+                        var keep = (int)Math.Min(read, remaining);
+                        if (keep > 0) buffered.Write(buffer, 0, keep);
+                        totalRead += read;
+                        if (totalRead > MaxBufferedFetchBytes) break;
+                    }
+
+                    bodyTruncated = totalRead > MaxBufferedFetchBytes;
+                    observedBytes = totalRead;
+                    responseText = DecodeBodyText(buffered, contentTypeHeader?.CharSet);
+                }
+
                 var finalUrl = response.RequestMessage?.RequestUri?.ToString() ?? url;
 
                 return BuildFetchTextResponseJson(
@@ -197,9 +397,148 @@ namespace Pie
                     response.ReasonPhrase ?? string.Empty,
                     response.IsSuccessStatusCode,
                     finalUrl,
-                    contentTypeHeader,
-                    responseText);
+                    contentTypeHeader?.ToString() ?? string.Empty,
+                    responseText,
+                    observedBytes,
+                    declaredBodyBytes,
+                    bodyTruncated,
+                    responseHeaders);
             });
+        }
+
+        /// <summary>Create a capped receiver for the UnityWebRequest buffered fallback (see BoundedDownloadHandler).</summary>
+        public static BoundedDownloadHandler CreateBoundedDownloadHandler()
+        {
+            return new BoundedDownloadHandler(MaxBufferedFetchBytes);
+        }
+
+        /// <summary>
+        /// DownloadHandlerScript receiver for the UnityWebRequest TLS fallback of
+        /// ordinary buffered fetches: response data is accumulated on the managed
+        /// side under a hard cap, so an unbounded body can never balloon the
+        /// native heap the way DownloadHandlerBuffer does. Bytes past the cap are
+        /// counted and discarded, and IsTruncated() reports the stop so callers
+        /// surface an explicit limit error instead of reading a partial body as a
+        /// complete page. ReceiveData runs on the Unity main thread; the request
+        /// itself must be created and polled there (PuerTS JS already is).
+        /// </summary>
+        public sealed class BoundedDownloadHandler : DownloadHandlerScript
+        {
+            private readonly int _maxBytes;
+            private readonly MemoryStream _buffer = new MemoryStream();
+            private long _received;
+            private bool _truncated;
+
+            public BoundedDownloadHandler(int maxBytes)
+            {
+                _maxBytes = maxBytes;
+            }
+
+            // Unity main-thread callback. Contract (DownloadHandlerScript):
+            // return true to keep downloading, false to abort the transfer.
+            // Do not call base: the native-side buffer is exactly what we are
+            // avoiding.
+            protected override bool ReceiveData(byte[] data, int dataLength)
+            {
+                if (data == null || dataLength <= 0)
+                    return true;
+
+                _received += dataLength;
+                var remaining = _maxBytes - (long)_buffer.Length;
+                if (remaining <= 0)
+                {
+                    // Past the cap: abort the transfer so runaway or infinite
+                    // bodies are bounded at the network level, not only in
+                    // native memory.
+                    _truncated = true;
+                    return false;
+                }
+
+                if (dataLength > remaining)
+                {
+                    _truncated = true;
+                    _buffer.Write(data, 0, (int)remaining);
+                    return false;
+                }
+
+                _buffer.Write(data, 0, dataLength);
+                return true;
+            }
+
+            public bool IsTruncated() => _truncated;
+
+            /// <summary>Total bytes received from the network (>= buffered size when truncated).</summary>
+            public long ReceivedBytes() => _received;
+
+            public string GetBodyText(string charset)
+            {
+                return DecodeStreamText(_buffer, charset);
+            }
+
+            // Verified against actual Unity 6 (6000.0.67f1) assemblies via
+            // dotnet compile probe: DownloadHandler exposes a virtual
+            // parameterless Dispose(), not the .NET Dispose(bool) pattern.
+            // The handler owns its managed buffer; dispose it with the handler
+            // (Unity disposes download handlers with the request).
+            public override void Dispose()
+            {
+                _buffer.Dispose();
+                base.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Decode a buffered body honoring the declared charset with BOM
+        /// detection (matching ReadAsStringAsync-style decoding instead of
+        /// forcing UTF-8). Unknown or unavailable charset labels fall back to
+        /// UTF-8.
+        /// </summary>
+        private static string DecodeBodyText(MemoryStream bytes, string charset)
+        {
+            return DecodeStreamText(bytes, charset);
+        }
+
+        private static string DecodeStreamText(MemoryStream bytes, string charset)
+        {
+            // RFC 9110 allows quoted parameter values: charset="iso-8859-1".
+            var label = charset?.Trim().Trim('"');
+            var encoding = string.IsNullOrWhiteSpace(label) ? null : TryGetEncoding(label);
+            if (encoding == null)
+                encoding = Encoding.UTF8;
+
+            try
+            {
+                bytes.Position = 0;
+                // leaveOpen: the stream's lifetime is owned by the caller (the
+                // using scope in FetchTextAsync, or the handler's buffer field);
+                // a disposing reader would close the buffer and break both
+                // repeat reads and the fallback path below.
+                using var reader = new StreamReader(
+                    bytes,
+                    encoding,
+                    detectEncodingFromByteOrderMarks: true,
+                    bufferSize: 1024,
+                    leaveOpen: true);
+                return reader.ReadToEnd();
+            }
+            catch (Exception ex)
+            {
+                PieDiagnostics.Warning($"[PieHttpBridge] Failed to decode fetch body as {encoding.WebName}: {ex.Message}");
+                bytes.Position = 0;
+                return Encoding.UTF8.GetString(bytes.ToArray());
+            }
+        }
+
+        private static Encoding TryGetEncoding(string charset)
+        {
+            try
+            {
+                return Encoding.GetEncoding(charset);
+            }
+            catch (ArgumentException)
+            {
+                return null;
+            }
         }
 
         /// <summary>
@@ -215,7 +554,8 @@ namespace Pie
             // Try to dequeue a buffered line
             if (state.Lines.TryDequeue(out var line))
             {
-                return line; // may be null (the end sentinel) or a real line
+                NoteLineDequeued(state, line);
+                return line; // a buffered line (empty string is a real SSE separator)
             }
 
             if (state.IsComplete)
@@ -255,7 +595,11 @@ namespace Pie
                 }
             }
 
+            // Both clients carry in-flight requests: the provider auto-follow
+            // client AND the manual-redirect fetch client (long bounded body
+            // reads on web_fetch traffic would otherwise outlive the cancel).
             try { _httpClient.CancelPendingRequests(); } catch { }
+            try { _manualRedirectHttpClient.CancelPendingRequests(); } catch { }
 
             if (workerTasks.Count == 0)
                 return;
@@ -274,6 +618,10 @@ namespace Pie
         private static void CancelState(RequestState state)
         {
             try { state.Cts.Cancel(); } catch { }
+            // A producer paused on the flow gate is not inside a read, so
+            // cancellation alone cannot unblock it: release the gate on every
+            // terminal path (cancel, failure, completion) so no worker hangs.
+            state.FlowGate.Release();
             try { state.NativeRequest?.Abort(); } catch { }
             try { state.NativeStream?.Dispose(); } catch { }
             try { state.NativeTcpClient?.Close(); } catch { }
@@ -317,7 +665,10 @@ namespace Pie
             }
 
             if (state.Lines.TryDequeue(out line))
-                return true; // real line (may be "" for SSE separator or null for end sentinel)
+            {
+                NoteLineDequeued(state, line);
+                return true; // a real line ("" is a real SSE separator; the end is signalled by IsComplete)
+            }
 
             if (state.IsComplete)
             {
@@ -413,12 +764,17 @@ namespace Pie
         // Internal
         // ─────────────────────────────────────────────────────────────────────
 
-        private static HttpClient CreateHttpClient()
+        private static HttpClient CreateHttpClient(bool allowAutoRedirect)
         {
             var handler = new HttpClientHandler
             {
                 AutomaticDecompression = System.Net.DecompressionMethods.GZip |
-                                          System.Net.DecompressionMethods.Deflate
+                                          System.Net.DecompressionMethods.Deflate,
+                // Pinned explicitly so the two clients differ only by intent:
+                // _httpClient keeps standard auto-follow for provider APIs,
+                // _manualRedirectHttpClient lets the shared web tools own
+                // redirect validation hop by hop.
+                AllowAutoRedirect = allowAutoRedirect
             };
             var client = new HttpClient(handler)
             {
@@ -487,8 +843,14 @@ namespace Pie
             }
             finally
             {
-                FlushByteLineBuffer(state);
+                // The tail flush may hit the single-line cap after the catch
+                // already recorded an overflow failure: swallow it so the
+                // finally still completes the request instead of throwing out
+                // of a finally (this path is currently unreachable from JS —
+                // kept as a guard should the native socket path return).
+                try { FlushByteLineBuffer(state); } catch { }
                 state.IsComplete = true;
+                state.FlowGate.Release();
                 try { state.NativeStream?.Dispose(); } catch { }
                 try { state.NativeTcpClient?.Close(); } catch { }
                 state.NativeStream = null;
@@ -538,6 +900,9 @@ namespace Pie
             finally
             {
                 state.IsComplete = true;
+                // Defensive release: the managed read loop may be paused on the
+                // flow gate when a sibling path completes or fails the request.
+                state.FlowGate.Release();
             }
         }
 
@@ -725,6 +1090,9 @@ namespace Pie
                 }
 
                 await ConsumeExpectedCrlfAsync(stream, cancellationToken);
+                // Flow control: stop pulling chunks off the socket while the
+                // shared line queue is above the high watermark.
+                await ApplyLineBackpressureAsync(state);
             }
         }
 
@@ -740,6 +1108,7 @@ namespace Pie
                 AppendBodyBytes(state, buffer, read);
                 remaining -= read;
             }
+            await ApplyLineBackpressureAsync(state);
         }
 
         private static async Task ReadUntilCloseSseBodyAsync(Stream stream, RequestState state, CancellationToken cancellationToken)
@@ -751,6 +1120,7 @@ namespace Pie
                 if (read <= 0)
                     break;
                 AppendBodyBytes(state, buffer, read);
+                await ApplyLineBackpressureAsync(state);
             }
         }
 
@@ -853,6 +1223,11 @@ namespace Pie
 
                 state.ByteLineBuffer.Add(value);
             }
+
+            // Single-line cap: a line without newlines past MaxSseLineBytes is a
+            // protocol violation (never a truncatable payload) - fail loudly.
+            if (state.ByteLineBuffer.Count > MaxSseLineBytes)
+                throw SseLineTooLong(state, state.ByteLineBuffer.Count);
         }
 
         private static void FlushByteLineBuffer(RequestState state)
@@ -1000,6 +1375,16 @@ namespace Pie
             if (request == null)
                 return;
 
+            // Flow control: while the shared line queue is above the high
+            // watermark, stop draining this request's native buffer (the
+            // bytes stay in the capped BoundedDownloadHandler until the pump
+            // catches up, so a long pause fails with the handler's byte cap
+            // instead of growing without bound). The final completion flush
+            // must still drain: the transfer already finished natively and
+            // the queue hard cap is the backstop for that one-shot path.
+            if (state.FlowGate.IsPaused && !flushTail)
+                return;
+
             if (state.StatusCode < 0 && request.responseCode > 0)
             {
                 state.StatusCode = (int)request.responseCode;
@@ -1046,6 +1431,11 @@ namespace Pie
                 state.TextLineBuffer.Append(ch);
             }
 
+            // Single-line cap: never buffer (or later deliver) a truncated
+            // monster line as if it were complete SSE/JSON.
+            if (state.TextLineBuffer.Length > MaxSseLineChars)
+                throw SseLineTooLong(state, state.TextLineBuffer.Length);
+
             if (flushTail && state.TextLineBuffer.Length > 0)
                 EmitBufferedLine(state, state.TextLineBuffer.ToString(), clearBuffer: true);
         }
@@ -1059,6 +1449,15 @@ namespace Pie
             if (clearBuffer)
                 state.TextLineBuffer.Length = 0;
 
+            // Single-line cap at the emission choke point: the end-of-chunk
+            // checks in AppendBodyBytes/AppendTextChunk never fire when a
+            // monster line AND its terminating newline land in the same native
+            // chunk (the flush below happens mid-chunk, before the check). A
+            // protocol-violating line must fail loudly here, never enter the
+            // queue masquerading as complete SSE/JSON.
+            if (line.Length > MaxSseLineChars)
+                throw SseLineTooLong(state, line.Length);
+
             if (!string.IsNullOrEmpty(line) && state.LoggedLineCount < 8)
             {
                 state.FirstLineLogged = true;
@@ -1066,7 +1465,7 @@ namespace Pie
                 PieDiagnostics.Info($"[PieHttpBridge] Line [{state.Id}] #{state.LoggedLineCount} {ClipForLog(line)}");
             }
 
-            state.Lines.Enqueue(line);
+            EnqueueSseLine(state, line);
         }
 
         private static async Task RunHttpClientRequestAsync(
@@ -1113,7 +1512,7 @@ namespace Pie
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    var errorBody = await response.Content.ReadAsStringAsync();
+                    var errorBody = await ReadErrorBodyBoundedAsync(response.Content, state.Cts.Token);
                     var contentType = response.Content?.Headers?.ContentType?.ToString() ?? "(none)";
                     state.StatusCode = (int)response.StatusCode;
                     state.Error = $"HTTP {(int)response.StatusCode}: {errorBody}";
@@ -1128,13 +1527,19 @@ namespace Pie
                 state.ManagedStream = stream;
                 using var reader = new StreamReader(stream, Encoding.UTF8);
 
-                while (!reader.EndOfStream && !state.Cts.Token.IsCancellationRequested)
+                // Bounded line-by-line read with flow control: lines enter the
+                // shared queue through EnqueueSseLine (hard cap backstop) and
+                // network reads pause at the high watermark until the
+                // main-thread pump drains the queue to the low watermark.
+                // The blocking stream-end peek is deliberately not used in
+                // this loop: EOF arrives as null from the bounded reader.
+                while (!state.Cts.Token.IsCancellationRequested)
                 {
-                    var line = await ReadLineWithCancellationAsync(reader, state);
-                    if (line != null)
-                    {
-                        state.Lines.Enqueue(line);
-                    }
+                    var line = await ReadManagedLineAsync(state, reader);
+                    if (line == null)
+                        break;
+                    EnqueueSseLine(state, line);
+                    await ApplyLineBackpressureAsync(state);
                 }
             }
             finally
@@ -1144,6 +1549,40 @@ namespace Pie
                 state.ManagedStream = null;
                 state.ManagedResponse = null;
             }
+        }
+
+        /// <summary>
+        /// Read an error response body under MaxErrorBodyBytes, in the bounded
+        /// style of FetchTextAsync: at most the cap reaches managed memory, the
+        /// read stops there, and the kept text is truncated with an explicit
+        /// marker so a partial error body is never mistaken for the whole one.
+        /// Decoding honors the declared charset like the buffered fetch path.
+        /// </summary>
+        private static async Task<string> ReadErrorBodyBoundedAsync(HttpContent content, CancellationToken cancellationToken)
+        {
+            if (content == null)
+                return string.Empty;
+
+            var charset = content.Headers?.ContentType?.CharSet;
+            using var stream = await content.ReadAsStreamAsync();
+            using var buffered = new MemoryStream();
+            var buffer = new byte[64 * 1024];
+            long totalRead = 0;
+            while (totalRead <= MaxErrorBodyBytes)
+            {
+                var read = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                if (read <= 0) break;
+                var remaining = MaxErrorBodyBytes + 1 - totalRead;
+                var keep = (int)Math.Min(read, remaining);
+                if (keep > 0) buffered.Write(buffer, 0, keep);
+                totalRead += read;
+                if (totalRead > MaxErrorBodyBytes) break;
+            }
+
+            var text = DecodeBodyText(buffered, charset);
+            if (totalRead > MaxErrorBodyBytes)
+                text += $"...[error body truncated at {MaxErrorBodyBytes} bytes; received {totalRead}+]";
+            return text;
         }
 
         private static async Task<string> ReadLineWithCancellationAsync(StreamReader reader, RequestState state)
@@ -1165,6 +1604,184 @@ namespace Pie
                 return await readTask;
 
             throw new OperationCanceledException(state.Cts.Token);
+        }
+
+        /// <summary>
+        /// Bounded line reader for the managed SSE loop. StreamReader.ReadLineAsync
+        /// would materialize an arbitrarily long "line" (a stream that never
+        /// sends a newline) in managed memory before any cap could fire, so
+        /// lines are accumulated chunk-by-chunk under MaxSseLineChars. A line
+        /// past the cap fails the request with an explicit error; it is never
+        /// truncated and delivered as a complete SSE/JSON line. Characters
+        /// read past a newline stay in RequestState.PendingReadChars for the
+        /// next call (StreamReader keeps its own buffer, so nothing is lost).
+        /// </summary>
+        private static async Task<string> ReadManagedLineAsync(RequestState state, StreamReader reader)
+        {
+            while (true)
+            {
+                var newlineIndex = Array.IndexOf(state.PendingReadChars, '\n', 0, state.PendingReadCharCount);
+                if (newlineIndex >= 0)
+                {
+                    state.ManagedLineBuffer.Append(state.PendingReadChars, 0, newlineIndex);
+                    var leftover = state.PendingReadCharCount - newlineIndex - 1;
+                    if (leftover > 0)
+                        Array.Copy(state.PendingReadChars, newlineIndex + 1, state.PendingReadChars, 0, leftover);
+                    state.PendingReadCharCount = leftover;
+                    return TakeManagedLine(state);
+                }
+
+                state.ManagedLineBuffer.Append(state.PendingReadChars, 0, state.PendingReadCharCount);
+                state.PendingReadCharCount = 0;
+                if (state.ManagedLineBuffer.Length > MaxSseLineChars)
+                    throw SseLineTooLong(state, state.ManagedLineBuffer.Length);
+
+                var read = await ReadCharsWithCancellationAsync(state, reader);
+                if (read <= 0)
+                {
+                    // EOF: deliver a trailing line without a final newline, or
+                    // signal end-of-stream between lines.
+                    return state.ManagedLineBuffer.Length == 0 ? null : TakeManagedLine(state);
+                }
+                state.PendingReadCharCount = read;
+            }
+        }
+
+        private static string TakeManagedLine(RequestState state)
+        {
+            var line = state.ManagedLineBuffer.ToString();
+            state.ManagedLineBuffer.Length = 0;
+            // Enforced at the single hand-off point so EVERY delivery path is
+            // capped: the newline branch of ReadManagedLineAsync appends its
+            // final characters and returns through here without any earlier
+            // length check, so a line assembled as (exactly-cap chunk) + (more
+            // chars + newline in the next read) must still fail, never deliver.
+            if (line.Length > MaxSseLineChars)
+                throw SseLineTooLong(state, line.Length);
+            if (line.Length > 0 && line[line.Length - 1] == '\r')
+                line = line.Substring(0, line.Length - 1);
+            return line;
+        }
+
+        /// <summary>
+        /// Cancellation-aware char-chunk read mirroring
+        /// ReadLineWithCancellationAsync: cancelling disposes the managed
+        /// stream/response to unblock the pending network read. Only called
+        /// with an empty pending buffer (ReadManagedLineAsync consumes the
+        /// pending chars before reading more), so the whole chunk buffer is
+        /// the read target.
+        /// </summary>
+        private static async Task<int> ReadCharsWithCancellationAsync(RequestState state, StreamReader reader)
+        {
+            var readTask = reader.ReadAsync(state.PendingReadChars, 0, state.PendingReadChars.Length);
+            if (readTask.IsCompleted)
+                return readTask.Result;
+
+            var cancelSignal = new TaskCompletionSource<bool>();
+            using var cancelRegistration = state.Cts.Token.Register(() =>
+            {
+                cancelSignal.TrySetResult(true);
+                try { state.ManagedStream?.Dispose(); } catch { }
+                try { state.ManagedResponse?.Dispose(); } catch { }
+            });
+            var completed = await Task.WhenAny(readTask, cancelSignal.Task);
+            if (completed == readTask)
+                return readTask.Result;
+
+            throw new OperationCanceledException(state.Cts.Token);
+        }
+
+        /// <summary>
+        /// Enqueue one SSE line for the main-thread pump, tracking queue depth
+        /// for flow control and enforcing the hard-cap backstop. The queue is
+        /// the only path lines take from background readers to JS; every
+        /// producer goes through here.
+        /// </summary>
+        private static void EnqueueSseLine(RequestState state, string line)
+        {
+            state.Lines.Enqueue(line);
+            var lineCount = Interlocked.Increment(ref state.QueuedLineCount);
+            var queuedChars = Interlocked.Add(ref state.QueuedLineChars, line.Length);
+            if (lineCount > LineQueueHardCapLines || queuedChars > LineQueueHardCapChars)
+            {
+                FailLineQueueOverflow(state, lineCount, queuedChars);
+                throw new SseLineQueueOverflowException(
+                    $"SSE line queue overflow (sse_line_queue_overflow): {lineCount} lines / {queuedChars} chars queued exceeds the hard cap ({LineQueueHardCapLines} lines / {LineQueueHardCapChars} chars); the JS consumer is not draining lines fast enough [{state.Id}]");
+            }
+        }
+
+        /// <summary>
+        /// Fail a request whose line queue breached the hard cap: set the
+        /// terminal error (even if the producer's exception is swallowed on
+        /// the main thread), release any paused producer, and cancel the
+        /// request so the transport stops feeding the queue.
+        /// </summary>
+        private static void FailLineQueueOverflow(RequestState state, int lineCount, long queuedChars)
+        {
+            var message = $"SSE line queue overflow (sse_line_queue_overflow): {lineCount} lines / {queuedChars} chars queued exceeds the hard cap ({LineQueueHardCapLines} lines / {LineQueueHardCapChars} chars); the JS consumer is not draining lines fast enough [{state.Id}]";
+            state.Error = message;
+            state.FlowGate.Release();
+            try { state.Cts.Cancel(); } catch { }
+            try { state.ManagedStream?.Dispose(); } catch { }
+            try { state.ManagedResponse?.Dispose(); } catch { }
+            PieDiagnostics.Error($"[PieHttpBridge] {message}");
+        }
+
+        /// <summary>
+        /// Producer-side backpressure: above the high watermark, pause network
+        /// reads until the main-thread pump releases the gate at the low
+        /// watermark. The consumer never stops draining queued lines, so a
+        /// pause always resolves; cancellation and every terminal path also
+        /// release the gate (see CancelState) so nothing can hang here.
+        /// </summary>
+        private static async Task ApplyLineBackpressureAsync(RequestState state)
+        {
+            if (Volatile.Read(ref state.QueuedLineCount) <= LineQueueHighWatermarkLines
+                && Volatile.Read(ref state.QueuedLineChars) <= LineQueueHighWatermarkChars)
+                return;
+
+            // Arm the gate FIRST, then re-check. Between the high-watermark
+            // observation above and the arming below, the consumer may drain
+            // to the low watermark and skip releasing (it saw IsPaused ==
+            // false), or cancellation/terminal handling may release before a
+            // pause task exists. A release issued while nothing is armed is
+            // lost, and the freshly-armed task on an already-drained queue
+            // would never complete. Re-checking depth and terminal state after
+            // arming (releases are idempotent) closes that lost-wakeup window.
+            var pauseTask = state.FlowGate.PauseAsync();
+            if (state.Error != null || state.Cts.IsCancellationRequested
+                || (Volatile.Read(ref state.QueuedLineCount) <= LineQueueLowWatermarkLines
+                    && Volatile.Read(ref state.QueuedLineChars) <= LineQueueLowWatermarkChars))
+            {
+                state.FlowGate.Release();
+            }
+            PieDiagnostics.Verbose(
+                $"[PieHttpBridge] Line queue above high watermark [{state.Id}] lines={Volatile.Read(ref state.QueuedLineCount)} chars={Volatile.Read(ref state.QueuedLineChars)}; pausing reads");
+            await pauseTask.ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Consumer-side bookkeeping after the pump dequeues a line: once the
+        /// queue has drained to the low watermark, release a paused producer.
+        /// </summary>
+        private static void NoteLineDequeued(RequestState state, string line)
+        {
+            Interlocked.Decrement(ref state.QueuedLineCount);
+            Interlocked.Add(ref state.QueuedLineChars, -(long)line.Length);
+            if (state.FlowGate.IsPaused
+                && Volatile.Read(ref state.QueuedLineCount) <= LineQueueLowWatermarkLines
+                && Volatile.Read(ref state.QueuedLineChars) <= LineQueueLowWatermarkChars)
+            {
+                state.FlowGate.Release();
+                PieDiagnostics.Verbose($"[PieHttpBridge] Line queue drained to low watermark [{state.Id}]; resuming reads");
+            }
+        }
+
+        /// <summary>Build the explicit over-long-line failure (never a silent truncation).</summary>
+        private static Exception SseLineTooLong(RequestState state, long observedLength)
+        {
+            return new SseLineTooLongException(
+                $"SSE line exceeded the single-line cap (sse_line_too_long): {observedLength} chars > {MaxSseLineChars}; refusing to truncate a line and deliver it as complete [{state.Id}]");
         }
 
         private static async Task RunHttpWebRequestAsync(
@@ -1242,7 +1859,10 @@ namespace Pie
                 var line = await reader.ReadLineAsync();
                 if (line != null)
                 {
-                    state.Lines.Enqueue(line);
+                    if (line.Length > MaxSseLineChars)
+                        throw SseLineTooLong(state, line.Length);
+                    EnqueueSseLine(state, line);
+                    await ApplyLineBackpressureAsync(state);
                 }
             }
         }
@@ -1358,7 +1978,11 @@ namespace Pie
             bool ok,
             string url,
             string contentType,
-            string body)
+            string body,
+            long observedBytes = -1,
+            long declaredBytes = -1,
+            bool bodyTruncated = false,
+            Dictionary<string, string> extraHeaders = null)
         {
             var builder = new StringBuilder(256 + (body?.Length ?? 0));
             builder.Append("{");
@@ -1366,7 +1990,35 @@ namespace Pie
             builder.Append("\"statusText\":").Append(JsonString(statusText)).Append(",");
             builder.Append("\"ok\":").Append(ok ? "true" : "false").Append(",");
             builder.Append("\"url\":").Append(JsonString(url)).Append(",");
-            builder.Append("\"headers\":{\"content-type\":").Append(JsonString(contentType)).Append("},");
+            builder.Append("\"headers\":{\"content-type\":").Append(JsonString(contentType));
+            // Manual-redirect mode: forward the response headers (Location and
+            // peers) so JS can validate/follow redirect hops itself. Keys are
+            // pre-lowercased by the collector; content-type stays canonical.
+            if (extraHeaders != null)
+            {
+                foreach (var kv in extraHeaders)
+                {
+                    if (string.Equals(kv.Key, "content-type", StringComparison.Ordinal)) continue;
+                    builder.Append(",").Append(JsonString(kv.Key)).Append(":").Append(JsonString(kv.Value));
+                }
+            }
+            // No content-length is synthesized here: the wire-byte length would
+            // misdescribe the UTF-8 payload JS serves after decoding, and a
+            // truncated body must never pass on a fabricated length. Declared
+            // and observed sizes travel as explicit fields below; JS surfaces
+            // them through the body_truncated error and an accurate UTF-8
+            // content-length for complete bodies.
+            builder.Append("},");
+            if (observedBytes >= 0)
+            {
+                // observedBytes is what the native read actually received (the
+                // minimum body size); declaredBodyBytes is the server-declared
+                // size, always present (-1 when not declared). Neither is the
+                // true complete size of a truncated chunked body.
+                builder.Append("\"bodyBytes\":").Append(observedBytes.ToString(CultureInfo.InvariantCulture)).Append(",");
+                builder.Append("\"declaredBodyBytes\":").Append(declaredBytes.ToString(CultureInfo.InvariantCulture)).Append(",");
+                builder.Append("\"bodyTruncated\":").Append(bodyTruncated ? "true" : "false").Append(",");
+            }
             builder.Append("\"body\":").Append(JsonString(body));
             builder.Append("}");
             return builder.ToString();
@@ -1484,6 +2136,18 @@ namespace Pie
         {
             public readonly int Id;
             public readonly ConcurrentQueue<string> Lines = new ConcurrentQueue<string>();
+
+            // Flow control for Lines (see the watermark constants above):
+            // producer-side pause gate plus depth accounting in UTF-16 chars.
+            public readonly LineFlowGate FlowGate = new LineFlowGate();
+            public int QueuedLineCount = 0;
+            public long QueuedLineChars = 0;
+
+            // Bounded managed line reader state (ReadManagedLineAsync).
+            public readonly char[] PendingReadChars = new char[8192];
+            public int PendingReadCharCount = 0;
+            public readonly StringBuilder ManagedLineBuffer = new StringBuilder(256);
+
             public readonly CancellationTokenSource Cts = new CancellationTokenSource();
             public Task WorkerTask = null;
             public volatile bool IsComplete = false;
@@ -1504,6 +2168,58 @@ namespace Pie
             public readonly List<byte> ByteLineBuffer = new List<byte>(4096);
 
             public RequestState(int id) { Id = id; }
+        }
+
+        /// <summary>
+        /// Thread-safe pause/release signal for SSE line backpressure. The
+        /// background read loop pauses (awaits PauseAsync) once the shared
+        /// line queue passes the high watermark; the main-thread pump releases
+        /// it after draining the queue back to the low watermark. Every
+        /// terminal path (cancel, failure, completion) also releases it so a
+        /// paused producer can never hang the worker task. PauseAsync while
+        /// already paused returns the same underlying task, so the producer's
+        /// check-then-pause window can never lose a release.
+        /// </summary>
+        private sealed class LineFlowGate
+        {
+            private readonly object _sync = new object();
+            private TaskCompletionSource<bool> _pauseSignal;
+
+            public bool IsPaused
+            {
+                get { lock (_sync) { return _pauseSignal != null; } }
+            }
+
+            public Task PauseAsync()
+            {
+                lock (_sync)
+                {
+                    if (_pauseSignal == null)
+                        _pauseSignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    return _pauseSignal.Task;
+                }
+            }
+
+            public void Release()
+            {
+                lock (_sync)
+                {
+                    _pauseSignal?.TrySetResult(true);
+                    _pauseSignal = null;
+                }
+            }
+        }
+
+        /// <summary>Line queue breached its hard cap: fail the request with the sse_line_queue_overflow error.</summary>
+        private sealed class SseLineQueueOverflowException : Exception
+        {
+            public SseLineQueueOverflowException(string message) : base(message) { }
+        }
+
+        /// <summary>A single SSE line passed the single-line cap: fail rather than truncate.</summary>
+        private sealed class SseLineTooLongException : Exception
+        {
+            public SseLineTooLongException(string message) : base(message) { }
         }
     }
 }

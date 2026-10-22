@@ -116,6 +116,25 @@ namespace Pie
         }
 
         [Serializable]
+        private class InstallSkillPayload
+        {
+            public string name;
+            public string content;
+        }
+
+        [Serializable]
+        private class SkillsListPayload
+        {
+            public SkillsListEntry[] skills;
+        }
+
+        [Serializable]
+        private class SkillsListEntry
+        {
+            public string name;
+        }
+
+        [Serializable]
         private class DevRpcMessagesPayload
         {
             public DevRpcMessagePayload[] messages;
@@ -135,6 +154,7 @@ namespace Pie
         private void Awake()
         {
             ActiveRunner = this;
+            RecoverInterruptedSkillInstalls();
             PieDevRpcDispatcher.InitializeMainThread();
             PieDevRpcServer.Start();
             PieHostBridge.Register("pie.interaction", HandleInteractionHostCall);
@@ -172,6 +192,11 @@ namespace Pie
             _bridge?.Tick();
         }
 
+        private void OnApplicationPause(bool paused)
+        {
+            if (paused) PieWebSocketBridge.CancelAll();
+        }
+
         private void OnDestroy()
         {
             CancelConfirmations();
@@ -195,33 +220,27 @@ namespace Pie
 
         private void RegisterDevRpcMethods()
         {
-            PieDevRpc.Register("runner.get_state", _ => JsonUtility.ToJson(new RunnerStatePayload
+            // Raw /rpc endpoints (legacy dispatch fallback). Capability-manifest
+            // registrations for the runner live in PieSettings.RegisterRuntimeCapabilities
+            // so editor and player tooling discover them through one source.
+            PieDevRpc.Register("runner.get_state", _ => BuildRuntimeRpcStateJson());
+            PieDevRpc.Register("runner.send_message", argsJson => DevRpcChatSend(argsJson));
+            PieDevRpc.Register("runner.abort", _ => { Abort(); return BuildRuntimeRpcStateJson(); });
+            PieDevRpc.Register("runner.reload_skills", _ => "{\"dispatched\":" + (ReloadSkills() ? "true" : "false") + "}");
+            PieDevRpc.Register("runner.install_skill", argsJson =>
             {
-                isReady = IsReady,
-                projectRootOverride = _projectRootOverride ?? "",
-                hasSettingsOverride = _settingsOverride != null,
-                lastAssistantText = _lastAssistantText ?? "",
-                isStreaming = _runtimeIsStreaming,
-                isBusy = _runtimeIsStreaming,
-                statusText = _runtimeStatusText ?? "",
-                messageCount = _devRpcMessages.Count,
-                mode = "runtime",
-            }));
-            PieUnityCapabilityRegistry.RegisterRpc(
-                "runner.get_state",
-                "runtime",
-                "Legacy runtime runner state RPC.",
-                "runtime",
-                true,
-                true,
-                null,
-                new PieUnityParameterDescriptor[0],
-                _ => BuildRuntimeRpcStateJson());
+                var payload = JsonUtility.FromJson<InstallSkillPayload>(argsJson ?? "{}") ?? new InstallSkillPayload();
+                return InstallSkill(payload.name, payload.content);
+            });
         }
 
         private void UnregisterDevRpcMethods()
         {
             PieDevRpc.Unregister("runner.get_state");
+            PieDevRpc.Unregister("runner.send_message");
+            PieDevRpc.Unregister("runner.abort");
+            PieDevRpc.Unregister("runner.reload_skills");
+            PieDevRpc.Unregister("runner.install_skill");
         }
 
         private string HandleInteractionHostCall(string argsJson)
@@ -356,6 +375,444 @@ namespace Pie
             return _bridge.SendToJs("reload_extensions", "{}");
         }
 
+        /// <summary>Ask the JS runtime to rescan skill sources (filesystem
+        /// layers + baked manifest) and re-emit skills_list.</summary>
+        public bool ReloadSkills()
+        {
+            if (_bridge?.IsInitialized != true) return false;
+            return _bridge.SendToJs("reload_skills", "{}");
+        }
+
+        /// <summary>
+        /// Install a skill into the player-writable filesystem layer
+        /// (&lt;persistentDataPath&gt;/.agents/skills/&lt;name&gt;/SKILL.md) and reload
+        /// skill sources. Player builds have no Assets tree; this layer is the
+        /// runtime-installable counterpart to the baked manifest.
+        /// </summary>
+        public string InstallSkill(string name, string content)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new InvalidOperationException("skill name is required");
+            if (content == null) throw new InvalidOperationException("skill content is required");
+            var invalid = name.IndexOfAny(System.IO.Path.GetInvalidFileNameChars());
+            // GetInvalidFileNameChars does not include '.', so traversal via
+            // ".." must be rejected explicitly.
+            if (invalid >= 0 || name.Contains("/") || name.Contains("\\") || name != name.Trim()
+                || name == "." || name == ".." || name.Contains(".."))
+                throw new InvalidOperationException($"invalid skill name: {name}");
+            // The filesystem loader registers skills by the FRONTMATTER name,
+            // not the install argument: a mismatch would write <name>/SKILL.md
+            // yet register it under the frontmatter identity, stranding the
+            // directory (a later install under the other identity could never
+            // replace it). Content with NO parsable frontmatter name is
+            // rejected too: the loader does not reject it — it falls back to
+            // the FILE identity "SKILL", which strands the directory the same
+            // way (review 2026-10-12, round 2).
+            var frontmatterName = ExtractFrontmatterName(content);
+            if (frontmatterName == null)
+                throw new InvalidOperationException(
+                    "skill content must carry --- frontmatter with a name: field (without one the loader registers it under the fallback identity 'SKILL')");
+            if (!string.Equals(frontmatterName, name, System.StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    $"skill name mismatch: install argument '{name}' but frontmatter name '{frontmatterName}' — install under the frontmatter name so the directory matches the registered identity");
+            var dir = System.IO.Path.Combine(
+                System.IO.Path.Combine(Application.persistentDataPath, ".agents"), "skills");
+            var skillDir = System.IO.Path.Combine(dir, name);
+            var path = System.IO.Path.Combine(skillDir, "SKILL.md");
+            AssertPathStaysUnderRoot(Application.persistentDataPath, dir, path);
+            System.IO.Directory.CreateDirectory(skillDir);
+            AssertPathStaysUnderRoot(Application.persistentDataPath, dir, path + ".install-lock");
+            WriteAllTextAtomic(path, content);
+            // SendToJs only proves DISPATCH: the JS reload handler is async and
+            // reports rebuild failures through error events, never through this
+            // synchronous return. The response field says exactly that — the
+            // old `reloaded` name claimed a reload that was never confirmed.
+            var dispatched = ReloadSkills();
+            if (!dispatched) PieDiagnostics.Warning("[PieRunner] skill file written but reload_skills dispatch failed; the skill loads on next bridge init");
+            return "{\"path\":\"" + EscapeJsonString(path) + "\",\"dispatched\":" + (dispatched ? "true" : "false") + "}";
+        }
+
+        /// <summary>Frontmatter name extraction mirroring the ACTUAL loader
+        /// (agent-framework skills/parser.ts: parseSkillFile + parseFrontmatter)
+        /// rather than the linter's stricter YAML subset: the file must START
+        /// with a --- fence line whose closing --- line is followed by a
+        /// newline (a fence at EOF has no frontmatter); lines are TRIMMED, so
+        /// indented fields count; # lines are skipped; values keep trailing
+        /// comments (only whole-value quotes strip); and the LAST duplicate
+        /// name wins. Null when no parsable frontmatter name exists.
+        /// </summary>
+        private static string ExtractFrontmatterName(string content)
+        {
+            if (string.IsNullOrEmpty(content)) return null;
+            // Only CRLF is normalized: the JS regex's \s*\n absorbs \r\n, but
+            // lone-\r content has no \n for it to match — the loader sees NO
+            // frontmatter there, and normalizing lone \r away would diverge
+            // (review 2026-10-12, round 3).
+            var normalized = content.Replace("\r\n", "\n");
+            var lines = normalized.Split('\n');
+            // Opening fence: the file must START with a --- line (leading
+            // whitespace or a BOM means no frontmatter, like the JS ^--- anchor).
+            if (!normalized.StartsWith("---") || lines[0].TrimEnd() != "---" || lines.Length < 3) return null;
+            var end = -1;
+            for (var index = 1; index < lines.Length; index++)
+            {
+                if (lines[index].TrimEnd() != "---") continue;
+                // The JS regex requires a newline AFTER the closing fence: a
+                // file ending exactly at the fence has no frontmatter at all.
+                if (index == lines.Length - 1) return null;
+                end = index;
+                break;
+            }
+            if (end == -1) return null;
+            var name = "";
+            for (var index = 1; index < end; index++)
+            {
+                var line = lines[index].Trim();
+                if (line.Length == 0 || line.StartsWith("#")) continue;
+                var colon = line.IndexOf(':');
+                if (colon == -1) continue;
+                if (line.Substring(0, colon).Trim() != "name") continue;
+                var value = line.Substring(colon + 1).Trim();
+                // JS parseFrontmatter uses `value = value.slice(1, -1)` with
+                // NO length guard: a lone single OR double quote becomes "".
+                // Substring needs a nonnegative count to mirror that slicing.
+                if ((value.StartsWith("\"") && value.EndsWith("\"")) || (value.StartsWith("'") && value.EndsWith("'")))
+                    value = value.Substring(1, Math.Max(0, value.Length - 2));
+                // parseFrontmatter converts bracket lists to arrays and
+                // String(array) joins with commas: `name: [t]` registers as
+                // "t", not "[t]" — mirror that or the identity check diverges
+                // (review 2026-10-12, round 3).
+                if (value.StartsWith("[") && value.EndsWith("]"))
+                {
+                    var parts = value.Substring(1, value.Length - 2).Split(',');
+                    var items = new System.Collections.Generic.List<string>();
+                    foreach (var part in parts)
+                    {
+                        var item = part.Trim();
+                        // Mirror parseFrontmatter's ORDER exactly: empties drop
+                        // BEFORE unquoting, and at most ONE leading and ONE
+                        // trailing quote are removed independently (its regex
+                        // is /^["]|["]$/g — NOT Trim, which strips every
+                        // boundary quote). `name: ["", t]` must yield the same
+                        // identity (",t") on both hosts; the previous
+                        // Trim('"', '\'') accepted it as "t" here while the
+                        // loader registered ",t" — recreating the identity
+                        // mismatch this check exists to catch (review
+                        // 2026-10-12, round 4).
+                        if (item.Length == 0) continue;
+                        if (item[0] == '"' || item[0] == '\'') item = item.Substring(1);
+                        if (item.Length > 0 && (item[item.Length - 1] == '"' || item[item.Length - 1] == '\'')) item = item.Substring(0, item.Length - 1);
+                        items.Add(item);
+                    }
+                    value = string.Join(",", items);
+                }
+                name = value; // last duplicate wins, exactly like the JS loop
+            }
+            return name.Length > 0 ? name : null;
+        }
+
+        /// <summary>Startup recovery for interrupted skill installs: a crash
+        /// or domain reload between ReplaceByBackupMove's two moves leaves the
+        /// previous SKILL.md parked as a sibling `.old-*` backup with no live
+        /// file. Runs once per runner startup; the per-skill OS-held lock also
+        /// excludes installs in other runners/processes sharing this root.</summary>
+        private static void RecoverInterruptedSkillInstalls()
+        {
+            var dir = System.IO.Path.Combine(
+                System.IO.Path.Combine(Application.persistentDataPath, ".agents"), "skills");
+            try
+            {
+                // Anchor the sweep's containment walk at persistentDataPath so
+                // reparse points ABOVE the skills root (.agents itself) are
+                // guarded exactly like InstallSkill's AssertPathStaysUnderRoot.
+                RecoverOrphanedSkillBackups(dir, anchor: Application.persistentDataPath);
+            }
+            catch (Exception ex)
+            {
+                // Recovery must never block startup; a failed sweep retries on
+                // the next domain reload with the backups still in place.
+                PieDiagnostics.Warning($"[PieRunner] orphaned skill backup sweep failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>Scan a skills root for orphaned install backups. When a
+        /// skill directory has `.old-*` backups but NO live SKILL.md, the
+        /// newest backup is restored into place (the previous installation
+        /// must survive every crash short of losing the disk). When the live
+        /// file exists, the backups are residue of failed post-commit deletes:
+        /// each one older than <paramref name="staleAgeMinutes"/> is removed,
+        /// while FRESH parked backups are kept conservatively. Both branches
+        /// hold the same per-skill exclusive lock as installation: a concurrent
+        /// editor/player install's missing-live-file window must NOT trigger
+        /// recovery, regardless of backup age. A busy skill is skipped until
+        /// the next startup. Every mutated path is first proven to stay under
+        /// <paramref name="anchor"/> (default: the skills root itself) with no
+        /// reparse point on the way — InstallSkill rejects such paths, and the
+        /// recovery walk must not restore/delete through a symlinked directory
+        /// that redirects outside the installation root; failing paths are
+        /// skipped and left for manual inspection. Returns the number of
+        /// restored installations.</summary>
+        public static int RecoverOrphanedSkillBackups(string skillsRoot, double staleAgeMinutes = 10, string anchor = null)
+        {
+            var recovered = 0;
+            if (string.IsNullOrEmpty(skillsRoot) || !System.IO.Directory.Exists(skillsRoot)) return 0;
+            // Anchor the containment walk where the caller did: the product
+            // path anchors at persistentDataPath so components ABOVE the skills
+            // root (.agents itself) are guarded exactly like InstallSkill.
+            var containmentAnchor = string.IsNullOrEmpty(anchor) ? skillsRoot : anchor;
+            foreach (var skillDir in System.IO.Directory.GetDirectories(skillsRoot))
+            {
+                if (!PathStaysUnderRoot(containmentAnchor, skillsRoot, skillDir))
+                {
+                    PieDiagnostics.Warning($"[PieRunner] skipped skill directory during backup recovery; path is not safely under the skills root (possible reparse point), inspect manually: {skillDir}");
+                    continue;
+                }
+                var live = System.IO.Path.Combine(skillDir, "SKILL.md");
+                var lockPath = live + ".install-lock";
+                if (!PathStaysUnderRoot(containmentAnchor, skillsRoot, lockPath)) continue;
+                System.IO.FileStream installLock;
+                try { installLock = AcquireSkillInstallLock(live); }
+                catch (System.IO.IOException) { continue; } // active install/recovery: retry next startup
+                catch (UnauthorizedAccessException) { continue; } // unreadable lock: leave backups alone
+                using (installLock)
+                {
+                    // Hold the SAME lock as the writer before inspecting live or
+                    // backups, through every restore/delete. Otherwise a normal
+                    // backup-move window looks exactly like an interrupted install.
+                    string[] backups;
+                    try { backups = System.IO.Directory.GetFiles(skillDir, "SKILL.md.old-*"); }
+                    catch { continue; } // unreadable directory: not our call to delete anything
+                    if (backups.Length == 0) continue;
+                    if (!System.IO.File.Exists(live))
+                    {
+                        // Crash between the two backup moves: restore the NEWEST
+                        // parked copy (several orphans accumulate only across
+                        // repeated crashes).
+                        string newestBackup = null;
+                        var newestWrite = DateTime.MinValue;
+                        foreach (var backup in backups)
+                        {
+                            DateTime write;
+                            try { write = System.IO.File.GetLastWriteTimeUtc(backup); }
+                            catch { continue; } // unreadable backup: leave it for manual inspection
+                            if (newestBackup == null || write >= newestWrite)
+                            {
+                                newestBackup = backup;
+                                newestWrite = write;
+                            }
+                        }
+                        if (newestBackup == null) continue;
+                        if (!PathStaysUnderRoot(containmentAnchor, skillsRoot, newestBackup)
+                            || !PathStaysUnderRoot(containmentAnchor, skillsRoot, live))
+                        {
+                            PieDiagnostics.Warning($"[PieRunner] skipped orphaned backup restore; path is not safely under the skills root (possible reparse point), inspect manually: {newestBackup}");
+                            continue;
+                        }
+                        try
+                        {
+                            System.IO.File.Move(newestBackup, live);
+                            recovered++;
+                            PieDiagnostics.Warning(
+                                $"[PieRunner] restored {live} from orphaned install backup {System.IO.Path.GetFileName(newestBackup)} (interrupted before commit)");
+                        }
+                        catch (Exception ex)
+                        {
+                            // Keep the backup on disk and surface the path: manual
+                            // recovery must stay possible.
+                            PieDiagnostics.Error(
+                                $"[PieRunner] could not restore {live} from backup {newestBackup}; the previous content survives there: {ex.Message}");
+                        }
+                        continue;
+                    }
+                    foreach (var backup in backups)
+                    {
+                        DateTime write;
+                        try { write = System.IO.File.GetLastWriteTimeUtc(backup); }
+                        catch { continue; }
+                        if ((DateTime.UtcNow - write).TotalMinutes > staleAgeMinutes)
+                        {
+                            // Live file committed long after the backup was parked:
+                            // the parked copy is garbage. Fresh ones stay as a
+                            // conservative grace period after transaction completion.
+                            if (!PathStaysUnderRoot(containmentAnchor, skillsRoot, backup))
+                            {
+                                PieDiagnostics.Warning($"[PieRunner] skipped stale backup delete; path is not safely under the skills root (possible reparse point), inspect manually: {backup}");
+                                continue;
+                            }
+                            try { System.IO.File.Delete(backup); }
+                            catch { /* best effort; retried by the next sweep */ }
+                        }
+                    }
+                }
+            }
+            return recovered;
+        }
+
+        /// <summary>Cross-process per-skill transaction ownership. Both writer
+        /// and recovery open the SAME persistent sibling with FileShare.None.
+        /// Contention fails closed (install reports busy; recovery skips it).
+        /// The OS releases the exclusive handle on dispose/domain reload/process
+        /// exit, so a crash leaves no stale ownership to expire by age. The
+        /// empty lock file may remain indefinitely: NEVER delete it, since
+        /// unlinking it can let another process lock a different inode while
+        /// the original transaction is still active. Callers containment-check
+        /// the lock path before opening it, just like the skill/backup paths.
+        /// </summary>
+        private static System.IO.FileStream AcquireSkillInstallLock(string path)
+        {
+            return new System.IO.FileStream(path + ".install-lock", System.IO.FileMode.OpenOrCreate,
+                System.IO.FileAccess.ReadWrite, System.IO.FileShare.None);
+        }
+
+        /// <summary>Atomic replace via a sibling temp file: the raw
+        /// WriteAllText truncated an existing installed SKILL.md IN PLACE, so
+        /// a mid-write failure (disk full, domain reload) destroyed the only
+        /// copy. File.Replace keeps the rename-commit contract where the
+        /// profile has it; the backup-restore fallback preserves the previous
+        /// file elsewhere — a plain Delete+Move could destroy it when the move
+        /// fails or the process dies between the two steps.</summary>
+        private static void WriteAllTextAtomic(string path, string content)
+        {
+            using (AcquireSkillInstallLock(path))
+            {
+                var temp = path + ".tmp-" + System.Guid.NewGuid().ToString("N").Substring(0, 8);
+                try
+                {
+                    System.IO.File.WriteAllText(temp, content);
+                    if (!System.IO.File.Exists(path))
+                    {
+                        System.IO.File.Move(temp, path);
+                        return;
+                    }
+                    try
+                    {
+                        System.IO.File.Replace(temp, path, null);
+                    }
+                    catch (System.NotImplementedException) { ReplaceByBackupMove(temp, path); }
+                    catch (System.PlatformNotSupportedException) { ReplaceByBackupMove(temp, path); }
+                }
+                finally
+                {
+                    try { if (System.IO.File.Exists(temp)) System.IO.File.Delete(temp); } catch { /* best effort */ }
+                }
+            }
+        }
+
+        /// <summary>Replace without File.Replace: park the destination as a
+        /// sibling backup, move the new content into place, and RESTORE the
+        /// backup when the move fails or dies mid-way — the previous
+        /// installation must survive every failure short of losing the disk.
+        /// </summary>
+        private static void ReplaceByBackupMove(string temp, string path)
+        {
+            var backup = path + ".old-" + System.Guid.NewGuid().ToString("N").Substring(0, 8);
+            System.IO.File.Move(path, backup);
+            // File.Move PRESERVES the source's LastWriteTime, but the startup
+            // sweep ages backups by exactly that timestamp: a long-installed
+            // skill parked milliseconds ago already looks stale, and a
+            // concurrent sweep (editor + player share persistentDataPath)
+            // could delete this in-flight rollback copy. The PARK time is the
+            // age that matters, so stamp it onto the parked file (review
+            // 2026-10-12).
+            try { System.IO.File.SetLastWriteTimeUtc(backup, System.DateTime.UtcNow); }
+            catch (Exception ex)
+            {
+                PieDiagnostics.Warning($"[PieRunner] could not stamp the parking time on {backup}; later backup sweeps may treat it as stale: {ex.Message}");
+            }
+            try
+            {
+                System.IO.File.Move(temp, path);
+            }
+            catch
+            {
+                try { if (!System.IO.File.Exists(path)) System.IO.File.Move(backup, path); }
+                catch (Exception restoreError)
+                {
+                    // Never swallow a failed restore silently: the caller (and
+                    // the log) must learn where the previous installation
+                    // survived, or the failure reads as data loss (review
+                    // 2026-10-12, round 5). The startup sweep picks the orphan
+                    // up on the next domain reload.
+                    throw new System.IO.IOException(
+                        $"skill replace failed and the previous file could not be restored; the previous content survives at {backup}: {restoreError.Message}",
+                        restoreError);
+                }
+                throw;
+            }
+            try { System.IO.File.Delete(backup); } catch { /* best effort; startup sweep removes stale residue */ }
+        }
+
+        /// <summary>
+        /// Reject paths that escape <paramref name="root"/> lexically, or that
+        /// pass through reparse points (symlinks/junctions) planted on any
+        /// existing component strictly below <paramref name="anchor"/> —
+        /// including components ABOVE the skills root (e.g. .agents itself).
+        /// Path.GetFullPath alone does not resolve symlinks, so a pre-planted
+        /// directory link would silently redirect CreateDirectory/WriteAllText
+        /// outside the skills root. Missing components are fine: they will be
+        /// created fresh by the caller.
+        /// </summary>
+        private static void AssertPathStaysUnderRoot(string anchor, string root, string target)
+        {
+            var fullAnchor = System.IO.Path.GetFullPath(anchor);
+            var fullRoot = System.IO.Path.GetFullPath(root);
+            var fullTarget = System.IO.Path.GetFullPath(target);
+            var anchorPrefix = WithTrailingSeparator(fullAnchor);
+            var rootPrefix = WithTrailingSeparator(fullRoot);
+            // The root may sit AT the anchor (the recovery sweep anchors its own
+            // walk at the skills root): only a root strictly BELOW the anchor
+            // needs the prefix check. Callers that pass an unrelated root still
+            // fail closed here.
+            if (!(string.Equals(fullRoot, fullAnchor, StringComparison.Ordinal) || fullRoot.StartsWith(anchorPrefix, StringComparison.Ordinal))
+                || !fullTarget.StartsWith(rootPrefix, StringComparison.Ordinal))
+                throw new InvalidOperationException("skill path escapes the skills root");
+
+            var current = fullAnchor;
+            var relative = fullTarget.Substring(anchorPrefix.Length);
+            foreach (var segment in relative.Split(System.IO.Path.DirectorySeparatorChar))
+            {
+                if (string.IsNullOrEmpty(segment)) continue;
+                current = System.IO.Path.Combine(current, segment);
+                System.IO.FileAttributes attributes;
+                try
+                {
+                    attributes = System.IO.File.GetAttributes(current);
+                }
+                catch (System.IO.FileNotFoundException) { continue; }
+                catch (System.IO.DirectoryNotFoundException) { continue; }
+                // Other failures (access denied, IO errors) leave the component
+                // existing but uninspectable: propagate so InstallSkill fails
+                // closed instead of writing through an unknown path.
+                if ((attributes & System.IO.FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidOperationException($"skill path component is a reparse point: {segment}");
+            }
+        }
+
+        /// <summary>Non-throwing twin of <see cref="AssertPathStaysUnderRoot"/>
+        /// for the RECOVERY walk: the startup sweep must skip (and leave for
+        /// manual inspection) any path whose containment cannot be proven —
+        /// a reparse point or an escaping path — instead of failing the whole
+        /// sweep or mutating through it (InstallSkill fails closed by throwing;
+        /// recovery must never block startup).</summary>
+        private static bool PathStaysUnderRoot(string anchor, string root, string target)
+        {
+            try
+            {
+                AssertPathStaysUnderRoot(anchor, root, target);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string WithTrailingSeparator(string path)
+        {
+            return path.EndsWith(System.IO.Path.DirectorySeparatorChar.ToString(), StringComparison.Ordinal)
+                ? path
+                : path + System.IO.Path.DirectorySeparatorChar;
+        }
+
         public bool Abort()
         {
             CancelConfirmations();
@@ -442,6 +899,20 @@ namespace Pie
                     var detail = ExtractJsonString(json, "detail") ?? ExtractJsonString(json, "name") ?? "";
                     if (!string.IsNullOrWhiteSpace(detail))
                         _runtimeStatusText = detail;
+                    break;
+                }
+                case "skills_list":
+                {
+                    // Startup/reload skill inventory. Previously this event
+                    // had no consumer in player builds; log it once per list
+                    // so what the agent actually sees is observable in the
+                    // player log (bake drift, hot installs, reloads).
+                    var payload = JsonUtility.FromJson<SkillsListPayload>(json ?? "{}") ?? new SkillsListPayload();
+                    var names = new List<string>();
+                    if (payload.skills != null)
+                        foreach (var entry in payload.skills)
+                            names.Add(entry == null ? "" : entry.name);
+                    PieDiagnostics.Info($"[PieRunner] skills available ({names.Count}): {string.Join(", ", names)}");
                     break;
                 }
                 case "timeline_item":

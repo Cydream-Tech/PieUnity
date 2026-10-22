@@ -284,14 +284,14 @@ namespace Pie
                 return RuntimeHostDiagnostics.ToArray();
         }
 
-        public static bool TryInvokeRpc(string name, string argsJson, out string resultJson, out string error)
+        public static bool TryInvokeRpc(string name, string argsJson, out string resultJson, out string error, out bool handlerInvoked)
         {
-            return TryInvoke("rpc", RpcMethods, name, argsJson, out resultJson, out error);
+            return TryInvoke("rpc", RpcMethods, name, argsJson, out resultJson, out error, out handlerInvoked);
         }
 
-        public static bool TryInvokeTool(string name, string argsJson, out string resultJson, out string error)
+        public static bool TryInvokeTool(string name, string argsJson, out string resultJson, out string error, out bool handlerInvoked)
         {
-            return TryInvoke("tool", ToolMethods, name, argsJson, out resultJson, out error);
+            return TryInvoke("tool", ToolMethods, name, argsJson, out resultJson, out error, out handlerInvoked);
         }
 
         public static bool HasTool(string name)
@@ -383,10 +383,17 @@ namespace Pie
             string name,
             string argsJson,
             out string resultJson,
-            out string error)
+            out string error,
+            out bool handlerInvoked)
         {
             lock (SyncRoot)
             {
+                // Structured dispatch outcome: a lookup miss (nothing executed)
+                // is reported separately from a handler failure, so callers can
+                // safely fall through to another dispatch layer only when no
+                // handler ran — handler error text can never spoof a miss and
+                // cause a side-effecting handler to re-run.
+                handlerInvoked = false;
                 if (!source.TryGetValue(name ?? "", out var registration))
                 {
                     resultJson = "null";
@@ -397,6 +404,7 @@ namespace Pie
 
                 try
                 {
+                    handlerInvoked = true;
                     resultJson = registration.Handler(argsJson ?? "{}") ?? "null";
                     error = "";
                     return true;
