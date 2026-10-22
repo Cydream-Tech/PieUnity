@@ -6301,11 +6301,17 @@ var _PieAgent = (() => {
       this.validatePath(destination, "copy");
       const platform = detectPlatform();
       const dir = this.dirname(destination);
-      this.mkdir(dir, { recursive: true });
       if (platform === "puerts" && typeof CS !== "undefined") {
+        if (isPuertsReparsePoint(source) || isPuertsReparsePoint(destination) || containsPuertsReparsePoint(dir) || containsPuertsReparsePoint(this.dirname(source))) {
+          throw new Error(
+            `Refusing to copy through a reparse point (symlink/junction): '${source}' -> '${destination}'; resolve the link or copy inside it explicitly`
+          );
+        }
+        this.mkdir(dir, { recursive: true });
         CS.System.IO.File.Copy(source, destination, true);
         return;
       }
+      this.mkdir(dir, { recursive: true });
       const fs = nodeRequire("fs");
       fs.copyFileSync(source, destination);
     }
@@ -6320,14 +6326,39 @@ var _PieAgent = (() => {
       this.validatePath(destination, "rename");
       const platform = detectPlatform();
       const dir = this.dirname(destination);
-      this.mkdir(dir, { recursive: true });
       if (platform === "puerts" && typeof CS !== "undefined") {
+        if (isPuertsReparsePoint(source) || isPuertsReparsePoint(destination) || containsPuertsReparsePoint(dir) || containsPuertsReparsePoint(this.dirname(source))) {
+          throw new Error(
+            `Refusing to rename through a reparse point (symlink/junction): '${source}' -> '${destination}'; resolve the link or move inside it explicitly`
+          );
+        }
+        this.mkdir(dir, { recursive: true });
+        if (!CS.System.IO.File.Exists(source)) {
+          throw new Error(`File not found: ${source}`);
+        }
+        if (this.normalizePath(source) === this.normalizePath(destination)) {
+          return;
+        }
         if (CS.System.IO.File.Exists(destination)) {
+          const staged = `${destination}.pie-replace-${Date.now()}.tmp`;
+          CS.System.IO.File.Copy(source, staged, false);
           CS.System.IO.File.Delete(destination);
+          try {
+            CS.System.IO.File.Move(staged, destination);
+          } catch (error) {
+            try {
+              CS.System.IO.File.Move(staged, destination);
+            } catch {
+            }
+            throw error;
+          }
+          CS.System.IO.File.Delete(source);
+          return;
         }
         CS.System.IO.File.Move(source, destination);
         return;
       }
+      this.mkdir(dir, { recursive: true });
       const fs = nodeRequire("fs");
       fs.renameSync(source, destination);
     }
@@ -6579,7 +6610,7 @@ var _PieAgent = (() => {
         warnedMissingPuertsGetAttributes = true;
         try {
           console.warn(
-            "[platform] File.GetAttributes is unbound on this host; directory symlink checks are disabled (move/delete follow links)"
+            "[platform] File.GetAttributes is unbound on this host; directory symlink checks are disabled (move/delete/copy follow links)"
           );
         } catch {
         }
@@ -6595,6 +6626,42 @@ var _PieAgent = (() => {
     } catch {
       return false;
     }
+  }
+  function containsPuertsReparsePoint(directory) {
+    const slashed = directory.replace(/\\/g, "/");
+    const trimmed = slashed.replace(/\/+$/, "");
+    if (!trimmed || trimmed === "/") return false;
+    const unc = /^\/\/([^/]+)\/([^/]+)/.exec(trimmed);
+    let prefix;
+    let rest;
+    if (unc) {
+      prefix = unc[0];
+      rest = trimmed.slice(prefix.length);
+    } else {
+      const driveRoot = /^([a-zA-Z]:)\//.exec(trimmed);
+      if (driveRoot) {
+        prefix = `${driveRoot[1]}/`;
+        rest = trimmed.slice(prefix.length);
+      } else {
+        const bareDrive = /^[a-zA-Z]:$/.test(trimmed);
+        if (bareDrive) {
+          return isPuertsReparsePoint(trimmed);
+        }
+        if (trimmed.startsWith("/")) {
+          prefix = "/";
+          rest = trimmed.slice(1);
+        } else {
+          prefix = "";
+          rest = trimmed;
+        }
+      }
+    }
+    let current2 = prefix;
+    for (const part of rest.split("/").filter((segment) => segment.length > 0 && segment !== ".")) {
+      current2 = current2 ? current2.endsWith("/") ? `${current2}${part}` : `${current2}/${part}` : part;
+      if (isPuertsReparsePoint(current2)) return true;
+    }
+    return false;
   }
   var warnedPuertsDeletionShells = false;
   function warnPuertsDeletionShellsOnce(path3) {
@@ -25754,7 +25821,7 @@ ${summary2}`;
   var PLAN_POWERSHELL_SAFE_PARAMETERS = /^(?:-(?:Raw|TotalCount|Head|Tail|First|Last|Wait|LiteralPath|Path|Name|Pattern|Recurse|Filter|Include|Exclude|SimpleMatch|CaseSensitive|Quiet|Word|Line|Character|Encoding|ErrorAction|WarningAction))$/i;
   var PLAN_POWERSHELL_SEPARATORS = /[;\n\r\t]|[<>]{1,2}|\||&&|\|\|/;
   var PLAN_POWERSHELL_NON_ASCII = /[^\x20-\x7E]/;
-  var PLAN_POWERSHELL_UNSAFE_TOKENS = /\$\(|`|%\{|[(){}\[\]]|\bsource\b|\.\s+[/~]|\b(bash|sh|zsh|pwsh|powershell|cmd|npm|npx|node|python3?|git)\b/i;
+  var PLAN_POWERSHELL_UNSAFE_TOKENS = /\$\(|`|%\{|[(){}\[\]]|\bsource\b|\.\s+[/~]|\b(bash|sh|zsh|pwsh|powershell|cmd|npm|npx|node|python3?)\b/i;
   function isPlanModeSafePowerShellCommand(command) {
     const trimmed = command.trim();
     if (!trimmed) return false;
@@ -25764,6 +25831,18 @@ ${summary2}`;
     const tokens = trimmed.split(/\s+/).filter(Boolean);
     const head = tokens[0].toLowerCase();
     if (!head) return false;
+    if (head === "git" || head === "rg") {
+      if (/["']/.test(trimmed)) return false;
+      if (/[$@]/.test(trimmed)) return false;
+    }
+    if (head === "git") {
+      const subcommand = tokens[1]?.toLowerCase() ?? "";
+      if (!GIT_READ_SUBCOMMANDS.has(subcommand)) return false;
+      return !tokens.slice(2).some((token) => UNSAFE_GIT_FLAGS.test(token) || token === "--no-pager" || token === "-c");
+    }
+    if (head === "rg") {
+      return !tokens.slice(1).some((token) => UNSAFE_RG_FLAGS.test(token) || token === "--pre" || token === "--pre-glob");
+    }
     if (!PLAN_POWERSHELL_READ_COMMANDS.has(head) && !PLAN_POWERSHELL_READ_ALIASES.has(head)) return false;
     for (const token of tokens.slice(1)) {
       if (token.startsWith("-") && !PLAN_POWERSHELL_SAFE_PARAMETERS.test(token)) return false;
@@ -26515,8 +26594,11 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
     // PowerShell resolves these aliases before execution. The classifier must
     // treat the aliases exactly like their canonical cmdlets; otherwise a
     // guarded shell can run `ri -Recurse -Force` without the confirmation that
-    // `Remove-Item -Recurse -Force` receives.
-    { pattern: /\b(?:Remove-Item|ri|rm|rmdir|del|erase|rd)\b[^;\n|]*(?:-Recurse|-Force)\b/i, warning: "may recursively or forcefully remove files", commandClass: "filesystem_write" },
+    // `Remove-Item -Recurse -Force` receives. PowerShell parameters are
+    // prefix-abbreviatable (`-r` == `-Recurse`, `-fo` == `-Force`), so the
+    // parameter matcher below accepts any unambiguous-style abbreviation,
+    // not just the full spellings.
+    { pattern: buildPowerShellRemoveItemPattern(), warning: "may recursively or forcefully remove files", commandClass: "filesystem_write" },
     { pattern: /\b(?:Remove-Item|ri|rm|rmdir|del|erase|rd)\b[^;\n|]*(?:HKLM:|HKCU:|Registry::)/i, warning: "may remove registry entries", commandClass: "infra_destructive" },
     // These write aliases are not all destructive in the recursive-delete sense,
     // but they can overwrite or create arbitrary files. Keep them behind the
@@ -26530,7 +26612,10 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
   ];
   var CMD_DESTRUCTIVE_PATTERNS = [
     { pattern: /\b(del|erase)\b[^&|\n]*(\/s|\/q)/i, warning: "may recursively or quietly delete files", commandClass: "filesystem_write" },
-    { pattern: /\brmdir\b[^&|\n]*(\/s|\/q)/i, warning: "may recursively remove directories", commandClass: "filesystem_write" },
+    // `rd` is cmd's documented synonym for rmdir and accepts the same /s /q
+    // switches; classifying only `rmdir` let `rd /s /q C:\\anywhere` run as an
+    // undetected recursive deletion.
+    { pattern: /\b(?:rmdir|rd)\b[^&|\n]*(\/s|\/q)/i, warning: "may recursively remove directories", commandClass: "filesystem_write" },
     { pattern: /\bformat\s+[a-z]:/i, warning: "may format a drive", commandClass: "infra_destructive" },
     { pattern: /\b(takeown|icacls)\b[^&|\n]*(\/grant|\/reset|\/remove)/i, warning: "may alter ownership or permissions", commandClass: "privilege_escalation" },
     { pattern: /\bgit\s+reset\s+--hard\b/i, warning: "may discard uncommitted changes", commandClass: "git_destructive" },
@@ -26541,6 +26626,15 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
   }
   function firstWord(command) {
     return command.trim().split(/\s+/)[0] || "";
+  }
+  function buildPowerShellRemoveItemPattern() {
+    const removeVerb = "(?:Remove-Item|ri|rm|rmdir|del|erase|rd)";
+    const recurseg = "-(?:r(?:e(?:c(?:u(?:r(?:s(?:e?)?)?)?)?)?)?)";
+    const force = "-(?:f(?:o(?:r(?:c(?:e?)?)?)?)?)";
+    return new RegExp(
+      `\\b${removeVerb}\\b[^;\\n|]*(?:${recurseg}|${force})\\b`,
+      "i"
+    );
   }
   function splitShellSegments(command) {
     const segments = [];

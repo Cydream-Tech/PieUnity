@@ -150,11 +150,20 @@ namespace Pie.Unity.Capabilities
 
             var packageInfo = UnityEditor.PackageManager.PackageInfo.FindForAssembly(typeof(PieBridge).Assembly);
             var packageRoot = packageInfo != null ? (packageInfo.resolvedPath ?? "").Replace("\\", "/") : "";
-            if (packageRoot.Length > 0 && path.StartsWith(packageRoot + "/", StringComparison.Ordinal))
+            // Windows volumes are case-insensitive: an absolute path spelled
+            // with different drive-letter or component casing identifies the
+            // same file and must resolve, not fall out as unresolvable. On
+            // case-SENSITIVE hosts (Linux/macOS) keep ordinal matching: a
+            // differently-cased path is a DIFFERENT directory and must not be
+            // mapped onto this project's asset space.
+            var rootComparison = Application.platform == RuntimePlatform.WindowsEditor || Application.platform == RuntimePlatform.WindowsPlayer
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+            if (packageRoot.Length > 0 && path.StartsWith(packageRoot + "/", rootComparison))
                 return $"Packages/{packageInfo.name}/{path.Substring(packageRoot.Length + 1)}";
 
             var projectRoot = Directory.GetParent(Application.dataPath).FullName.Replace("\\", "/");
-            if (path.StartsWith(projectRoot + "/", StringComparison.Ordinal))
+            if (path.StartsWith(projectRoot + "/", rootComparison))
                 return path.Substring(projectRoot.Length + 1);
 
             return null;

@@ -749,7 +749,15 @@ namespace Pie
             var value = (path ?? "").Replace("\\", "/").Trim();
             if (string.IsNullOrWhiteSpace(value))
                 throw new InvalidOperationException("Asset path is required.");
-            if (value.StartsWith(Application.dataPath.Replace("\\", "/"), StringComparison.Ordinal))
+            // Windows volumes are case-insensitive: a dataPath-prefixed absolute
+            // path with different casing is still under Assets and must be
+            // normalized instead of rejected by the Assets/ check below. On
+            // case-SENSITIVE hosts (Linux/macOS) keep ordinal matching: a
+            // differently-cased prefix is a DIFFERENT directory.
+            var dataPathComparison = Application.platform == RuntimePlatform.WindowsEditor || Application.platform == RuntimePlatform.WindowsPlayer
+                ? StringComparison.OrdinalIgnoreCase
+                : StringComparison.Ordinal;
+            if (value.StartsWith(Application.dataPath.Replace("\\", "/"), dataPathComparison))
                 value = "Assets" + value.Substring(Application.dataPath.Length);
             if (!value.StartsWith("Assets/", StringComparison.Ordinal) && value != "Assets")
                 throw new InvalidOperationException("Path must be under Assets: " + path);
