@@ -156,12 +156,46 @@ Rules:
 - Bindings are for TYPES callable from JS. PuerTS delegate bridges
   (`UsingAction<T>` etc.) are a separate, runtime-side declaration.
 
+## Delegate ABI and the ungenerated Editor fallback
+
+Type reflection and JS-to-C# delegate bridges are different contracts. In
+PuerTS 2.2.2, an Editor with `PUERTS_DISABLE_IL2CPP_OPTIMIZATION` and no generated
+delegate bridge can return null / throw `can not find delegate bridge` for
+unregistered value-type signatures. Reflection alone does not make SSE/file
+completion delivery work.
+
+`PieBridge.RegisterDelegateSignatures` is the single runtime registration list,
+called immediately after `new JsEnv`, before injection or delegate Eval. It
+covers **all** generic Action/Func Eval signatures, including core message,
+script/runtime-host and compiler delegates, not just SSE/file callbacks.
+Parameterless `Action` (tick) is built into PuerTS 2.2.2 `GenericDelegate`; there
+is no parameterless `UsingAction()` API. The same registrations stay enabled on
+the default generated/xIl2cpp path (PuerTS's xIl2cpp methods are no-ops).
+Do not hand-edit generated bridge code to repair this contract.
+
+`npm run check:unity-binding-surface` also checks this source contract and boot
+ordering; `player-runtime-contract.test.ts` mutation-tests missing registrations
+and new signatures. These are source checks, **not real Unity execution**.
+Native release verification must separately exercise:
+
+- a fresh Editor fallback host, no generated bridge, explicit disable define,
+  and auto-generation disabled: boot/core invoke/tick, compiler, SSE status/data/
+  terminal and async file completion (including failure) must actually deliver;
+- the default generated Editor and strict xIl2cpp smoke player, with the same
+  completion paths and no define/registration regressions.
+
+This repair has not run those native Unity checks. Fallback here means a
+supported runtime registration contract for the ungenerated **Editor** path,
+not a promise of reflection-only IL2CPP player/AOT support, nor permission to
+bypass strict build freshness checks. Configure test-host defines deliberately;
+do not leave the disable define alongside GenV2 output.
+
 ## Platform status
 
 | platform | status |
 | --- | --- |
 | Standalone Windows/macOS/Linux IL2CPP | allowed target family; dogfood validation was macOS, Unity 6000.0.67f1; Windows/Linux still need platform verification |
-| Editor (Mono) | unaffected by generated code; reflection path |
+| Editor (Mono) | reflection path requires the runtime delegate ABI registrations above; ungenerated fallback native regression still needs verification |
 | iOS / WebGL | **unsupported** by this product pipeline; implicit generation warns/skips, explicit generation and IL2CPP builds fail actionably |
 | Consoles / other targets | **unsupported** until separately validated |
 

@@ -93,6 +93,8 @@ namespace Pie
         public string sessionId = "";
         public string clientTurnId = "";
         public bool hadToolActivity;
+        // Missing/false preserves the original terminal error contract.
+        public bool nonTerminal;
     }
 
     [Serializable]

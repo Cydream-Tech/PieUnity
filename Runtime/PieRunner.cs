@@ -348,6 +348,10 @@ namespace Pie
             return _bridge.SendToJs("set_config", json);
         }
 
+        // Scoped to synchronous SendToJs callbacks; nested sends restore their
+        // own optimistic snapshot before notifying OnRuntimeError listeners.
+        private Action<PieRuntimeError> _restoreRejectedRuntimeSend;
+
         public bool SendChatMessage(string content)
         {
             return SendChatMessage(new PieChatRequest
@@ -382,10 +386,7 @@ namespace Pie
             AddDevRpcMessage("user", "", request.displayContent, "", false, false);
             _runtimeStatusText = "Sending message";
             _runtimeIsStreaming = true;
-            var dispatched = bridge.SendToJs("send_message", json);
-            // SendToJs may synchronously emit a response/error. Never roll back
-            // an observed outcome (or a replacement bridge) with the old snapshot.
-            if (!dispatched && _runtimeRpcEventVersion == eventVersion && ReferenceEquals(_bridge, bridge))
+            Action restore = () =>
             {
                 _devRpcMessages.Clear();
                 _devRpcMessages.AddRange(previousRows);
@@ -393,8 +394,23 @@ namespace Pie
                 _assistantDeltaText = previousDelta;
                 _runtimeStatusText = previousStatus;
                 _runtimeIsStreaming = wasStreaming;
+            };
+            var previousRestore = _restoreRejectedRuntimeSend;
+            _restoreRejectedRuntimeSend = error =>
+            {
+                if (ReferenceEquals(_bridge, bridge)
+                    && string.Equals(error.clientTurnId ?? "", request.clientTurnId.Trim(), StringComparison.Ordinal))
+                    restore();
+            };
+            try
+            {
+                var dispatched = bridge.SendToJs("send_message", json);
+                // A transport rejection with no callback restores the same snapshot.
+                if (!dispatched && _runtimeRpcEventVersion == eventVersion && ReferenceEquals(_bridge, bridge))
+                    restore();
+                return dispatched;
             }
-            return dispatched;
+            finally { _restoreRejectedRuntimeSend = previousRestore; }
         }
 
         public bool ResumeSession(string sessionId, bool recoverInterrupted = false)
@@ -1045,6 +1061,14 @@ namespace Pie
                     {
                         if (!string.IsNullOrEmpty(error.sessionId) && !string.IsNullOrEmpty(ActiveSessionId)
                             && error.sessionId != ActiveSessionId) break;
+                        if (error.nonTerminal)
+                        {
+                            // Keep A busy on overlap; restore idle when a terminal
+                            // callback attempted B during session-switch retirement.
+                            _restoreRejectedRuntimeSend?.Invoke(error);
+                            OnRuntimeError?.Invoke(error);
+                            break;
+                        }
                         _lastStructuredErrorMessage = error.message ?? "";
                         CompleteRunningRpcMessages(true);
                         _assistantDeltaText = "";

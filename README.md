@@ -13,7 +13,7 @@ It uses a runtime-first architecture: the agent core runs in Runtime, while the 
 
 ## Attention consumer caveat
 
-Unity forwards shared `attention_requested` / `attention_resolved` events through `PieBridge.OnJsEvent`. This is a semantic bridge, **not a native attention presenter**: consumers must supply any in-game bubbles, badges, audio or OS notifications. Ordinary completion is explicitly **OFF** in production, with no supported host toggle. The low-level `user-initiated` coordinator policy requires caller-owned accepted-delivery bookkeeping not supplied by the production controller. Generic confirmation is input (explicit `false` is an answer); timeout, skipped, unavailable and missing responses cancel attention consistently with CLI. Only the interaction owner resolves requests; suppressing presentation must not resolve them. See the [Unity host contract](../../docs/public-api/unity-host-adapter.md#attention-events-experimental).
+Unity forwards shared `attention_requested` / `attention_resolved` events through `PieBridge.OnJsEvent`. This is a semantic bridge, **not a native attention presenter**: consumers must supply any in-game bubbles, badges, audio or OS notifications. Ordinary completion is explicitly **OFF** in production, with no supported host toggle. The low-level `user-initiated` coordinator policy requires caller-owned accepted-delivery bookkeeping not supplied by the production controller. Generic confirmation is input (explicit `false` is an answer); timeout, skipped, unavailable and missing responses cancel attention consistently with CLI. Only the interaction owner resolves requests; suppressing presentation must not resolve them. The monorepo's `docs/public-api/unity-host-adapter.md#attention-events-experimental` records the underlying host contract.
 
 ## Unity RPC Host
 
@@ -87,8 +87,8 @@ session messages, independently of the runtime timeline's 50-turn/500-item limit
 Search tools use the same effective-argument normalization during live execution
 and history restoration; the sync payload also retains the original arguments.
 
-For repeatable real-Unity script coverage, see the repository's
-[Three Sparks fixture](../../scripts/fixtures/pie-unity-script-game/README.md).
+For repeatable real-Unity script coverage, see the monorepo's
+`scripts/fixtures/pie-unity-script-game/README.md` (Three Sparks fixture).
 It covers Editor, Play Mode, and a standalone macOS IL2CPP Development Player.
 
 ## Host Responsibility
@@ -370,6 +370,10 @@ runner.ResumeSession("sess_xxx");
 
 `displayContent` is persisted with the user message and is used for the
 player-facing timeline and session title. `content` remains the model input.
+The `send_message` wire action rejects an overlapping accepted turn with
+`SESSION_TURN_ACTIVE` before starting another one; terminal finalization is
+fenced to the accepted `clientTurnId`. Use an explicit host queue until a
+public queue/steering contract exists.
 One session snapshot contains at most the latest 50 turns / 500 timeline
 items; thinking blocks are never projected into the runtime timeline.
 
@@ -377,9 +381,9 @@ items; thinking blocks are never projected into the runtime timeline.
 For per-mod/workspace binding, subscribe to `OnSessionBindingResult` and pass a
 fresh request id via `ResumeSession(id, false, requestId)` or `NewSession(requestId)`.
 Only a matching successful result authorizes saving its `sessionId` or sending on
-that binding; an arbitrary `OnSessionChanged` snapshot does not. See the
-[correlated binding contract](../../docs/maintenance/unity-bridge.md#correlated-runtime-session-binding)
-for result fields, supersession and retry semantics. Legacy overloads remain supported.
+that binding; an arbitrary `OnSessionChanged` snapshot does not. The monorepo's
+`docs/maintenance/unity-bridge.md#correlated-runtime-session-binding` documents
+result fields, supersession and retry semantics. Legacy overloads remain supported.
 
 Example:
 
@@ -466,8 +470,9 @@ Model transport overrides the profile. Editor and native Player both use
 `PieWebSocketBridge` / `UnityWebSocketClient`; WebGL is unsupported. Runtime
 pause and bridge disposal cancel native connections. Unknown native handshake
 failures are surfaced because ClientWebSocket does not reliably expose an HTTP
-status for safe auto fallback. See the [transport validation record](../../docs/maintenance/responses-transport.md)
-for tested platforms, isolated smoke commands and live-test limitations.
+status for safe auto fallback. The monorepo's
+`docs/maintenance/responses-transport.md` records tested platforms, isolated
+smoke commands and live-test limitations.
 
 If no valid profile is configured, Unity starts in an unconfigured model state and asks you to configure `~/.pie/models.json` before sending messages.
 
@@ -686,7 +691,7 @@ Then send two real prompts:
 
 For repeatable regression steps and reliability runs, see:
 
-- [TESTING.md](/Users/fonzie/Documents/AIProjects/Pie/products/pie-unity/TESTING.md)
+- [TESTING.md](TESTING.md) (included in standalone package exports)
 
 ## Sessions And Memory
 

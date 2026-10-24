@@ -6880,33 +6880,33 @@ var _PieAgent = (() => {
   }
   function containsPuertsReparsePoint(directory) {
     const slashed = directory.replace(/\\/g, "/");
-    const trimmed = slashed.replace(/\/+$/, "");
-    if (!trimmed || trimmed === "/") return false;
-    const unc = /^\/\/([^/]+)\/([^/]+)/.exec(trimmed);
+    if (!slashed) return false;
+    const unc = /^\/\/([^/]+)\/([^/]+)/.exec(slashed);
     let prefix;
     let rest;
     if (unc) {
       prefix = unc[0];
-      rest = trimmed.slice(prefix.length);
+      rest = slashed.slice(prefix.length);
     } else {
-      const driveRoot = /^([a-zA-Z]:)\//.exec(trimmed);
+      const driveRoot = /^([a-zA-Z]:)\//.exec(slashed);
       if (driveRoot) {
         prefix = `${driveRoot[1]}/`;
-        rest = trimmed.slice(prefix.length);
+        rest = slashed.slice(prefix.length);
       } else {
-        const bareDrive = /^[a-zA-Z]:$/.test(trimmed);
+        const bareDrive = /^[a-zA-Z]:$/.test(slashed);
         if (bareDrive) {
-          return isPuertsReparsePoint(trimmed);
+          return isPuertsReparsePoint(slashed);
         }
-        if (trimmed.startsWith("/")) {
+        if (slashed.startsWith("/")) {
           prefix = "/";
-          rest = trimmed.slice(1);
+          rest = slashed.slice(1);
         } else {
           prefix = "";
-          rest = trimmed;
+          rest = slashed;
         }
       }
     }
+    if (prefix && isPuertsReparsePoint(prefix)) return true;
     let current2 = prefix;
     for (const part of rest.split("/").filter((segment) => segment.length > 0 && segment !== ".")) {
       current2 = current2 ? current2.endsWith("/") ? `${current2}${part}` : `${current2}/${part}` : part;
@@ -17744,6 +17744,26 @@ ${delta}`;
     streamSimple: streamSimpleResponses
   });
 
+  // ../../packages/agent-core/src/failure.ts
+  function getAgentFailureMetadata(error) {
+    if (!error || typeof error !== "object") return {};
+    const source = error;
+    return {
+      ...source.retryable === false ? { retryable: false } : {},
+      ...source.remoteFailure ? { remoteFailure: source.remoteFailure } : {},
+      ...source.replayEligible === true ? { replayEligible: true } : {},
+      ...typeof source.replayClass === "string" ? { replayClass: source.replayClass } : {},
+      ...source.operationFailure ? { operationFailure: source.operationFailure } : {}
+    };
+  }
+  function createAgentOperationError(error, failure2) {
+    return Object.assign(
+      new Error(error instanceof Error ? error.message : String(error), { cause: error }),
+      getAgentFailureMetadata(error),
+      { operationFailure: failure2 }
+    );
+  }
+
   // ../../packages/agent-core/src/agent-loop.ts
   function createLoopErrorMessage(error, config, signal) {
     const message = error instanceof Error ? error.message : String(error);
@@ -17763,6 +17783,7 @@ ${delta}`;
       },
       stopReason: signal?.aborted ? "aborted" : "error",
       errorMessage: message,
+      ...getAgentFailureMetadata(error),
       timestamp: Date.now()
     };
   }
@@ -22669,7 +22690,11 @@ ${summary2}`;
     try {
       await params.runAutoCompact();
     } catch (error) {
-      if (boundary) throw error;
+      if (boundary) throw createAgentOperationError(error, {
+        origin: "tool-continuation",
+        operation: "compaction",
+        terminal: true
+      });
       if (params.isCurrent?.() !== false) params.setRecoveryState("none");
     }
   }
@@ -22978,7 +23003,8 @@ ${summary2}`;
     return !message.content.some((block) => block.type === "toolCall");
   }
   function createFailureClassification(context, retry, classifyFailure) {
-    if (context.message?.role === "assistant" && context.message.replayEligible === true && context.message.stopReason === "error") {
+    const terminalOperation = context.message?.role === "assistant" && context.message.operationFailure?.terminal === true;
+    if (!terminalOperation && context.message?.role === "assistant" && context.message.replayEligible === true && context.message.stopReason === "error") {
       return {
         kind: "provider_transient",
         retryable: true,
@@ -22989,7 +23015,7 @@ ${summary2}`;
         replayExempt: true
       };
     }
-    if (context.message?.role === "assistant" && context.message.retryable === false) {
+    if (context.message?.role === "assistant" && (terminalOperation || context.message.retryable === false)) {
       return { kind: "unknown", retryable: false, compactable: false, userAbort: context.message.stopReason === "aborted", terminal: true, message: context.errorMessage };
     }
     const remote = context.message?.role === "assistant" && context.message.stopReason === "error" ? classifyRemoteFailure(context.message.remoteFailure, context.errorMessage) : void 0;
@@ -23772,7 +23798,8 @@ ${summary2}`;
       params.emit({ type: "turn_settled" });
       return;
     }
-    const compactDecision = params.getAutoCompactDecision?.({
+    const recoveryClosed = failure2?.terminal && params.message?.role === "assistant" && (params.message.retryable === false || params.message.operationFailure?.terminal === true);
+    const compactDecision = recoveryClosed ? void 0 : params.getAutoCompactDecision?.({
       agent: params.agent,
       sessionManager: params.sessionManager,
       cwd: params.cwd,
@@ -26230,7 +26257,7 @@ ${summary2}`;
     "Compare-Object",
     "Test-Path"
   ].map((name) => name.toLowerCase()));
-  var PLAN_POWERSHELL_READ_ALIASES = /* @__PURE__ */ new Set(["cat", "ls", "pwd", "echo", "sort"]);
+  var PLAN_POWERSHELL_READ_ALIASES = /* @__PURE__ */ new Set(["cat", "ls", "pwd", "echo"]);
   var PLAN_POWERSHELL_SAFE_PARAMETERS = /^(?:-(?:Raw|TotalCount|Head|Tail|First|Last|Wait|LiteralPath|Path|Name|Pattern|Recurse|Filter|Include|Exclude|SimpleMatch|CaseSensitive|Quiet|Word|Line|Character|Encoding|ErrorAction|WarningAction))$/i;
   var PLAN_POWERSHELL_SEPARATORS = /[;\n\r\t&<>|]/;
   var PLAN_POWERSHELL_NON_ASCII = /[^\x20-\x7E]/;
@@ -27934,6 +27961,22 @@ ${formatSkillsForPrompt(skills ?? [])}`;
     agentRunHooks.set(agent2, hooks);
     return agent2;
   }
+  function inFlightRequestSummary(observation, now) {
+    const transport = observation?.transport;
+    if (!transport || transport.length === 0) return void 0;
+    const lastStartIndex = transport.map((event) => event.phase).lastIndexOf("request_start");
+    if (lastStartIndex < 0) return void 0;
+    const start = transport[lastStartIndex];
+    const after = transport.slice(lastStartIndex + 1);
+    const terminal = after.find((event) => event.phase === "terminal_accepted");
+    if (terminal) {
+      const gapMs = Math.max(0, now - terminal.at);
+      return `last model response completed ${Math.round(gapMs / 100) / 10}s before the deadline; no request in flight at abort`;
+    }
+    const sawFirst = after.some((event) => event.phase === "first_application_message");
+    const ageMs = Math.max(0, now - start.at);
+    return `a model request was still in flight at abort (${Math.round(ageMs / 100) / 10}s old, ${sawFirst ? "receiving stream events" : "no application message yet"}) \u2014 the deadline cut an unfinished response, which usually means the budget is too small for this reasoning level, not a transport stall`;
+  }
   function isParentHandoffRequired(task) {
     return task.report?.availability !== "available" || task.mode === "edit" || task.status === "timeout" || task.status === "failed" || task.confidenceSignals.some((signal) => signal.type === "tool_error" || signal.type === "no_tool_use" || signal.type === "no_text_report");
   }
@@ -28438,7 +28481,8 @@ ${DELEGATION_REPORT_INSTRUCTION}`;
       task.status = timedOut ? "timeout" : signal?.aborted ? "cancelled" : "failed";
       observeDelegationPhase(task.observation, timedOut ? "deadline" : signal?.aborted ? "cancelled" : "failed");
       phaseProgress(task.observation.phase);
-      task.error = errorMessage.slice(0, 2e3);
+      const deadlineDetail = timedOut ? inFlightRequestSummary(task.observation, Date.now()) : void 0;
+      task.error = `${errorMessage.slice(0, 2e3)}${deadlineDetail ? `; ${deadlineDetail}` : ""}`.slice(0, 2e3);
       const failureCarrier = error;
       if (failureCarrier?.subagentFailure) {
         task.failure = failureCarrier.subagentFailure;
@@ -28455,7 +28499,7 @@ ${DELEGATION_REPORT_INSTRUCTION}`;
       task.report ??= parseDelegationReport(void 0, task.id);
       task.parentHandoffRequired = isParentHandoffRequired(task);
       task.completedAt = Date.now();
-      report({ message: `[${task.name}] Failed: ${errorMessage.slice(0, 100)}`, increment: 100 });
+      report({ message: `[${task.name}] Failed: ${(errorMessage + (deadlineDetail ? `; ${deadlineDetail}` : "")).slice(0, 160)}`, increment: 100 });
     } finally {
       if (heartbeat) {
         clearInterval(heartbeat);
@@ -28550,7 +28594,7 @@ ${DELEGATION_REPORT_INSTRUCTION}`;
 `;
       }
       if (task.sessionId) {
-        resultText += task.sessionBusy ? `Session: ${task.sessionId} (busy \u2014 previous run is still settling; recall will fail until it settles` : `Session: ${task.sessionId} (resumable \u2014 pass as "sessionId" in a later spawn to continue this subagent with its accumulated context`;
+        resultText += task.sessionBusy ? `Session: ${task.sessionId} (busy \u2014 previous run is still settling; recall will fail until it settles` : `Session: ${task.sessionId} (resumable \u2014 pass as "sessionId" in a later spawn to continue this subagent with its accumulated context; add resumeMode:"report" to reuse only its last report`;
         if (task.sessionRunCount) resultText += `; run ${task.sessionRunCount}`;
         if (task.sessionPersisted) resultText += "; persisted to disk, survives restarts";
         resultText += ")\n";
@@ -28726,7 +28770,7 @@ Default mode="read" is for investigation, search, review, or triage and cannot e
               priority: Type.Optional(Type.Union([Type.Literal("fast"), Type.Literal("thorough")], { description: "fast uses lower-cost defaults; thorough raises model class when needed." })),
               model: Type.Optional(Type.String({ description: 'Explicit model override, e.g. "provider/model-id". Only when the user names a specific model; otherwise automatic.' })),
               thinkingLevel: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("xhigh")], { description: "off|minimal|low|medium|high|xhigh. Default medium; override only when the user asks or for cheap lookups (off)." })),
-              timeout: Type.Optional(Type.Number({ description: "Seconds. Default 1200; set higher for long tasks." })),
+              timeout: Type.Optional(Type.Number({ description: "Seconds. Default 1200; set higher for long tasks. Note: high/xhigh reasoning tasks can spend minutes per response on thinking alone \u2014 budget accordingly or the deadline will cut an in-flight response mid-thought." })),
               resumeMode: Type.Optional(Type.Union([Type.Literal("full"), Type.Literal("report")], { description: "Default full retains prior transcript. Explicit report rebuilds with current tools/model/credentials and only the latest valid historical report as data plus the new task; fails if unavailable." })),
               sessionId: Type.Optional(Type.String({ description: "Continue a previous subagent session by id (from an earlier result's Session line); full mode retains historical input with unknown cost. Optional mode/model/thinkingLevel reconfigure it; one task at a time; recalls never replay on failure and must target an idle session; prefer a fresh task for independent reviews." }))
             }
@@ -48589,6 +48633,12 @@ ${extensionSection.join("\n\n---\n\n")}
       return this.active?.hadToolActivity === true;
     }
     beginTurn(displayContent, requestedClientTurnId) {
+      const reserved = this.reserveTurn(displayContent, requestedClientTurnId);
+      reserved.publish();
+      return reserved.clientTurnId;
+    }
+    /** Allocate identity without calling the host; admission owns publication. */
+    reserveTurn(displayContent, requestedClientTurnId) {
       const startedAt = Date.now();
       const sessionId = this.getSessionId();
       const clientTurnId = String(requestedClientTurnId || "").trim() || `turn_${startedAt.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -48618,8 +48668,7 @@ ${extensionSection.join("\n\n---\n\n")}
       item.text = value.value;
       item.summary = summary(value.value);
       item.isTruncated = value.truncated;
-      this.emitTimeline(item);
-      return clientTurnId;
+      return { clientTurnId, publish: () => this.emitTimeline(item) };
     }
     beginAssistant(timestamp = Date.now()) {
       const active = this.active;
@@ -48804,7 +48853,7 @@ ${extensionSection.join("\n\n---\n\n")}
       this.emitTimeline(item);
     }
     emitError(message, overrides = {}) {
-      const active = this.active;
+      const active = overrides.nonTerminal ? null : this.active;
       const classified = classifyRuntimeError(message);
       const payload = {
         ...classified,
@@ -48814,6 +48863,10 @@ ${extensionSection.join("\n\n---\n\n")}
         hadToolActivity: active?.hadToolActivity === true,
         ...overrides
       };
+      if (payload.nonTerminal) {
+        this.bridge.sendToUnity("runtime_error", payload);
+        return payload;
+      }
       const errorKey = `${payload.code}:${payload.message}`;
       if (!active || !active.emittedErrorKeys.has(errorKey)) {
         active?.emittedErrorKeys.add(errorKey);
@@ -48836,13 +48889,9 @@ ${extensionSection.join("\n\n---\n\n")}
       }
       return payload;
     }
-    finishTurn(outcome, stopReason) {
+    finishTurn(outcome, stopReason, beforeNotify) {
       const active = this.active;
       if (active?.terminalSent) return;
-      if (active) {
-        active.terminalSent = true;
-        this.flushUnclosedTools(active);
-      }
       if (!active) return;
       const payload = {
         sessionId: active.sessionId,
@@ -48850,7 +48899,14 @@ ${extensionSection.join("\n\n---\n\n")}
         outcome,
         stopReason
       };
-      this.bridge.sendToUnity("turn_finished", payload);
+      active.terminalSent = true;
+      try {
+        this.flushUnclosedTools(active);
+      } finally {
+        if (this.active === active) this.active = null;
+        beforeNotify?.();
+        this.bridge.sendToUnity("turn_finished", payload);
+      }
     }
     resetForSessionSwitch() {
       const active = this.active;
@@ -48991,7 +49047,7 @@ ${extensionSection.join("\n\n---\n\n")}
       syncSessionInfo();
       deps.emitSessionSync();
     }
-    async function forkFromRecord2(record) {
+    async function forkFromRecord2(record, persist = persistCurrentSession2) {
       const forked = createSessionRecord({
         parentSessionId: record.id,
         provider: record.provider || deps.getProvider(),
@@ -49001,7 +49057,7 @@ ${extensionSection.join("\n\n---\n\n")}
         executionState: record.executionState
       });
       restoreSessionRecord2(forked);
-      await persistCurrentSession2();
+      await persist();
     }
     return {
       // Shared switch epoch: persistence does not advance it; even same-id restores do.
@@ -49996,12 +50052,15 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       todoTool: todoTool2
     } = host;
     let executionWork;
+    let chatTurn;
     let turnFinalized = false;
     attachAgentEventsToSessionTrace({ agent: agent2, trace: sessionTrace2 });
     agent2.subscribe((event) => {
       try {
         switch (event.type) {
           case "agent_start":
+            chatTurn = host.getRuntimeChatTurn?.();
+            chatTurn?.markDispatched();
             executionWork = todoTool2.beginWork?.();
             turnFinalized = false;
             bridge2.sendToUnity("state_event", { name: "agent_start", detail: "agent loop started" });
@@ -50130,6 +50189,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
             });
             break;
           case "turn_completed": {
+            if (host.getRuntimeChatTurn && (!chatTurn || !chatTurn.isCurrent)) break;
             if (executionWork && todoTool2.isWorkCurrent?.(executionWork) === false) break;
             host.refreshTodoLoopState();
             bridge2.sendToUnity("turn_end", {
@@ -50171,13 +50231,14 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               }
             }
             if (shouldFinalizeStructuredTurn) {
-              void host.finalizeRuntimeChatTurn("completed", messageStopReason(event.message, "stop"));
+              void host.finalizeRuntimeChatTurn("completed", messageStopReason(event.message, "stop"), void 0, chatTurn);
             } else {
               host.persistCurrentSessionSafely();
             }
             break;
           }
           case "turn_failed": {
+            if (host.getRuntimeChatTurn && (!chatTurn || !chatTurn.isCurrent)) break;
             if (turnFinalized || executionWork && (todoTool2.isTurnCurrent?.(executionWork) ?? todoTool2.isWorkCurrent?.(executionWork)) === false) break;
             turnFinalized = true;
             const stopReason = messageStopReason(event.message, "error");
@@ -50195,7 +50256,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
             bridge2.sendToUnity("turn_end", { role: messageRole(event.message), stopReason });
             bridge2.sendToUnity("state_event", { name: "turn_failed", detail: `stopReason=${stopReason}` });
             const outcome = stopReason === "aborted" ? "aborted" : "failed";
-            void host.finalizeRuntimeChatTurn(outcome, stopReason, errMsg);
+            void host.finalizeRuntimeChatTurn(outcome, stopReason, errMsg, chatTurn);
             bridge2.sendToUnity("error", { message: errMsg });
             break;
           }
@@ -50373,6 +50434,46 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     return messages.slice(0, turnEnd);
   }
 
+  // src/session-persistence.ts
+  var SessionPersistenceUnavailableError = class extends Error {
+    code = "SESSION_PERSISTENCE_UNAVAILABLE";
+    constructor() {
+      super("SESSION_PERSISTENCE_UNAVAILABLE: cancelled session persistence is still in flight; retry after it settles.");
+      this.name = "SessionPersistenceUnavailableError";
+    }
+  };
+  function isSessionPersistenceUnavailable(error) {
+    return error instanceof SessionPersistenceUnavailableError;
+  }
+  var UnitySessionPersistence = class {
+    constructor(getSessionGeneration) {
+      this.getSessionGeneration = getSessionGeneration;
+    }
+    getSessionGeneration;
+    tail;
+    abandoned;
+    assertAvailable() {
+      if (this.abandoned) throw new SessionPersistenceUnavailableError();
+    }
+    serialize(action) {
+      if (this.abandoned) return Promise.reject(new SessionPersistenceUnavailableError());
+      const generation = this.getSessionGeneration();
+      const guarded = () => generation === this.getSessionGeneration() ? action() : Promise.resolve();
+      const run = (this.tail ?? Promise.resolve()).then(guarded);
+      const settled = () => {
+        if (this.tail === tail) this.tail = void 0;
+        if (this.abandoned === tail) this.abandoned = void 0;
+      };
+      const tail = run.then(settled, settled);
+      this.tail = tail;
+      return run;
+    }
+    /** Must run before an aborted terminal can synchronously admit another turn. */
+    abandonPending() {
+      if (this.tail) this.abandoned = this.tail;
+    }
+  };
+
   // src/unity-public-api.ts
   function isRecord14(value) {
     return typeof value === "object" && value !== null;
@@ -50479,8 +50580,8 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         }
         host.emitSessionSync();
         ack(true);
-      } catch {
-        ack(false, "SESSION_BINDING_FAILED");
+      } catch (error) {
+        ack(false, isSessionPersistenceUnavailable(error) ? error.code : "SESSION_BINDING_FAILED");
       }
     }
     globalThis.pie = {
@@ -50489,12 +50590,27 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         const generation = isSessionRequest ? ++sessionGeneration : sessionGeneration;
         const epoch = isSessionRequest ? host.getSessionEpoch() : void 0;
         if (isSessionRequest && stringField(data2, "requestId")) return bindSession(action, data2, generation);
+        let acceptedTurn;
+        const rejectRequest = (message, overrides) => host.emitRuntimeError(message, {
+          ...overrides,
+          clientTurnId: stringField(data2, "clientTurnId")?.trim() || "",
+          hadToolActivity: false,
+          nonTerminal: true
+        });
         try {
           switch (action) {
             case "send_message": {
+              if (host.isRuntimeChatTurnActive()) {
+                const message = "Cannot send a message while another turn is active. Abort it or wait for completion.";
+                rejectRequest(message, { code: "SESSION_TURN_ACTIVE", category: "session", retryable: true });
+                break;
+              }
               const content = stringField(data2, "content") ?? String(data2);
               const displayContent = stringField(data2, "displayContent") ?? content;
-              const clientTurnId = host.beginRuntimeChatTurn(displayContent, stringField(data2, "clientTurnId"));
+              const turn = host.beginRuntimeChatTurn(displayContent, stringField(data2, "clientTurnId"));
+              acceptedTurn = turn;
+              if (!turn.isCurrent) break;
+              const { clientTurnId } = turn;
               const parsedImages = parseImageAttachments(data2?.images);
               if (parsedImages.error) {
                 const message = `Invalid image attachments: ${parsedImages.error}`;
@@ -50504,7 +50620,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                   retryable: false
                 });
                 host.bridge.sendToUnity("error", { message });
-                await host.finalizeRuntimeChatTurn("failed", "error");
+                await host.finalizeRuntimeChatTurn("failed", "error", void 0, turn);
                 break;
               }
               const images = parsedImages.images;
@@ -50516,30 +50632,31 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                   retryable: false
                 });
                 host.bridge.sendToUnity("error", { message });
-                await host.finalizeRuntimeChatTurn("failed", "error");
+                await host.finalizeRuntimeChatTurn("failed", "error", void 0, turn);
                 break;
               }
               host.sessionTrace.notePendingUserText(content);
               host.todoTool.resumeForUserText?.(content);
               const reminder = host.todoTool.getReminder?.();
               const finalContent = reminder ? `${reminder}${content}` : content;
-              if (await host.handleLocalCommand(content)) {
-                await host.finalizeRuntimeChatTurn("completed", "stop");
+              if (await turn.run(() => host.handleLocalCommand(content, turn))) {
+                await host.finalizeRuntimeChatTurn("completed", "stop", void 0, turn);
                 break;
               }
-              await host.persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId, images);
+              await turn.run(() => host.persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId, images));
               host.emitSessionSync();
               host.sessionTrace.noteDispatchStart({ mode: "unity" });
-              host.promptAgentWithRecovery(finalContent, displayContent, clientTurnId, images).catch(async (err) => {
+              turn.dispatch(() => host.promptAgentWithRecovery(finalContent, displayContent, clientTurnId, images)).catch(async (err) => {
+                if (!turn.isCurrent) return;
                 const msg = err instanceof Error ? err.message : String(err);
                 host.bridge.log("error", `[pie/index] agent.prompt rejected: ${msg}`);
-                host.emitRuntimeError(msg);
+                host.emitRuntimeError(msg, isSessionPersistenceUnavailable(err) ? { code: err.code, category: "session", retryable: true } : void 0);
                 host.bridge.sendToUnity("error", { message: msg });
                 host.sessionTrace.noteStalled(msg, { mode: "unity" });
                 host.sessionTrace.abortTurn(msg);
-                await host.finalizeRuntimeChatTurn("failed", "error");
+                await host.finalizeRuntimeChatTurn("failed", "error", void 0, turn);
               }).finally(() => {
-                host.sessionTrace.noteDispatchSettled({ mode: "unity" });
+                if (turn.isCurrent) host.sessionTrace.noteDispatchSettled({ mode: "unity" });
               });
               break;
             }
@@ -50568,12 +50685,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               if (host.isRuntimeChatTurnActive()) {
                 const message = "Cannot start a new session while a turn is streaming. Abort it first.";
                 host.bridge.log("warn", "[pie/index] new_session rejected: turn active");
-                host.emitRuntimeError(message, {
+                rejectRequest(message, {
                   code: "SESSION_TURN_ACTIVE",
                   category: "session",
                   retryable: true
                 });
-                host.bridge.sendToUnity("error", { message });
                 break;
               }
               await host.persistCurrentSession();
@@ -50581,12 +50697,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               if (host.isRuntimeChatTurnActive()) {
                 const message = "Cannot start a new session while a turn is streaming. Abort it first.";
                 host.bridge.log("warn", "[pie/index] new_session rejected after persist: turn became active");
-                host.emitRuntimeError(message, {
+                rejectRequest(message, {
                   code: "SESSION_TURN_ACTIVE",
                   category: "session",
                   retryable: true
                 });
-                host.bridge.sendToUnity("error", { message });
                 break;
               }
               host.startFreshSession();
@@ -50614,13 +50729,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 }
                 const message = "Cannot resume a different session while a turn is streaming. Abort it first.";
                 host.bridge.log("warn", `[pie/index] resume_session ${sessionId} rejected: turn active on ${currentId || "<none>"}`);
-                host.emitRuntimeError(message, {
+                rejectRequest(message, {
                   code: "SESSION_TURN_ACTIVE",
                   category: "session",
-                  retryable: true,
-                  sessionId
+                  retryable: true
                 });
-                host.bridge.sendToUnity("error", { message });
                 break;
               }
               host.bridge.log("info", `[pie/index] resume_session ${sessionId}`);
@@ -50629,13 +50742,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               if (loaded && host.isRuntimeChatTurnActive()) {
                 const message = "Cannot resume a session while a turn is streaming. Abort it first.";
                 host.bridge.log("warn", `[pie/index] resume_session ${sessionId} rejected after load: turn became active`);
-                host.emitRuntimeError(message, {
+                rejectRequest(message, {
                   code: "SESSION_TURN_ACTIVE",
                   category: "session",
-                  retryable: true,
-                  sessionId
+                  retryable: true
                 });
-                host.bridge.sendToUnity("error", { message });
                 break;
               }
               if (loaded) {
@@ -50692,12 +50803,20 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 break;
               }
               if (host.isRuntimeChatTurnActive()) {
-                host.bridge.sendToUnity("error", { message: "Cannot rewind or fork while a turn is streaming. Abort it first." });
+                rejectRequest("Cannot rewind or fork while a turn is streaming. Abort it first.", {
+                  code: "SESSION_TURN_ACTIVE",
+                  category: "session",
+                  retryable: true
+                });
                 break;
               }
               await host.persistCurrentSession();
               if (host.isRuntimeChatTurnActive()) {
-                host.bridge.sendToUnity("error", { message: "Cannot rewind or fork while a turn is streaming. Abort it first." });
+                rejectRequest("Cannot rewind or fork while a turn is streaming. Abort it first.", {
+                  code: "SESSION_TURN_ACTIVE",
+                  category: "session",
+                  retryable: true
+                });
                 break;
               }
               const record = host.getCurrentSession();
@@ -50730,7 +50849,8 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               }
               break;
             }
-            case "abort":
+            case "abort": {
+              const abortPending = host.preparePendingRuntimeChatAbort();
               host.bridge.log("info", `[pie/index] abort reason=${stringField(data2, "reason") || "user"}`);
               host.agentSessionController.abort();
               clearTodoAfterAbort({
@@ -50740,19 +50860,181 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 persistCurrentSessionSafely: host.persistCurrentSessionSafely,
                 emitSessionSync: host.emitSessionSync
               });
+              abortPending();
               break;
+            }
             default:
               host.bridge.log("warn", `[pie/index] Unknown action: ${action}`);
           }
         } catch (err) {
+          if (acceptedTurn && !acceptedTurn.isCurrent) return;
           const msg = err instanceof Error ? err.message : String(err);
           host.bridge.log("error", `[pie/index] Error in ${action}: ${msg}`);
-          host.emitRuntimeError(msg);
+          host.emitRuntimeError(msg, isSessionPersistenceUnavailable(err) ? { code: err.code, category: "session", retryable: true } : void 0);
           host.bridge.sendToUnity("error", { message: msg });
+          if (acceptedTurn) {
+            try {
+              await host.finalizeRuntimeChatTurn("failed", "error", void 0, acceptedTurn);
+            } catch (finalizeError) {
+              host.bridge.log("error", `[pie/index] Failed to finalize pre-dispatch turn: ${finalizeError instanceof Error ? finalizeError.message : String(finalizeError)}`);
+            }
+          }
         }
       }
     };
   }
+
+  // src/runtime-chat-turn.ts
+  var RetiredChatTurn = class extends Error {
+  };
+  var UnityRuntimeChatTurns = class {
+    constructor(host) {
+      this.host = host;
+    }
+    host;
+    active;
+    settling = /* @__PURE__ */ new WeakMap();
+    get current() {
+      return this.active;
+    }
+    get isActive() {
+      return this.active !== void 0;
+    }
+    begin(displayContent, clientTurnId) {
+      if (this.active) throw new Error("SESSION_TURN_ACTIVE");
+      const owner = this;
+      const reserved = this.host.projection.reserveTurn(displayContent, clientTurnId);
+      let phase = "pending";
+      let release;
+      const retired = new Promise((resolve2) => {
+        release = resolve2;
+      });
+      const check = () => {
+        if (!lease.isCurrent) throw new RetiredChatTurn();
+      };
+      const lease = {
+        clientTurnId: reserved.clientTurnId,
+        get isCurrent() {
+          return owner.active === lease && phase !== "retired";
+        },
+        get isPending() {
+          return phase === "pending" || phase === "dispatching";
+        },
+        startFinishing() {
+          if (phase === "finishing" || phase === "retired") return false;
+          phase = "finishing";
+          return true;
+        },
+        retire() {
+          phase = "retired";
+          release();
+        },
+        async run(operation) {
+          check();
+          const result = await Promise.race([
+            operation(),
+            retired.then(() => {
+              throw new RetiredChatTurn();
+            })
+          ]);
+          check();
+          return result;
+        },
+        dispatch(operation) {
+          check();
+          phase = "dispatching";
+          return operation();
+        },
+        markDispatched() {
+          if (lease.isCurrent && lease.isPending) phase = "dispatched";
+        }
+      };
+      this.active = lease;
+      try {
+        reserved.publish();
+      } catch (error) {
+        try {
+          if (lease.isCurrent) this.finish(lease, "failed", "error");
+        } catch (terminalError) {
+          this.host.logPersistenceError(`Turn terminal notification failed: ${String(terminalError)}`);
+        } finally {
+          this.host.logPersistenceError(`Turn publication failed: ${String(error)}`);
+        }
+      }
+      return lease;
+    }
+    finish(lease, outcome, stopReason) {
+      if (this.active !== lease) return;
+      const owned = this.active;
+      if (!owned.startFinishing()) return;
+      try {
+        this.host.projection.finishTurn(outcome, stopReason, () => {
+          owned.retire();
+          if (this.active === owned) this.active = void 0;
+        });
+      } finally {
+        if (this.active === owned) {
+          owned.retire();
+          this.active = void 0;
+        }
+      }
+    }
+    /** Pending work has no semantic agent terminal and must not wait for IO. */
+    preparePendingAbort() {
+      const lease = this.active;
+      if (lease?.isPending) this.host.abandonPendingPersistence?.();
+      return () => {
+        if (lease?.isPending) this.finish(lease, "aborted", "aborted");
+      };
+    }
+    /**
+     * Switching is synchronous and intentionally not reentrant admission: the
+     * caller still has to replace session/agent state after this returns. The
+     * nonTerminal rejection restores C#'s optimistic send snapshot. Ordinary
+     * terminals (including predispatch abort) instead release before notifying.
+     */
+    resetForSessionSwitch() {
+      const owned = this.active;
+      try {
+        if (owned?.startFinishing()) this.host.projection.finishTurn("aborted", "session_switch");
+      } finally {
+        this.host.projection.resetForSessionSwitch();
+        owned?.retire();
+        this.active = void 0;
+      }
+    }
+    finalize(outcome, stopReason, errorMessage, lease = this.active) {
+      if (!lease) return Promise.resolve();
+      const pending = this.settling.get(lease);
+      if (pending) return pending;
+      if (this.active !== lease) return Promise.resolve();
+      const settlement = Promise.resolve().then(async () => {
+        if (this.active !== lease) return;
+        try {
+          if (errorMessage) this.host.projection.emitError(errorMessage);
+          if (this.active !== lease) return;
+          try {
+            await this.host.waitForIdle?.();
+            if (this.active !== lease) return;
+            await this.host.persist();
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            this.host.logPersistenceError(message);
+            if (this.active === lease) this.host.projection.emitError(message, {
+              code: isSessionPersistenceUnavailable(error) ? error.code : "SESSION_PERSIST_FAILED",
+              category: "session",
+              retryable: isSessionPersistenceUnavailable(error)
+            });
+          }
+          if (this.active === lease) this.host.sync();
+        } finally {
+          this.finish(lease, outcome, stopReason);
+        }
+      });
+      this.settling.set(lease, settlement);
+      return settlement;
+    }
+  };
 
   // src/unity-self-check.ts
   async function runUnitySelfCheck(host) {
@@ -50851,15 +51133,16 @@ ${availableSessions.join("\n")}` : "\n\nNo Pie chat sessions have been saved yet
     }
   }
   function createUnityLocalCommandHandler(host) {
-    return async function handleLocalCommand2(content) {
+    return async function handleLocalCommand2(content, turn) {
+      const wait = (operation) => turn ? turn.run(operation) : Promise.resolve(operation());
       const trimmed = content.trim();
       if (!trimmed.startsWith("/")) return false;
       const [command, ...rest] = trimmed.split(/\s+/);
       if (command === "/new") {
-        await host.persistCurrentSession();
+        await wait(() => host.persistCurrentSession());
         host.startFreshSession();
-        await host.persistCurrentSessionForRecovery();
         host.emitLocalAssistantMessage(`Started new session: ${host.getCurrentSession().id}`);
+        await host.persistCurrentSessionForRecovery();
         return true;
       }
       if (command === "/resume") {
@@ -50867,14 +51150,14 @@ ${availableSessions.join("\n")}` : "\n\nNo Pie chat sessions have been saved yet
         const args = rest.filter((arg) => arg !== "--silent");
         const sessionId = args[0];
         if (!sessionId) {
-          const sessions = await listSessions(host.projectRoot);
+          const sessions = await wait(() => listSessions(host.projectRoot));
           const text = sessions.length === 0 ? "No saved sessions." : sessions.map((session) => `${session.id} | ${session.title} | ${session.modelId} | ${session.updatedAt}`).join("\n");
           host.emitLocalAssistantMessage(text);
           return true;
         }
-        const loaded = await loadSession(host.projectRoot, sessionId);
+        const loaded = await wait(() => loadSession(host.projectRoot, sessionId));
         if (!loaded) {
-          const explanation = await tryExplainExternalSessionId(host, sessionId);
+          const explanation = await wait(() => tryExplainExternalSessionId(host, sessionId));
           host.emitLocalAssistantMessage(explanation || `Session not found: ${sessionId}`);
           return true;
         }
@@ -50887,7 +51170,7 @@ Messages: ${loaded.messageCount}`);
         return true;
       }
       if (command === "/tree") {
-        host.emitLocalAssistantMessage(await formatSessionTree(host.projectRoot));
+        host.emitLocalAssistantMessage(await wait(() => formatSessionTree(host.projectRoot)));
         return true;
       }
       if (command === "/session-check") {
@@ -50899,8 +51182,8 @@ Messages: ${loaded.messageCount}`);
           messages: probeMessages,
           todoState: host.todoTool.getState()
         });
-        const saved = await saveSession(host.projectRoot, probe);
-        const loaded = await loadSession(host.projectRoot, saved.id);
+        const saved = await wait(() => saveSession(host.projectRoot, probe));
+        const loaded = await wait(() => loadSession(host.projectRoot, saved.id));
         const ok = !!loaded && loaded.id === saved.id && loaded.provider === saved.provider && loaded.modelId === saved.modelId && (loaded.messages?.length || 0) === saved.messages.length && (loaded.todoState?.length || 0) === saved.todoState.length;
         host.emitLocalAssistantMessage(
           ok ? `Session self-check passed.
@@ -50913,7 +51196,7 @@ Loaded: ${loaded ? loaded.id : "(missing)"}`
         return true;
       }
       if (command === "/self-check") {
-        host.emitLocalAssistantMessage(await host.runUnitySelfCheck());
+        host.emitLocalAssistantMessage(await wait(() => host.runUnitySelfCheck()));
         return true;
       }
       if (command === "/debug-stream") {
@@ -50927,20 +51210,22 @@ Loaded: ${loaded ? loaded.id : "(missing)"}`
       if (command === "/fork") {
         const sessionId = rest[0];
         if (sessionId) {
-          const source2 = await loadSession(host.projectRoot, sessionId);
+          const source2 = await wait(() => loadSession(host.projectRoot, sessionId));
           if (!source2) {
-            const explanation = await tryExplainExternalSessionId(host, sessionId);
+            const explanation = await wait(() => tryExplainExternalSessionId(host, sessionId));
             host.emitLocalAssistantMessage(explanation || `Session not found: ${sessionId}`);
             return true;
           }
-          await host.forkFromRecord(source2);
+          const persisted2 = host.forkFromRecord(source2);
           host.emitLocalAssistantMessage(`Forked new session ${host.getCurrentSession().id} from ${source2.id}`);
+          await persisted2;
           return true;
         }
-        await host.persistCurrentSession();
-        const source = await loadSession(host.projectRoot, host.getCurrentSession().id) || host.getCurrentSession();
-        await host.forkFromRecord(source);
+        await wait(() => host.persistCurrentSession());
+        const source = await wait(() => loadSession(host.projectRoot, host.getCurrentSession().id)) || host.getCurrentSession();
+        const persisted = host.forkFromRecord(source);
         host.emitLocalAssistantMessage(`Forked new session ${host.getCurrentSession().id} from ${source.id}`);
+        await persisted;
         return true;
       }
       if (command === "/memory") {
@@ -50967,7 +51252,7 @@ ${configured.join("\n")}` : host.getModelSelectionWarning());
           host.emitLocalAssistantMessage(`Unknown model selection: ${rest[0]}`);
           return true;
         }
-        await host.applyModelSelection(provider, modelId);
+        await wait(() => host.applyModelSelection(provider, modelId));
         host.emitLocalAssistantMessage(host.hasConfiguredModelSelection() ? `Switched model to ${provider}/${modelId}` : host.getModelSelectionWarning());
         return true;
       }
@@ -51552,7 +51837,8 @@ ${initialAgentsFile}`);
   function getUnityPolicyContext() {
     return resolveUnityRuntimePolicy(bridge, isEditor);
   }
-  var sessionPersistenceTail = Promise.resolve();
+  var persistenceSessionGeneration = 0;
+  var sessionPersistence = new UnitySessionPersistence(() => persistenceSessionGeneration);
   var todoTool = createManageTodoListTool();
   var todoLoopState = null;
   var fileToolPathOptions = buildFileToolPathOptions();
@@ -51700,13 +51986,8 @@ ${initialAgentsFile}`);
       todoTool
     });
   }
-  var persistenceSessionGeneration = 0;
   function serializeSessionPersistence(action) {
-    const generation = persistenceSessionGeneration;
-    const guarded = () => generation === persistenceSessionGeneration ? action() : Promise.resolve();
-    const run = sessionPersistenceTail.then(guarded, guarded);
-    sessionPersistenceTail = run.catch(() => void 0);
-    return run;
+    return sessionPersistence.serialize(action);
   }
   async function persistCurrentSession() {
     await serializeSessionPersistence(() => sessionRuntime.persistCurrentSession());
@@ -51758,14 +52039,14 @@ ${initialAgentsFile}`);
   }
   function startFreshSession(parentSessionId) {
     persistenceSessionGeneration++;
-    runtimeChat.resetForSessionSwitch();
+    runtimeChatTurns.resetForSessionSwitch();
     sessionRuntime.startFreshSession(parentSessionId);
     agentSessionController.syncFromActiveSession();
     todoLoopState = null;
   }
   function restoreSessionRecord(record) {
     persistenceSessionGeneration++;
-    runtimeChat.resetForSessionSwitch();
+    runtimeChatTurns.resetForSessionSwitch();
     _provider = record.provider || "";
     _modelId = record.modelId || "";
     const resolved = getActiveResolvedModel();
@@ -51801,10 +52082,14 @@ ${initialAgentsFile}`);
       messages
     };
   }
-  async function forkFromRecord(record) {
+  function forkFromRecord(record) {
+    sessionPersistence.assertAvailable();
     persistenceSessionGeneration++;
-    await sessionRuntime.forkFromRecord(record);
+    runtimeChatTurns.resetForSessionSwitch();
+    const persisted = sessionRuntime.forkFromRecord(record, persistCurrentSession);
+    agentSessionController.syncFromActiveSession();
     refreshTodoLoopState();
+    return persisted;
   }
   function emitLocalAssistantMessage(text) {
     bridge.sendToUnity("message_update", { type: "text_full", text });
@@ -51858,38 +52143,20 @@ ${initialAgentsFile}`);
       bridge.log("error", `[pie/index] Failed to persist session: ${err instanceof Error ? err.message : String(err)}`);
     });
   }
-  var runtimeChatTurnOpen = false;
-  function beginRuntimeChatTurn(displayContent, clientTurnId) {
-    runtimeChatTurnOpen = true;
-    return runtimeChat.beginTurn(displayContent, clientTurnId);
-  }
+  var runtimeChatTurns = new UnityRuntimeChatTurns({
+    projection: runtimeChat,
+    // Semantic turn_end precedes agent_end/prompt-lock release. Keep admission
+    // until that run is idle so an OnTurnFinished send can really dispatch.
+    waitForIdle: () => agent.waitForIdle(),
+    persist: persistCurrentSession,
+    abandonPendingPersistence: () => sessionPersistence.abandonPending(),
+    sync: emitSessionSync,
+    logPersistenceError: (message) => bridge.log("error", `[pie/index] Failed to persist terminal session snapshot: ${message}`)
+  });
+  var beginRuntimeChatTurn = runtimeChatTurns.begin.bind(runtimeChatTurns);
+  var finalizeRuntimeChatTurn = runtimeChatTurns.finalize.bind(runtimeChatTurns);
   function emitRuntimeError(message, overrides) {
     return runtimeChat.emitError(message, overrides);
-  }
-  async function finalizeRuntimeChatTurn(outcome, stopReason, errorMessage) {
-    try {
-      const generation = persistenceSessionGeneration;
-      const turnId = runtimeChat.activeClientTurnId;
-      const isCurrent = () => generation === persistenceSessionGeneration && turnId === runtimeChat.activeClientTurnId;
-      if (errorMessage) runtimeChat.emitError(errorMessage);
-      try {
-        await persistCurrentSession();
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        bridge.log("error", `[pie/index] Failed to persist terminal session snapshot: ${message}`);
-        if (!isCurrent()) return;
-        runtimeChat.emitError(message, {
-          code: "SESSION_PERSIST_FAILED",
-          category: "session",
-          retryable: false
-        });
-      }
-      if (!isCurrent()) return;
-      emitSessionSync();
-      runtimeChat.finishTurn(outcome, stopReason);
-    } finally {
-      runtimeChatTurnOpen = false;
-    }
   }
   async function applyModelSelection(provider, modelId) {
     const resolved = resolveModelWithRuntimeOverrides(provider, modelId);
@@ -51956,6 +52223,7 @@ ${initialAgentsFile}`);
     persistCurrentSessionSafely,
     refreshTodoLoopState,
     runtimeChat,
+    getRuntimeChatTurn: () => runtimeChatTurns.current,
     finalizeRuntimeChatTurn,
     verboseLog
   });
@@ -51967,6 +52235,7 @@ ${initialAgentsFile}`);
     todoTool,
     applyModelSelectionSync,
     beginRuntimeChatTurn,
+    preparePendingRuntimeChatAbort: runtimeChatTurns.preparePendingAbort.bind(runtimeChatTurns),
     emitRuntimeError,
     emitSessionSync,
     emitSkillsList,
@@ -51999,7 +52268,7 @@ ${initialAgentsFile}`);
     getSessionEpoch: sessionRuntime.getSessionEpoch,
     getCurrentSession: () => _currentSession,
     forkFromRecord,
-    isRuntimeChatTurnActive: () => runtimeChatTurnOpen || agent.state.isStreaming === true,
+    isRuntimeChatTurnActive: () => runtimeChatTurns.isActive || agent.state.isStreaming === true,
     getTodoLoopState: () => todoLoopState,
     setTodoLoopState: (loop) => {
       todoLoopState = loop;

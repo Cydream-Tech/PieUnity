@@ -239,6 +239,7 @@ namespace Pie
         {
             PieDiagnostics.Verbose("Creating JsEnv (PuerTS 2.2.2 BackendType.V8)...");
             _jsEnv = new JsEnv(new DefaultLoader(), -1, BackendType.V8, IntPtr.Zero, IntPtr.Zero);
+            RegisterDelegateSignatures();
 
             PieDiagnostics.Verbose("Injecting pieBridge...");
             InjectPieBridge(projectRoot, settings);
@@ -256,6 +257,22 @@ namespace Pie
             RefreshRuntimeBridgeReady();
             if (!_isUnityScriptHostReady)
                 throw new Exception("Unity script host was not installed by the bundled Pie runtime.");
+        }
+
+        // Single ABI registration list for every generic Action/Func Eval in this
+        // class. Required by the PuerTS 2.2.2 ungenerated Editor fallback, even
+        // for reference-only core delegates; harmless on the xIl2cpp path.
+        // Non-generic Action (script-host tick) is built into GenericDelegate:
+        // PuerTS 2.2.2 has no parameterless UsingAction() API.
+        // check-unity-binding-surface.mjs gates coverage and boot ordering.
+        private void RegisterDelegateSignatures()
+        {
+            _jsEnv.UsingAction<string, string>();
+            _jsEnv.UsingFunc<string, string, string>();
+            _jsEnv.UsingFunc<string, string>();
+            _jsEnv.UsingAction<int, string>();
+            _jsEnv.UsingAction<int, int, string>();
+            _jsEnv.UsingAction<int, string, string>();
         }
 
         /// <summary>
