@@ -618,7 +618,8 @@ namespace Pie
                 || string.Equals(source, "player", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(source, "pie", StringComparison.OrdinalIgnoreCase))
                 return source.ToLowerInvariant();
-            throw new InvalidOperationException("Unsupported log source: " + source);
+            throw new InvalidOperationException(
+                "Unsupported log source: " + source + ". Valid sources: active, editor, player, pie.");
         }
 
         private static List<string> GetLogCandidates(string source)

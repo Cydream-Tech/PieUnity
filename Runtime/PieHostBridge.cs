@@ -79,7 +79,8 @@ namespace Pie
                     PieUnityCapabilityRegistry.UnregisterRuntimeHost(hostNamespace);
                     return PieHostBridgeProtocol.SuccessJson();
                 default:
-                    throw new InvalidOperationException("Unsupported host bridge action: " + action);
+                    throw new InvalidOperationException(
+                        "Unsupported host bridge action: " + action + ". Valid actions: register_host, unregister_host.");
             }
         }
 

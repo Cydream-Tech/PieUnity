@@ -28,7 +28,7 @@ internal static class PieUnityScreenshotRegistration
         PieUnityCapabilityRegistry.RegisterTool(
             "unity_screenshot",
             "unity",
-            "Capture the current game view as a PNG screenshot rendered from the active camera (or a named camera) and saved under the persistent root at PieScreenshots/. Pair with read_file (root=persistent) to visually inspect the capture.",
+            "Capture the current game view as a PNG screenshot rendered from the active camera (or a named camera) and saved under the persistent root at PieScreenshots/. Captures are opaque (RGB, no alpha) and sRGB-encoded in both gamma and linear color space projects. Pass includeUI=false to capture via a camera render with UI canvases temporarily disabled (chat panels, HUD); that fresh render can differ from the final presented frame. Pair with read_file (root=persistent) to visually inspect the capture.",
             "editor+runtime",
             true,
             false,
@@ -39,6 +39,7 @@ internal static class PieUnityScreenshotRegistration
                 new PieUnityParameterDescriptor { name = "height", type = "integer", required = false },
                 new PieUnityParameterDescriptor { name = "cameraName", type = "string", required = false },
                 new PieUnityParameterDescriptor { name = "path", type = "string", required = false },
+                new PieUnityParameterDescriptor { name = "includeUI", type = "boolean", required = false },
             },
             PieUnityScreenshotRuntime.ScreenshotJson,
             capabilityKind: "inspect");

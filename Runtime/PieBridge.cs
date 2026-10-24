@@ -7,6 +7,13 @@
 //   3. SendToJs(action, json) — call JS pie.handleCSharpMessage(action, data)
 //   4. ReceiveFromJs(event, json) — called by JS via pieBridge.sendToUnity(...)
 //   5. Dispose() — cleanup JsEnv
+//
+// Hot channels are cached JS delegates, not string Eval: every interpolated
+// Eval payload is unique source that V8 must parse again (SendToJs, every SSE
+// line, every file completion), and string Eval forced a hand-rolled escaping
+// helper. Delegates parse once at bind time and marshal arguments natively.
+// Delegate bodies re-resolve their target through globalThis on each call so a
+// JS-side reinstall of a host object cannot leave a stale closure behind.
 
 using System;
 using System.IO;
@@ -36,6 +43,17 @@ namespace Pie
         private bool _isRuntimeHostBridgeReady = false;
         private bool _isRuntimeBridgeReady = false;
         private bool _isTypeScriptCompilerReady = false;
+
+        // Cached JS delegates (bound once per env lifetime; see file header).
+        private Action<string, string> _jsHandleCSharpMessage;
+        private Func<string, string, string> _jsScriptHostInvoke;
+        private Action _jsScriptHostTick;
+        private Func<string, string, string> _jsRuntimeHostInvoke;
+        private Func<string, string> _jsTypeScriptCompile;
+        private Action<int, string> _jsSSEPush;
+        private Action<int, int, string> _jsSSEStatus;
+        private Action<int, string> _jsSSETerminal;
+        private Action<int, string, string> _jsFileComplete;
 
         /// <summary>Fired when JS calls pieBridge.sendToUnity(event, jsonData).</summary>
         public event Action<string, string> OnJsEvent;
@@ -112,8 +130,13 @@ namespace Pie
                     PieDiagnostics.Error("[PieBridge.SendToJs] BRIDGE_INVALID_JSON: payload is not valid JSON");
                     return false;
                 }
+                if (_jsHandleCSharpMessage == null)
+                {
+                    PieDiagnostics.Error("[PieBridge.SendToJs] handleCSharpMessage delegate is not bound");
+                    return false;
+                }
 
-                _jsEnv.Eval($"pie.handleCSharpMessage({JsonString(action ?? "")}, {normalizedJson});");
+                _jsHandleCSharpMessage(action ?? "", normalizedJson);
                 return true;
             }
             catch (Exception ex)
@@ -135,8 +158,9 @@ namespace Pie
                 throw new InvalidOperationException("PieBridge is not initialized.");
 
             RefreshUnityScriptHostReady();
-            var script = $"(function(){{var host=globalThis.__pieUnityScriptHost;if(!host||typeof host.invoke!=='function') throw new Error('Unity script host is not ready.'); return host.invoke({JsonString(method ?? "")},{JsonString(argsJson ?? "{}")});}})()";
-            return _jsEnv.Eval<string>(script);
+            if (!_isUnityScriptHostReady || _jsScriptHostInvoke == null)
+                throw new InvalidOperationException("Unity script host is not ready.");
+            return _jsScriptHostInvoke(method ?? "", argsJson ?? "{}");
         }
 
         public string InvokeRuntimeHostCapability(string capabilityName, string argsJson)
@@ -145,8 +169,9 @@ namespace Pie
                 throw new InvalidOperationException("PieBridge is not initialized.");
 
             RefreshRuntimeHostBridgeReady();
-            var script = $"(function(){{var host=globalThis.__pieRuntimeHostBridge;if(!host||typeof host.invokeCapability!=='function') throw new Error('Runtime host bridge is not ready.'); return host.invokeCapability({JsonString(capabilityName ?? "")},{JsonString(argsJson ?? "{}")});}})()";
-            return _jsEnv.Eval<string>(script);
+            if (!_isRuntimeHostBridgeReady || _jsRuntimeHostInvoke == null)
+                throw new InvalidOperationException("Runtime host bridge is not ready.");
+            return _jsRuntimeHostInvoke(capabilityName ?? "", argsJson ?? "{}");
         }
 
         public string InvokeTypeScriptCompiler(string requestJson)
@@ -155,8 +180,9 @@ namespace Pie
                 throw new InvalidOperationException("PieBridge is not initialized.");
 
             EnsureTypeScriptCompilerLoaded();
-            var script = $"(function(){{var compiler=globalThis.__pieTypeScriptCompiler;if(!compiler||typeof compiler.compileJson!=='function') throw new Error('Runtime TypeScript compiler is not ready.'); return compiler.compileJson({JsonString(requestJson ?? "{}")});}})()";
-            return _jsEnv.Eval<string>(script);
+            if (_jsTypeScriptCompile == null)
+                throw new Exception("Runtime TypeScript compiler delegate is not bound.");
+            return _jsTypeScriptCompile(requestJson ?? "{}");
         }
 
         public void Dispose()
@@ -193,7 +219,7 @@ namespace Pie
                 PieHttpBridge.PumpActiveRequests();
                 PushSSEData();
                 PushFileData();
-                _jsEnv.Eval("(function(){var host=globalThis.__pieUnityScriptHost;if(host&&typeof host.tick==='function') host.tick();})()");
+                _jsScriptHostTick?.Invoke();
                 RefreshUnityScriptHostReady();
                 RefreshRuntimeHostBridgeReady();
                 RefreshRuntimeBridgeReady();
@@ -223,11 +249,43 @@ namespace Pie
             if (!VerifyPieObject())
                 throw new Exception("pie.handleCSharpMessage not found after bundled Pie runtime execution");
 
+            BindCoreDelegates();
+
             RefreshUnityScriptHostReady();
             RefreshRuntimeHostBridgeReady();
             RefreshRuntimeBridgeReady();
             if (!_isUnityScriptHostReady)
                 throw new Exception("Unity script host was not installed by the bundled Pie runtime.");
+        }
+
+        /// <summary>
+        /// Cache JS entry points as delegates so hot paths neither re-parse an
+        /// Eval string per call nor need string escaping for arguments. The
+        /// delegate bodies re-resolve through globalThis on every invocation,
+        /// which keeps them correct if JS reinstalls one of the host objects.
+        /// The script host is part of the boot contract (CreateJsEnvironment
+        /// throws when it is missing), so failing to bind it is fatal here.
+        /// </summary>
+        private void BindCoreDelegates()
+        {
+            // The historical channel delivered action+payload as an embedded JS
+            // literal (parsed object). Keep that contract: the shim parses the
+            // JSON string before invoking the handler, so the TS side is
+            // untouched. Malformed JSON now surfaces as a JS exception from the
+            // shim instead of breaking generated Eval source.
+            _jsHandleCSharpMessage = _jsEnv.Eval<Action<string, string>>(
+                "(function(){var p=globalThis.pie;if(!p||typeof p.handleCSharpMessage!=='function')return null;" +
+                "return function(action,json){globalThis.pie.handleCSharpMessage(action,JSON.parse(json));};})()");
+            if (_jsHandleCSharpMessage == null)
+                throw new Exception("Failed to bind pie.handleCSharpMessage delegate.");
+
+            _jsScriptHostInvoke = _jsEnv.Eval<Func<string, string, string>>(
+                "(function(){var h=globalThis.__pieUnityScriptHost;return h&&typeof h.invoke==='function'" +
+                "?function(m,a){return globalThis.__pieUnityScriptHost.invoke(m,a);}:null;})()");
+            _jsScriptHostTick = _jsEnv.Eval<Action>(
+                "(function(){var h=globalThis.__pieUnityScriptHost;return h&&typeof h.tick==='function'" +
+                "?function(){globalThis.__pieUnityScriptHost.tick();}:null;})()");
+            _isUnityScriptHostReady = _jsScriptHostInvoke != null && _jsScriptHostTick != null;
         }
 
         private void DestroyJsEnvironment()
@@ -241,6 +299,15 @@ namespace Pie
                 PieDiagnostics.Warning($"[PieBridge] JsEnv dispose failed: {ex.Message}");
             }
             _jsEnv = null;
+            _jsHandleCSharpMessage = null;
+            _jsScriptHostInvoke = null;
+            _jsScriptHostTick = null;
+            _jsRuntimeHostInvoke = null;
+            _jsTypeScriptCompile = null;
+            _jsSSEPush = null;
+            _jsSSEStatus = null;
+            _jsSSETerminal = null;
+            _jsFileComplete = null;
             _isUnityScriptHostReady = false;
             _isRuntimeHostBridgeReady = false;
             _isRuntimeBridgeReady = false;
@@ -416,20 +483,23 @@ namespace Pie
                 return;
 
             var alreadyLoaded = _jsEnv.Eval<bool>("(function(){return !!(globalThis.__pieTypeScriptCompiler&&typeof globalThis.__pieTypeScriptCompiler.compileJson==='function');})()");
-            if (alreadyLoaded)
+            if (!alreadyLoaded)
             {
-                _isTypeScriptCompilerReady = true;
-                return;
+                var compilerJs = LoadResourceText("pie/typescript-compiler");
+                if (string.IsNullOrEmpty(compilerJs))
+                    throw new Exception("Failed to load bundled TypeScript compiler from Resources/pie/typescript-compiler.bytes.");
+
+                _jsEnv.Eval(compilerJs);
+                alreadyLoaded = _jsEnv.Eval<bool>("(function(){return !!(globalThis.__pieTypeScriptCompiler&&typeof globalThis.__pieTypeScriptCompiler.compileJson==='function');})()");
+                if (!alreadyLoaded)
+                    throw new Exception("Runtime TypeScript compiler did not register globalThis.__pieTypeScriptCompiler.");
             }
 
-            var compilerJs = LoadResourceText("pie/typescript-compiler");
-            if (string.IsNullOrEmpty(compilerJs))
-                throw new Exception("Failed to load bundled TypeScript compiler from Resources/pie/typescript-compiler.bytes.");
-
-            _jsEnv.Eval(compilerJs);
-            alreadyLoaded = _jsEnv.Eval<bool>("(function(){return !!(globalThis.__pieTypeScriptCompiler&&typeof globalThis.__pieTypeScriptCompiler.compileJson==='function');})()");
-            if (!alreadyLoaded)
-                throw new Exception("Runtime TypeScript compiler did not register globalThis.__pieTypeScriptCompiler.");
+            _jsTypeScriptCompile = _jsEnv.Eval<Func<string, string>>(
+                "(function(){var c=globalThis.__pieTypeScriptCompiler;return c&&typeof c.compileJson==='function'" +
+                "?function(j){return globalThis.__pieTypeScriptCompiler.compileJson(j);}:null;})()");
+            if (_jsTypeScriptCompile == null)
+                throw new Exception("Failed to bind TypeScript compiler delegate.");
 
             _isTypeScriptCompilerReady = true;
         }
@@ -644,6 +714,11 @@ namespace Pie
                 _isUnityScriptHostReady = false;
                 return;
             }
+            // Bound delegates do not regress within one env lifetime: nothing in
+            // the bundle uninstalls the script host, and DestroyJsEnvironment
+            // resets the flag. Skip the per-frame Eval probe once ready.
+            if (_isUnityScriptHostReady)
+                return;
 
             try
             {
@@ -664,15 +739,25 @@ namespace Pie
                 _isRuntimeHostBridgeReady = false;
                 return;
             }
+            if (_isRuntimeHostBridgeReady && _jsRuntimeHostInvoke != null)
+                return;
 
             try
             {
                 _isRuntimeHostBridgeReady = _jsEnv.Eval<bool>(
                     "!!(globalThis.__pieRuntimeHostBridge && typeof globalThis.__pieRuntimeHostBridge.invokeCapability === 'function' && typeof globalThis.__pieRuntimeHostBridge.hasRegisteredHostBridge === 'function' && globalThis.__pieRuntimeHostBridge.hasRegisteredHostBridge())");
+                if (_isRuntimeHostBridgeReady)
+                {
+                    _jsRuntimeHostInvoke = _jsEnv.Eval<Func<string, string, string>>(
+                        "(function(){var b=globalThis.__pieRuntimeHostBridge;return b&&typeof b.invokeCapability==='function'" +
+                        "?function(n,a){return globalThis.__pieRuntimeHostBridge.invokeCapability(n,a);}:null;})()");
+                    _isRuntimeHostBridgeReady = _jsRuntimeHostInvoke != null;
+                }
             }
             catch (Exception ex)
             {
                 _isRuntimeHostBridgeReady = false;
+                _jsRuntimeHostInvoke = null;
                 PieDiagnostics.Warning($"[PieBridge] Failed to probe runtime host bridge readiness: {ex.Message}");
             }
         }
@@ -684,6 +769,10 @@ namespace Pie
                 _isRuntimeBridgeReady = false;
                 return;
             }
+            // Readiness flag only (no C# caller delegates); bound state does not
+            // regress within one env lifetime, so stop probing once ready.
+            if (_isRuntimeBridgeReady)
+                return;
 
             try
             {
@@ -699,10 +788,60 @@ namespace Pie
 
         private const int MAX_LINES_PER_FRAME = 3;
 
+        /// <summary>
+        /// SSE/file push handlers are installed by the JS HTTP/file client, which
+        /// can happen after env boot. Bind lazily: a C#-side request can only
+        /// originate from that same JS client, so by the time anything is queued
+        /// the handlers exist and stay bound for the rest of the env lifetime.
+        /// </summary>
+        private void EnsureSseDelegatesBound()
+        {
+            if (_jsSSEPush != null && _jsSSEStatus != null)
+                return;
+
+            try
+            {
+                _jsSSEPush = _jsEnv.Eval<Action<int, string>>(
+                    "(function(){return typeof globalThis._pieSSEPush==='function'" +
+                    "?function(id,line){globalThis._pieSSEPush(id,line);}:null;})()");
+                _jsSSEStatus = _jsEnv.Eval<Action<int, int, string>>(
+                    "(function(){return typeof globalThis._pieSSEStatus==='function'" +
+                    "?function(id,st,err){globalThis._pieSSEStatus(id,st,err);}:null;})()");
+                _jsSSETerminal = _jsEnv.Eval<Action<int, string>>(
+                    "(function(){return typeof globalThis._pieSSETerminal==='function'" +
+                    "?function(id,err){globalThis._pieSSETerminal(id,err);}:null;})()");
+            }
+            catch (Exception ex)
+            {
+                PieDiagnostics.Warning($"[PieBridge] SSE delegate binding failed: {ex.Message}");
+            }
+        }
+
+        private void EnsureFileDelegateBound()
+        {
+            if (_jsFileComplete != null)
+                return;
+
+            try
+            {
+                _jsFileComplete = _jsEnv.Eval<Action<int, string, string>>(
+                    "(function(){return typeof globalThis._pieFileComplete==='function'" +
+                    "?function(id,res,err){globalThis._pieFileComplete(id,res,err);}:null;})()");
+            }
+            catch (Exception ex)
+            {
+                PieDiagnostics.Warning($"[PieBridge] File delegate binding failed: {ex.Message}");
+            }
+        }
+
         private void PushSSEData()
         {
             foreach (var reqId in PieHttpBridge.GetActiveRequestIds())
             {
+                EnsureSseDelegatesBound();
+                if (_jsSSEPush == null || _jsSSEStatus == null)
+                    return; // Nothing marked pushed; delivery resumes once JS installs the handlers.
+
                 var status = PieHttpBridge.GetStatus(reqId);
                 if (status != -1 && !PieHttpBridge.IsStatusPushed(reqId))
                 {
@@ -714,8 +853,7 @@ namespace Pie
                     var error = status >= 200 && status < 300
                         ? null
                         : PieHttpBridge.GetError(reqId);
-                    var errorArg = error != null ? JsonString(error) : "null";
-                    _jsEnv.Eval($"globalThis._pieSSEStatus({reqId},{status},{errorArg})");
+                    _jsSSEStatus(reqId, status, error);
                     return;
                 }
 
@@ -728,17 +866,16 @@ namespace Pie
                     if (line == null)
                         break;
 
-                    _jsEnv.Eval($"globalThis._pieSSEPush({reqId},{JsonString(line)})");
+                    _jsSSEPush(reqId, line);
                     pushed++;
                 }
 
                 if (PieHttpBridge.TryGetTerminal(reqId, out var terminalError))
                 {
-                    var errorArg = terminalError != null ? JsonString(terminalError) : "null";
-                    _jsEnv.Eval(
-                        $"typeof globalThis._pieSSETerminal === 'function' " +
-                        $"? globalThis._pieSSETerminal({reqId},{errorArg}) " +
-                        $": globalThis._pieSSEPush({reqId},null)");
+                    if (_jsSSETerminal != null)
+                        _jsSSETerminal(reqId, terminalError);
+                    else
+                        _jsSSEPush(reqId, null);
                     PieHttpBridge.MarkTerminalPushed(reqId);
                 }
             }
@@ -748,15 +885,17 @@ namespace Pie
         {
             foreach (var reqId in PieFileBridge.GetActiveRequestIds())
             {
+                EnsureFileDelegateBound();
+                if (_jsFileComplete == null)
+                    return; // Nothing marked pushed; delivery resumes once JS installs the handler.
+
                 if (!PieFileBridge.IsRequestComplete(reqId) || PieFileBridge.IsResultPushed(reqId))
                     continue;
 
                 PieFileBridge.MarkResultPushed(reqId);
                 var error = PieFileBridge.GetRequestError(reqId);
                 var resultJson = PieFileBridge.GetRequestResultJson(reqId);
-                var errorArg = error != null ? JsonString(error) : "null";
-                var resultArg = resultJson != null ? JsonString(resultJson) : "null";
-                _jsEnv.Eval($"globalThis._pieFileComplete({reqId},{resultArg},{errorArg})");
+                _jsFileComplete(reqId, resultJson, error);
             }
         }
 
@@ -777,22 +916,17 @@ namespace Pie
                 + "\"";
         }
 
+        /// <summary>
+        /// Cheap syntactic gate only. Deep JSON validity is enforced by the JS
+        /// shim's JSON.parse: delegate calls marshal the payload as a plain
+        /// string argument, so malformed JSON can no longer corrupt generated
+        /// Eval source — the reason the old code paid an extra JS roundtrip per
+        /// message to pre-validate.
+        /// </summary>
         private string NormalizeMessageJson(string value)
         {
             var trimmed = string.IsNullOrWhiteSpace(value) ? "{}" : value.Trim();
-            if (!LooksLikeJsonValue(trimmed))
-                return null;
-
-            try
-            {
-                var isValid = _jsEnv.Eval<bool>(
-                    $"(function(){{try{{JSON.parse({JsonString(trimmed)});return true;}}catch(e){{return false;}}}})()");
-                return isValid ? trimmed : null;
-            }
-            catch
-            {
-                return null;
-            }
+            return LooksLikeJsonValue(trimmed) ? trimmed : null;
         }
 
         private static bool LooksLikeJsonValue(string value)

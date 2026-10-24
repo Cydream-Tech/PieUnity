@@ -1,15 +1,18 @@
 using System;
-using System.Net.Http;
-using System.Net.Http.Headers;
+using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using UnityEngine.Networking;
 
 namespace Pie
 {
     internal static class PieVoiceHttpClient
     {
-        private static readonly HttpClient HttpClient = CreateHttpClient();
-
+        // Uploads go through PieSafeHttpClient (UnityWebRequest on the main
+        // thread): HttpClient + multipart hangs indefinitely in IL2CPP player
+        // builds (dogfood 3.0: voice uploads never completed and the 120s
+        // CancelAfter never fired, while the same flow works in the editor).
+        // UnityWebRequest is the supported stack on every player platform.
         internal static async Task<string> TranscribeAsync(
             PieVoiceOptions options,
             byte[] audioBytes,
@@ -23,45 +26,52 @@ namespace Pie
                 throw new ArgumentException("Audio payload is empty.", nameof(audioBytes));
 
             var url = BuildTranscribeUrl(options.ApiBaseUrl);
-            using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
-            using (var request = new HttpRequestMessage(HttpMethod.Post, url))
-            using (var form = new MultipartFormDataContent())
+            var sections = new List<IMultipartFormSection>
             {
-                timeout.CancelAfter(TimeSpan.FromSeconds(Math.Max(1, options.TimeoutSeconds)));
+                new MultipartFormFileSection("file", audioBytes,
+                    string.IsNullOrWhiteSpace(sourceName) ? "recording.wav" : sourceName,
+                    string.IsNullOrWhiteSpace(mimeType) ? "audio/wav" : mimeType),
+            };
+            AddSection(sections, "mode", ToApiValue(options.Mode));
+            AddSection(sections, "context_hint", ToApiValue(options.ContextHint));
+            AddSection(sections, "tone", ToApiValue(options.Tone));
+            AddOptionalSection(sections, "language", options.Language, false);
+            AddOptionalSection(sections, "target_language", options.TargetLanguage, true);
+            AddOptionalSection(sections, "preserve_terms", options.PreserveTerms, false);
+            AddOptionalSection(sections, "asr_model", options.AsrModel, false);
+            AddOptionalSection(sections, "llm_model", options.LlmModel, false);
+            var headers = new Dictionary<string, string>
+            {
+                ["Authorization"] = "Bearer " + NormalizeBearerToken(options.VirtualKey),
+                ["Accept"] = "application/json",
+            };
+            var timeoutSeconds = Math.Max(1, options.TimeoutSeconds);
 
-                var token = NormalizeBearerToken(options.VirtualKey);
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                request.Headers.TryAddWithoutValidation("Accept", "application/json");
-
-                var fileContent = new ByteArrayContent(audioBytes);
-                fileContent.Headers.ContentType = new MediaTypeHeaderValue(
-                    string.IsNullOrWhiteSpace(mimeType) ? "audio/wav" : mimeType);
-                form.Add(fileContent, "file", string.IsNullOrWhiteSpace(sourceName) ? "recording.wav" : sourceName);
-
-                AddField(form, "mode", ToApiValue(options.Mode));
-                AddField(form, "context_hint", ToApiValue(options.ContextHint));
-                AddField(form, "tone", ToApiValue(options.Tone));
-                AddOptionalField(form, "language", options.Language, false);
-                AddOptionalField(form, "target_language", options.TargetLanguage, true);
-                AddOptionalField(form, "preserve_terms", options.PreserveTerms, false);
-                AddOptionalField(form, "asr_model", options.AsrModel, false);
-                AddOptionalField(form, "llm_model", options.LlmModel, false);
-
-                request.Content = form;
-
-                using (var response = await HttpClient.SendAsync(
-                    request,
-                    HttpCompletionOption.ResponseContentRead,
-                    timeout.Token))
-                {
-                    var body = response.Content != null
-                        ? await response.Content.ReadAsStringAsync()
-                        : "";
-                    if (!response.IsSuccessStatusCode)
-                        throw new PieVoiceHttpException((int)response.StatusCode, body);
-                    return body;
-                }
+            try
+            {
+                return await PieSafeHttpClient
+                    .UploadMultipartAsync(url, sections, headers, timeoutSeconds, cancellationToken)
+                    .ConfigureAwait(false);
             }
+            catch (PieHttpException httpError)
+            {
+                throw new PieVoiceHttpException(httpError.StatusCode, httpError.ResponseBody);
+            }
+        }
+
+        private static void AddSection(List<IMultipartFormSection> sections, string name, string value)
+        {
+            sections.Add(new MultipartFormDataSection(name, value ?? ""));
+        }
+
+        private static void AddOptionalSection(List<IMultipartFormSection> sections, string name, string value, bool skipNone)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return;
+            var normalized = value.Trim();
+            if (skipNone && string.Equals(normalized, "none", StringComparison.OrdinalIgnoreCase))
+                return;
+            sections.Add(new MultipartFormDataSection(name, normalized));
         }
 
         internal static string ToApiValue(PieVoiceMode mode)
@@ -115,16 +125,6 @@ namespace Pie
             }
         }
 
-        private static HttpClient CreateHttpClient()
-        {
-            var client = new HttpClient
-            {
-                Timeout = TimeSpan.FromSeconds(180),
-            };
-            client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-            return client;
-        }
-
         private static string BuildTranscribeUrl(string apiBaseUrl)
         {
             var baseUrl = string.IsNullOrWhiteSpace(apiBaseUrl)
@@ -141,22 +141,6 @@ namespace Pie
             return token;
         }
 
-        private static void AddField(MultipartFormDataContent form, string name, string value)
-        {
-            form.Add(new StringContent(value ?? ""), name);
-        }
-
-        private static void AddOptionalField(MultipartFormDataContent form, string name, string value, bool skipNone)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-                return;
-
-            var normalized = value.Trim();
-            if (skipNone && string.Equals(normalized, "none", StringComparison.OrdinalIgnoreCase))
-                return;
-
-            form.Add(new StringContent(normalized), name);
-        }
     }
 
     internal sealed class PieVoiceHttpException : Exception

@@ -6,4 +6,56 @@
     PieProjectPaths.GetSessionsDirectory and PieBridge.ReceiveFromJs.
   -->
   <assembly fullname="Pie.Runtime" preserve="all" />
+
+  <!--
+    The runtime bundle's file bridge (packages/platform puerts-fs) drives
+    System.IO / System.Text / System.Convert / System.Environment through the
+    same invisible CS.* reflection path: session storage, file tools, and
+    image reads all fail in an IL2CPP Player without these preserves
+    (observed live: "CS.System.IO.File.Copy is not a function").
+  -->
+  <assembly fullname="mscorlib">
+    <type fullname="System.IO.*" preserve="all" />
+    <type fullname="System.Text.*" preserve="all" />
+    <type fullname="System.Convert" preserve="all" />
+    <type fullname="System.Environment" preserve="all" />
+    <type fullname="System.Environment/SpecialFolder" preserve="all" />
+  </assembly>
+  <assembly fullname="netstandard">
+    <type fullname="System.IO.*" preserve="all" />
+    <type fullname="System.Text.*" preserve="all" />
+    <type fullname="System.Convert" preserve="all" />
+    <type fullname="System.Environment" preserve="all" />
+  </assembly>
+
+  <!--
+    PuerTS-hosted game/mod JavaScript calls UnityEngine math and helper APIs
+    through CS.* reflection: operator methods (Vector3.op_Subtraction),
+    overloads (Quaternion.LookRotation), statics (Mathf, ColorUtility,
+    Random, Time). Host C# rarely references every overload, so IL2CPP
+    strips the rest and the JS fails at call time (observed live in the
+    PieArcade IL2CPP Player: every Quaternion.LookRotation overload
+    missing). This preservation keeps those explicit calls available; it is
+    separate from the PuerTS semantic that JavaScript operators never bind
+    to C# operators — `vectorA - vectorB` is plain JS coercion and silently
+    yields NaN no matter what is preserved (observed live: a frozen
+    camera). Preserve the value-type math surface embedded JS is expected
+    to reach, and extend your own link.xml with the same pattern when your
+    JS reflects over further engine APIs.
+  -->
+  <assembly fullname="UnityEngine.CoreModule">
+    <type fullname="UnityEngine.Vector2" preserve="all" />
+    <type fullname="UnityEngine.Vector3" preserve="all" />
+    <type fullname="UnityEngine.Vector4" preserve="all" />
+    <type fullname="UnityEngine.Quaternion" preserve="all" />
+    <type fullname="UnityEngine.Matrix4x4" preserve="all" />
+    <type fullname="UnityEngine.Mathf" preserve="all" />
+    <type fullname="UnityEngine.Color" preserve="all" />
+    <type fullname="UnityEngine.Color32" preserve="all" />
+    <type fullname="UnityEngine.ColorUtility" preserve="all" />
+    <type fullname="UnityEngine.Rect" preserve="all" />
+    <type fullname="UnityEngine.Bounds" preserve="all" />
+    <type fullname="UnityEngine.Random" preserve="all" />
+    <type fullname="UnityEngine.Time" preserve="all" />
+  </assembly>
 </linker>

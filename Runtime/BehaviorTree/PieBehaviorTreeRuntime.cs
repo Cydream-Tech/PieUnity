@@ -663,7 +663,9 @@ namespace Pie
                     node = new NPAction(() => false);
                     break;
                 default:
-                    throw new InvalidOperationException("Unsupported behavior tree node type: " + type);
+                    throw new InvalidOperationException(
+                        "Unsupported behavior tree node type: " + type +
+                        ". Valid types: selector, sequence, parallel, repeat, condition, wait, action, succeed, fail.");
             }
 
             var label = FirstNonEmpty(spec.id, spec.name, spec.action, type);
@@ -1002,7 +1004,10 @@ namespace Pie
                 case "true":
                     return NPBehave.Operator.ALWAYS_TRUE;
                 default:
-                    throw new InvalidOperationException("Unsupported behavior tree condition op: " + op);
+                    throw new InvalidOperationException(
+                        "Unsupported behavior tree condition op: " + op +
+                        ". Valid ops: is_set, is_not_set, is_equal (==), is_not_equal (!=), " +
+                        "is_greater_or_equal (>=), is_greater (>), is_smaller_or_equal (<=), is_smaller (<), always_true.");
             }
         }
 
@@ -1026,7 +1031,9 @@ namespace Pie
                 case "lower_priority_immediate_restart":
                     return NPBehave.Stops.LOWER_PRIORITY_IMMEDIATE_RESTART;
                 default:
-                    throw new InvalidOperationException("Unsupported behavior tree stopsOnChange: " + stops);
+                    throw new InvalidOperationException(
+                        "Unsupported behavior tree stopsOnChange: " + stops +
+                        ". Valid values: none, self, lower_priority, both, immediate_restart, lower_priority_immediate_restart.");
             }
         }
 
@@ -1051,7 +1058,8 @@ namespace Pie
                 return NPBehave.Parallel.Policy.ONE;
             if (policy == "all")
                 return NPBehave.Parallel.Policy.ALL;
-            throw new InvalidOperationException("Unsupported behavior tree parallel policy: " + policy);
+            throw new InvalidOperationException(
+                "Unsupported behavior tree parallel policy: " + policy + ". Valid values: one, all.");
         }
 
         private static PieBehaviorTreeStatus BuildStatus(BehaviorTreeInstance instance)

@@ -11,8 +11,17 @@ namespace Pie
     public class PieRunner : MonoBehaviour
     {
         public static PieRunner ActiveRunner { get; private set; }
+
+        /// <summary>Raw JSON of the most recent skills_list event from the JS
+        /// runtime (empty until the first scan completes). The player smoke
+        /// uses it to prove the JS runtime scanned the skill filesystem
+        /// layers through puerts-fs in THIS player.</summary>
+        internal string LastSkillsListJson { get; private set; } = "";
         private PieBridge _bridge;
+        // RPC retains the latest visible answer; delta comparison is per response.
         private string _lastAssistantText = "";
+        private string _assistantDeltaText = "";
+        private long _runtimeRpcEventVersion;
         private readonly List<DevRpcMessagePayload> _devRpcMessages = new List<DevRpcMessagePayload>();
         private string _runtimeStatusText = "Idle";
         private bool _runtimeIsStreaming;
@@ -90,6 +99,18 @@ namespace Pie
         public event Action<string> OnError;
         public event Action<PieTimelineItem> OnTimelineItemChanged;
         public event Action<PieSessionSnapshot> OnSessionChanged;
+        public event Action<PieSessionBindingResult> OnSessionBindingResult;
+
+        [Serializable]
+        public sealed class PieSessionBindingResult
+        {
+            public string requestId;
+            public string operation;
+            public string requestedSessionId;
+            public string sessionId;
+            public bool ok;
+            public string code;
+        }
         public event Action<PieAgentStatus> OnStatusChanged;
         public event Action<PieTurnResult> OnTurnFinished;
         public event Action<PieRuntimeError> OnRuntimeError;
@@ -344,29 +365,63 @@ namespace Pie
                 ? request.content
                 : request.displayContent;
             request.clientTurnId = request.clientTurnId ?? "";
+            var json = JsonUtility.ToJson(request);
+            var bridge = _bridge;
+            var eventVersion = _runtimeRpcEventVersion;
+            var previousRows = _devRpcMessages.ToArray(); // bounded to 200; also undo trimming on rejection
+            var previousText = _lastAssistantText;
+            var previousDelta = _assistantDeltaText;
+            var previousStatus = _runtimeStatusText;
+            var wasStreaming = _runtimeIsStreaming;
+            // A queued/steering submission does not start a new assistant response.
+            if (!_runtimeIsStreaming)
+            {
+                _lastAssistantText = "";
+                _assistantDeltaText = "";
+            }
             AddDevRpcMessage("user", "", request.displayContent, "", false, false);
             _runtimeStatusText = "Sending message";
             _runtimeIsStreaming = true;
-            return _bridge.SendToJs("send_message", JsonUtility.ToJson(request));
+            var dispatched = bridge.SendToJs("send_message", json);
+            // SendToJs may synchronously emit a response/error. Never roll back
+            // an observed outcome (or a replacement bridge) with the old snapshot.
+            if (!dispatched && _runtimeRpcEventVersion == eventVersion && ReferenceEquals(_bridge, bridge))
+            {
+                _devRpcMessages.Clear();
+                _devRpcMessages.AddRange(previousRows);
+                _lastAssistantText = previousText;
+                _assistantDeltaText = previousDelta;
+                _runtimeStatusText = previousStatus;
+                _runtimeIsStreaming = wasStreaming;
+            }
+            return dispatched;
         }
 
         public bool ResumeSession(string sessionId, bool recoverInterrupted = false)
+            => ResumeSession(sessionId, recoverInterrupted, null);
+
+        /// <summary>True means dispatch only. Await OnSessionBindingResult for requestId.</summary>
+        public bool ResumeSession(string sessionId, bool recoverInterrupted, string requestId)
         {
             if (_bridge?.IsInitialized != true || string.IsNullOrWhiteSpace(sessionId)) return false;
             var payload = new ResumeSessionPayload
             {
                 sessionId = sessionId.Trim(),
                 recoverInterrupted = recoverInterrupted,
+                requestId = requestId,
             };
             _runtimeStatusText = "Loading session";
             return _bridge.SendToJs("resume_session", JsonUtility.ToJson(payload));
         }
 
-        public bool NewSession()
+        public bool NewSession() => NewSession(null);
+
+        /// <summary>True means dispatch only. Await OnSessionBindingResult for requestId.</summary>
+        public bool NewSession(string requestId)
         {
             if (_bridge?.IsInitialized != true) return false;
             AddDevRpcMessage("system", "", "/new", "Create new session", false, false);
-            return _bridge.SendToJs("new_session", "{}");
+            return _bridge.SendToJs("new_session", JsonUtility.ToJson(new ResumeSessionPayload { requestId = requestId }));
         }
 
         public bool ReloadExtensions()
@@ -833,12 +888,16 @@ namespace Pie
                 _bridge = null;
             }
 
-            _lastAssistantText = "";
+            ResetRuntimeRpcHistory();
+            ActiveSessionId = "";
+            CurrentSession = null;
+            CurrentStatus = new PieAgentStatus();
             return InitializeBridge();
         }
 
         private void HandleJsEvent(string eventName, string json)
         {
+            _runtimeRpcEventVersion++;
             switch (eventName)
             {
                 case "message_update":
@@ -848,10 +907,14 @@ namespace Pie
                     var text = ExtractJsonString(json, "text");
                     if (text != null)
                     {
+                        var previousText = _assistantDeltaText;
+                        _lastAssistantText = text;
+                        _assistantDeltaText = text;
+                        UpsertLatestAssistantMessage(text);
                         OnAssistantMessage?.Invoke(text);
-                        if (text.StartsWith(_lastAssistantText, StringComparison.Ordinal))
+                        if (text.StartsWith(previousText, StringComparison.Ordinal))
                         {
-                            var delta = text.Substring(_lastAssistantText.Length);
+                            var delta = text.Substring(previousText.Length);
                             if (!string.IsNullOrEmpty(delta))
                                 OnAssistantDelta?.Invoke(delta);
                         }
@@ -859,14 +922,15 @@ namespace Pie
                         {
                             OnAssistantDelta?.Invoke(text);
                         }
-                        _lastAssistantText = text;
-                        UpsertLatestAssistantMessage(text);
                     }
                     break;
                 }
                 case "tool_start":
                 {
                     var name = ExtractJsonString(json, "name") ?? "tool";
+                    CompleteRunningRpcMessages(false, false);
+                    _assistantDeltaText = "";
+                    _runtimeIsStreaming = true;
                     _runtimeStatusText = "Using " + name;
                     AddDevRpcMessage("tool", name, "", "", true, false);
                     OnToolStart?.Invoke(name);
@@ -884,19 +948,21 @@ namespace Pie
                 case "turn_end":
                 {
                     var stopReason = ExtractJsonString(json, "stopReason") ?? "";
+                    CompleteRunningRpcMessages(stopReason == "error");
+                    _assistantDeltaText = "";
+                    _runtimeIsStreaming = stopReason == "toolUse";
+                    _runtimeStatusText = _runtimeIsStreaming ? "Using tool" : stopReason == "error" ? "Error" : "Idle";
                     OnTurnEndDetailed?.Invoke(stopReason);
-                    _runtimeIsStreaming = false;
-                    _runtimeStatusText = stopReason == "toolUse" ? "Using tool" : "Idle";
-                    if (stopReason == "toolUse")
-                        break;
-
-                    _lastAssistantText = "";
-                    OnTurnEnd?.Invoke();
+                    if (stopReason != "toolUse") OnTurnEnd?.Invoke();
                     break;
                 }
                 case "state_event":
                 {
-                    var detail = ExtractJsonString(json, "detail") ?? ExtractJsonString(json, "name") ?? "";
+                    var name = ExtractJsonString(json, "name") ?? "";
+                    var detail = ExtractJsonString(json, "detail") ?? name;
+                    if (name == "message_start" && detail == "role=assistant")
+                        _assistantDeltaText = "";
+                    if (name == "agent_start" || name == "turn_start") _runtimeIsStreaming = true;
                     if (!string.IsNullOrWhiteSpace(detail))
                         _runtimeStatusText = detail;
                     break;
@@ -913,6 +979,11 @@ namespace Pie
                         foreach (var entry in payload.skills)
                             names.Add(entry == null ? "" : entry.name);
                     PieDiagnostics.Info($"[PieRunner] skills available ({names.Count}): {string.Join(", ", names)}");
+                    // Cache the raw list: the JS runtime produced it by
+                    // scanning the skill layers through puerts-fs, which makes
+                    // it the observable end of the player smoke's JS file
+                    // bridge proof (see PiePlayerSmoke).
+                    LastSkillsListJson = json ?? "";
                     break;
                 }
                 case "timeline_item":
@@ -925,6 +996,9 @@ namespace Pie
                     }
                     break;
                 }
+                case "session_binding_result":
+                    OnSessionBindingResult?.Invoke(JsonUtility.FromJson<PieSessionBindingResult>(json ?? "{}"));
+                    break;
                 case "session_sync":
                 {
                     var snapshot = JsonUtility.FromJson<PieSessionSnapshot>(json ?? "{}");
@@ -934,6 +1008,9 @@ namespace Pie
                             snapshot.messages = Array.Empty<PieSessionMessage>();
                         if (snapshot.timelineItems == null)
                             snapshot.timelineItems = Array.Empty<PieTimelineItem>();
+                        if (!string.IsNullOrEmpty(ActiveSessionId)
+                            && !string.Equals(ActiveSessionId, snapshot.id ?? "", StringComparison.Ordinal))
+                            ResetRuntimeRpcHistory();
                         CurrentSession = snapshot;
                         ActiveSessionId = snapshot.id ?? "";
                         OnSessionChanged?.Invoke(snapshot);
@@ -949,6 +1026,11 @@ namespace Pie
                         _runtimeIsStreaming = string.Equals(status.phase, "responding", StringComparison.Ordinal)
                             || string.Equals(status.phase, "running_tool", StringComparison.Ordinal)
                             || string.Equals(status.turnState, "continuing", StringComparison.Ordinal);
+                        if (!_runtimeIsStreaming)
+                        {
+                            CompleteRunningRpcMessages(status.turnState == "failed" && status.lastStopReason != "aborted");
+                            _assistantDeltaText = "";
+                        }
                         _runtimeStatusText = !string.IsNullOrEmpty(status.activeToolName)
                             ? "Using " + status.activeToolName
                             : status.phase ?? "";
@@ -961,7 +1043,11 @@ namespace Pie
                     var error = JsonUtility.FromJson<PieRuntimeError>(json ?? "{}");
                     if (error != null)
                     {
+                        if (!string.IsNullOrEmpty(error.sessionId) && !string.IsNullOrEmpty(ActiveSessionId)
+                            && error.sessionId != ActiveSessionId) break;
                         _lastStructuredErrorMessage = error.message ?? "";
+                        CompleteRunningRpcMessages(true);
+                        _assistantDeltaText = "";
                         _runtimeIsStreaming = false;
                         _runtimeStatusText = "Error";
                         OnRuntimeError?.Invoke(error);
@@ -973,11 +1059,14 @@ namespace Pie
                     var result = JsonUtility.FromJson<PieTurnResult>(json ?? "{}");
                     if (result != null)
                     {
+                        if (!string.IsNullOrEmpty(result.sessionId) && !string.IsNullOrEmpty(ActiveSessionId)
+                            && result.sessionId != ActiveSessionId) break;
+                        CompleteRunningRpcMessages(result.outcome == "failed");
+                        _assistantDeltaText = "";
                         _runtimeIsStreaming = false;
                         _runtimeStatusText = string.Equals(result.outcome, "completed", StringComparison.Ordinal)
                             ? "Idle"
                             : result.outcome ?? "Idle";
-                        _lastAssistantText = "";
                         OnTurnFinished?.Invoke(result);
                     }
                     break;
@@ -985,6 +1074,8 @@ namespace Pie
                 case "error":
                 {
                     var message = ExtractJsonString(json, "message") ?? json;
+                    CompleteRunningRpcMessages(true);
+                    _assistantDeltaText = "";
                     _runtimeIsStreaming = false;
                     _runtimeStatusText = "Error";
                     AddDevRpcMessage("system", "error", message ?? "", "", false, true);
@@ -1045,6 +1136,26 @@ namespace Pie
             });
         }
 
+        private void CompleteRunningRpcMessages(bool isError, bool includeTools = true)
+        {
+            foreach (var item in _devRpcMessages)
+            {
+                if (!item.isRunning || (item.role != "assistant" && (!includeTools || item.role != "tool"))) continue;
+                item.isRunning = false;
+                item.isError |= isError;
+            }
+        }
+
+        private void ResetRuntimeRpcHistory()
+        {
+            _devRpcMessages.Clear();
+            _lastAssistantText = "";
+            _assistantDeltaText = "";
+            _lastStructuredErrorMessage = "";
+            _runtimeIsStreaming = false;
+            _runtimeStatusText = "Idle";
+        }
+
         private void AddDevRpcMessage(string role, string title, string content, string summary, bool isRunning, bool isError)
         {
             _devRpcMessages.Add(new DevRpcMessagePayload
@@ -1064,7 +1175,7 @@ namespace Pie
             if (_devRpcMessages.Count > 0)
             {
                 var last = _devRpcMessages[_devRpcMessages.Count - 1];
-                if (last != null && string.Equals(last.role, "assistant", StringComparison.Ordinal))
+                if (last != null && last.isRunning && string.Equals(last.role, "assistant", StringComparison.Ordinal))
                 {
                     last.content = text ?? "";
                     last.summary = text ?? "";
@@ -1129,6 +1240,7 @@ namespace Pie
         [Serializable]
         private sealed class ResumeSessionPayload
         {
+            public string requestId;
             public string sessionId;
             public bool recoverInterrupted;
         }

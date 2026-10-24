@@ -18,6 +18,48 @@ namespace Pie
         private static readonly List<PieVoiceRecording> ActiveRecordings = new List<PieVoiceRecording>();
         private static int _mainThreadId = -1;
         private static bool _quitting;
+        private static readonly object DispatchGate = new object();
+        private static bool _acceptingRequests;
+
+        // The pump must exist before ANY worker thread can ask for it:
+        // RunOnMainThread previously created the GameObject lazily inside
+        // Ensure(), which throws when the first touch happens on a worker
+        // thread (dogfood: PieSafeHttpClient-driven asset tasks called from
+        // Task.Run hit "Internal_CreateGameObject can only be called from
+        // the main thread"). Both hooks below run on the main thread in
+        // every mode, capture the main thread id, and create the pump eagerly.
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+        private static void RuntimeEagerCreate()
+        {
+            _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+            // Statics may survive play sessions when domain reload is
+            // disabled; a fresh run means the pump is wanted again.
+            _quitting = false;
+            Ensure();
+        }
+
+#if UNITY_EDITOR
+        [UnityEditor.InitializeOnLoadMethod]
+        private static void EditorEagerCreate()
+        {
+            _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+            _quitting = false;
+            Ensure();
+            // Play-mode transitions destroy the pump object and set _quitting;
+            // with domain reload disabled none of the static state resets on
+            // its own. Restore edit-mode pumping explicitly on the way back.
+            UnityEditor.EditorApplication.playModeStateChanged += OnPlayModeChanged;
+        }
+
+        private static void OnPlayModeChanged(UnityEditor.PlayModeStateChange change)
+        {
+            if (change != UnityEditor.PlayModeStateChange.EnteredEditMode)
+                return;
+            _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+            _quitting = false;
+            Ensure(); // main thread: recreates the pump + editor update hook
+        }
+#endif
 
 #if UNITY_EDITOR
         private static bool _editorUpdateSubscribed;
@@ -39,10 +81,17 @@ namespace Pie
 
         internal static void Ensure()
         {
-            if (_instance != null || _quitting)
+            // Unity fake-null: a destroyed pump (play-mode exit destroys
+            // DontDestroyOnLoad objects) still compares != null as a managed
+            // reference, so use the lifetime-aware implicit bool.
+            if (_quitting || _instance)
+                return;
+            // Never create the GameObject off the main thread. The eager hooks
+            // set _mainThreadId on the main thread in every mode; an off-main
+            // caller simply enqueues and the pump drains once created.
+            if (!IsMainThread)
                 return;
 
-            _mainThreadId = Thread.CurrentThread.ManagedThreadId;
             var go = new GameObject("PieVoiceRuntimePump");
             go.hideFlags = HideFlags.HideAndDontSave;
             if (Application.isPlaying)
@@ -71,6 +120,25 @@ namespace Pie
             }
 
             MainThreadQueue.Enqueue(action);
+        }
+
+        // Used by resource-owning callers that must not enqueue after teardown.
+        // Enqueue and closing admission are atomic; accepted HTTP work is also
+        // tracked by PieSafeHttpClient before entering this gate.
+        internal static bool TryRunOnMainThread(Action action)
+        {
+            Ensure();
+            lock (DispatchGate)
+            {
+                if (!_acceptingRequests) return false;
+                if (!IsMainThread)
+                {
+                    MainThreadQueue.Enqueue(action);
+                    return true;
+                }
+            }
+            action();
+            return true;
         }
 
         internal static void PostToMainThread(Action action)
@@ -124,6 +192,7 @@ namespace Pie
         {
             _instance = this;
             _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+            lock (DispatchGate) { _acceptingRequests = true; }
         }
 
         private void Update()
@@ -165,7 +234,12 @@ namespace Pie
         private void OnDestroy()
         {
             if (_instance == this)
+            {
+                lock (DispatchGate) { _acceptingRequests = false; }
                 _instance = null;
+            }
+            // Abort + settle in-flight requests so no caller stays pending.
+            try { PieSafeHttpClient.OnPumpTeardown(); } catch { }
 #if UNITY_EDITOR
             if (!Application.isPlaying)
                 UnsubscribeEditorUpdate();
@@ -175,6 +249,8 @@ namespace Pie
         private void OnApplicationQuit()
         {
             _quitting = true;
+            lock (DispatchGate) { _acceptingRequests = false; }
+            PieSafeHttpClient.OnPumpTeardown();
         }
 
 #if UNITY_EDITOR

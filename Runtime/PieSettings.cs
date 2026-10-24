@@ -39,12 +39,15 @@ namespace Pie
         [SerializeField] private List<PieFileToolRootDefinition> fileToolRoots = new List<PieFileToolRootDefinition>();
         [SerializeField] private string defaultFileToolRootEditor = "persistent";
         [SerializeField] private string defaultFileToolRootRuntime = "persistent";
+        [Tooltip("Regenerate PuerTS xIl2cpp static bindings in the editor when they are stale or missing (default on).")]
+        [SerializeField] private bool autoGeneratePuerTSBindings = true;
 
         public IReadOnlyList<string> ExtensionSearchPaths => extensionSearchPaths;
         public IReadOnlyList<string> SkillSearchPaths => skillSearchPaths;
         public IReadOnlyList<PieFileToolRootDefinition> FileToolRoots => fileToolRoots;
         public string DefaultFileToolRootEditor => defaultFileToolRootEditor;
         public string DefaultFileToolRootRuntime => defaultFileToolRootRuntime;
+        public bool AutoGeneratePuerTSBindings => autoGeneratePuerTSBindings;
     }
 }
 
@@ -1652,7 +1655,8 @@ namespace Pie
                     || string.Equals(source, "player", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(source, "pie", StringComparison.OrdinalIgnoreCase))
                     return source.ToLowerInvariant();
-                throw new InvalidOperationException("Unsupported log source: " + source);
+                throw new InvalidOperationException(
+                    "Unsupported log source: " + source + ". Valid sources: active, editor, player, pie.");
             }
 
             private static List<string> GetLogCandidates(string source)
@@ -1842,7 +1846,7 @@ namespace Pie
     // Merged from Runtime/UnityCapabilities/PieUnityCapabilitiesConstants.cs
     public static class PieUnityCapabilitiesConstants
         {
-            public const string Version = "0.1.39";
+            public const string Version = "0.1.40";
             public const string ManifestSchemaVersion = "2";
             public const string SkillProtocolVersion = "pie-unity-rpc/2";
             public const int DefaultPort = 8091;
@@ -3435,7 +3439,12 @@ namespace Pie
                     case "cylinder": return GameObject.CreatePrimitive(PrimitiveType.Cylinder);
                     case "plane": return GameObject.CreatePrimitive(PrimitiveType.Plane);
                     case "quad": return GameObject.CreatePrimitive(PrimitiveType.Quad);
-                    default: throw new InvalidOperationException("Unsupported primitiveType: " + primitiveType);
+                    // Models guess plural/camelCase spellings constantly; list the
+                    // valid set so the retry succeeds without a schema round-trip.
+                    default: throw new InvalidOperationException(
+                        "Unsupported primitiveType: " + primitiveType +
+                        ". Valid values: cube, sphere, capsule, cylinder, plane, quad " +
+                        "(omit primitiveType for an empty GameObject).");
                 }
             }
 
@@ -3497,7 +3506,21 @@ namespace Pie
                 if (type == typeof(bool))
                     return ParseJsonBool(raw);
                 if (type.IsEnum)
-                    return Enum.Parse(type, ReadJsonStringOrRaw(raw), true);
+                {
+                    var enumRaw = ReadJsonStringOrRaw(raw);
+                    try
+                    {
+                        return Enum.Parse(type, enumRaw, true);
+                    }
+                    catch
+                    {
+                        // Enum values are a finite set; list them so the model's
+                        // next guess lands (it constantly invents case/plurals).
+                        throw new InvalidOperationException(
+                            "Invalid enum value '" + enumRaw + "' for " + type.FullName +
+                            ". Valid values: " + string.Join(", ", Enum.GetNames(type)) + ".");
+                    }
+                }
                 if (IsNumericType(type))
                     return Convert.ChangeType(ParseJsonDouble(raw), type, CultureInfo.InvariantCulture);
                 if (type == typeof(Vector2))
@@ -3511,7 +3534,11 @@ namespace Pie
                         ReadRequiredJsonFloat(raw, "b"),
                         TryReadJsonNumberMember(raw, "a", out var a) ? a : 1f);
 
-                throw new InvalidOperationException("Unsupported component property type: " + type.FullName);
+                // List what ConvertJsonValue CAN do so the model can pick a
+                // convertible representation instead of guessing again.
+                throw new InvalidOperationException(
+                    "Unsupported component property type: " + type.FullName +
+                    ". Supported: string, bool, enum, numeric, Vector2, Vector3, Color.");
             }
 
             private static bool IsNumericType(Type type)

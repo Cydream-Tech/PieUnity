@@ -120,6 +120,78 @@ PieChat reload recovery is intentionally interrupt-and-resume, not transparent n
 - PieChat rejects a second `send` while a turn is already busy; do not queue overlapping streaming turns unless a real queue is designed.
 - Future `AgentSessionController` reuse must go through a Unity adapter. The adapter has to keep Unity's pending-user recovery as the source of truth before delegating to controller persistence, otherwise reload recovery can duplicate the interrupted user message.
 
+### Embedding PuerTS JavaScript: IL2CPP pitfalls
+
+Hosts that run their own game/mod JavaScript on the embedded PuerTS VM
+(as PieRunner and mod hosts such as PieArcade do) should know these four
+pitfalls. All were observed live while debugging IL2CPP players; only the
+linker stripping in pitfall 2 is build-specific — the rest are general
+PuerTS/rendering traps that can bite in the editor too:
+
+1. **PuerTS has no JavaScript operator overloading.** `vectorA - vectorB`
+   does not throw — it is plain JS coercion and silently produces `NaN`.
+   In the observed case the NaN flowed into `transform.eulerAngles` and
+   the rotation simply never changed, with no error anywhere. Use the
+   bound static operators (`UnityEngine.Vector3.op_Subtraction(a, b)`)
+   or component-wise math (`new UnityEngine.Vector3(a.x - b.x, ...)`), and
+   treat any unexplained frozen transform as a NaN suspect first.
+2. **Reflection-called engine overloads are stripped by IL2CPP.** Host C#
+   almost never references every overload of e.g. `Quaternion.LookRotation`,
+   so the linker removes the ones only JS calls. `Runtime/link.xml` ships a
+   `UnityEngine.CoreModule` preservation list for the math/helper surface
+   (Vector/Quaternion/Matrix/Mathf/Color/ColorUtility/Rect/Bounds/Random/Time);
+   extend your own `link.xml` with the same pattern when your JS reflects
+   over further engine APIs.
+3. **Linear color space changes what code-authored colors mean.** A
+   `Color` is an untagged numeric value; consumers that expect linear
+   light (shaders, rendering in a `PlayerSettings.colorSpace = Linear`
+   project) will render an intended sRGB `0.05` as ~`0.26`, washing the
+   whole UI out. Convert with `.linear` at the boundary where a
+   linear-expecting consumer receives the color — and only there, so
+   consumers that already convert are not double-corrected. Captures had
+   the same class of bug: `unity_screenshot` PNGs from a linear project
+   carried bytes/metadata that disagreed with the display-referred sRGB a
+   PNG must hold, and framebuffer alpha of 0 made image viewers composite
+   captures onto white — two independent causes of the same washed-out
+   look. The tool now encodes opaque sRGB PNGs in both color spaces.
+4. **Player logs are reachable over RPC.** When a player build misbehaves,
+   call `unity_log_read` (`source: "player"` or `"active"`) instead of
+   hunting `Player.log` by hand; `contains` + `tailLines` cover the usual
+   triage. For scene captures that must exclude chat/HUD overlay canvases,
+   call `unity_screenshot` with `includeUI: false`.
+
+### Static bindings and reusable mod hosting
+
+See [PUERTS-BINDINGS.md](PUERTS-BINDINGS.md) for the Standalone xIl2cpp preset,
+install-time generation, freshness stamp and strict CI build gate. Other player
+targets are not supported by this new generation pipeline yet.
+
+`PieModHost<TApi>` runs trusted plain-script mods on a caller-owned `JsEnv`.
+It caches `game_init(api)`, optional `game_update(api, dt)`,
+`game_onKey(api, key)` and `game_dispose()` delegates. Install guards with
+`InstallStepGuardsFromResources()` and check its result **before loading mods**.
+The bundled `pie/mod-guards` resource uses the same Acorn loop injector as
+`unity_script_run`; hosts no longer need to ship their own copy.
+
+- Budgets cover top-level evaluation/init (30s), updates (2s), keys (2s) and
+  cleanup (2s). Hosts can tune the public budget fields and update budget via
+  `PerfTool`. These are cooperative limits, **not a sandbox or hard VM timeout**:
+  native calls, recursion, dynamic code or deliberately caught errors can evade
+  termination. Only use trusted mods; a missing guard installation is reported
+  but does not itself prohibit `LoadMod`.
+- Loading unloads the previous hooks; failed initialization also gets best-effort
+  cleanup. Hook globals are reset between loads, but arbitrary mod globals share
+  the VM. Use top-level `var`, not redeclarable `let`/`const`, for reloadable state.
+- `ModFailed` fires after teardown, with a phase and error. The caller owns scene/UI
+  cleanup, `JsEnv.Tick()` and disposal. Unload the mod before disposing its VM.
+- Telemetry exposes a 600-sample rolling percentile window plus total frame/jank
+  and budget-abort counters since reset. The first two update ticks execute but
+  are excluded as warmup; a loading overlay can wait for `IsWarmingUp == false`.
+  `PerfTool({"reset":true})` returns the old snapshot **before** resetting it.
+- Agent and mod work share Unity's main thread: budgets detect runaway code, not
+  schedule independent CPU quotas. Batch/ArrayBuffer channels remain unshipped;
+  the dogfood's 600-entity update measured p95 0.12ms without them.
+
 ## Requirements
 
 `com.pie.agent` depends on PuerTS Unity 2.2.2 with the V8 backend:
@@ -301,6 +373,14 @@ player-facing timeline and session title. `content` remains the model input.
 One session snapshot contains at most the latest 50 turns / 500 timeline
 items; thinking blocks are never projected into the runtime timeline.
 
+`ResumeSession` / `NewSession` return **dispatch success, not binding completion**.
+For per-mod/workspace binding, subscribe to `OnSessionBindingResult` and pass a
+fresh request id via `ResumeSession(id, false, requestId)` or `NewSession(requestId)`.
+Only a matching successful result authorizes saving its `sessionId` or sending on
+that binding; an arbitrary `OnSessionChanged` snapshot does not. See the
+[correlated binding contract](../../docs/maintenance/unity-bridge.md#correlated-runtime-session-binding)
+for result fields, supersession and retry semantics. Legacy overloads remain supported.
+
 Example:
 
 ```csharp
@@ -393,17 +473,28 @@ If no valid profile is configured, Unity starts in an unconfigured model state a
 
 Android runtime discovery and Pie logs are also stored below `Application.persistentDataPath`; Android's `UserProfile` location is not assumed to be writable. For Player builds, the package's Editor linker processor explicitly supplies `Runtime/link.xml` to UnityLinker, preserving the PuerTS-visible bridge surface that embedded JavaScript calls through `CS.Pie.*` on IL2CPP.
 
-PuerTS 2.2.2 enables its IL2CPP optimization on desktop and Android by default.
-Before an IL2CPP build, generate the project's PuerTS IL2CPP glue through
-**Tools > PuerTS > Generate For xIl2cpp mode (all in one without wrapper)**
-(or the corresponding full-wrapper command). For batch validation, the installed
-2.2.2 generator exposes `PuertsIl2cpp.Editor.Generator.UnityMenu.GenV2WithoutWrapper`;
-run generation before starting the separate Player build invocation.
-For a project using the regular reflection bridge, add
-`PUERTS_DISABLE_IL2CPP_OPTIMIZATION` to the target's Scripting Define Symbols
-instead. Without either configuration, native linking fails with missing symbols
-such as `InitialPuerts`; Pie's linker preservation does not generate this glue.
-See the [PuerTS IL2CPP setup](https://github.com/Tencent/puerts/blob/master/doc/unity/zhcn/performance/il2cpp.md).
+Use Pie's [PuerTS xIl2cpp binding workflow](PUERTS-BINDINGS.md), shipped with the
+package. Generate full-wrapper bindings through **Tools > Pie > PuerTS Bindings >
+Generate (xIl2cpp, full wrapper)**, or explicitly in batch mode:
+
+```bash
+Unity -batchmode -projectPath <project> -buildTarget StandaloneOSX \
+  -executeMethod Pie.Editor.PiePuerTSBindingGenerator.GenerateAllBatch -quit
+```
+
+Use the same active Standalone target for generation and the separate Player
+build. Exit 0 means ready; exit 2 requires a new Unity process to compile and
+repeat generation; exit 1 is failure. Strict CI (`PIE_PUERTS_GEN_STRICT=1`)
+never silently regenerates stale bindings. Pie manages
+`PUERTS_DISABLE_IL2CPP_OPTIMIZATION`; do not set it manually or substitute raw
+PuerTS generator commands, which do not produce Pie's validated stamp.
+
+The productized IL2CPP pipeline currently supports active Standalone targets
+(macOS validated; Windows/Linux need platform validation). iOS, WebGL and other
+non-Standalone IL2CPP targets are unsupported; do not infer support from the
+upstream PuerTS defaults. For the isolated PieSmoke player, explicitly run
+`Pie.Editor.PiePlayerSmokeBuild.PrepareSmokeBindingsBatch` before building; see
+the [Smoke workflow](PUERTS-BINDINGS.md#isolated-smoke-player).
 
 ## Paths
 

@@ -83,7 +83,13 @@ namespace Pie
             if (string.Equals(action, "set_component_property", StringComparison.OrdinalIgnoreCase))
                 return SetComponentPropertyJson(payload, argsJson ?? "{}");
 
-            throw new InvalidOperationException("Unsupported action: " + action);
+            // Unknown actions are almost always model guesses; list the
+            // valid set so the next call can succeed without a manifest
+            // round-trip.
+            throw new InvalidOperationException(
+                "Unsupported action: " + action + ". Valid actions: create_scene_object, destroy_scene_object, " +
+                "set_transform, set_active, set_parent, set_name, set_tag_layer, add_component, remove_component, " +
+                "set_component_enabled, set_component_property.");
         }
 
         public static string RefreshJson()
@@ -470,7 +476,12 @@ namespace Pie
                 case "cylinder": return GameObject.CreatePrimitive(PrimitiveType.Cylinder);
                 case "plane": return GameObject.CreatePrimitive(PrimitiveType.Plane);
                 case "quad": return GameObject.CreatePrimitive(PrimitiveType.Quad);
-                default: throw new InvalidOperationException("Unsupported primitiveType: " + primitiveType);
+                // Models guess plural/camelCase spellings constantly; list the
+                // valid set so the retry succeeds without a schema round-trip.
+                default: throw new InvalidOperationException(
+                    "Unsupported primitiveType: " + primitiveType +
+                    ". Valid values: cube, sphere, capsule, cylinder, plane, quad " +
+                    "(omit primitiveType for an empty GameObject).");
             }
         }
 
@@ -532,7 +543,21 @@ namespace Pie
             if (type == typeof(bool))
                 return ParseJsonBool(raw);
             if (type.IsEnum)
-                return Enum.Parse(type, ReadJsonStringOrRaw(raw), true);
+            {
+                var enumRaw = ReadJsonStringOrRaw(raw);
+                try
+                {
+                    return Enum.Parse(type, enumRaw, true);
+                }
+                catch
+                {
+                    // Enum values are a finite set; list them so the model's
+                    // next guess lands (it constantly invents case/plurals).
+                    throw new InvalidOperationException(
+                        "Invalid enum value '" + enumRaw + "' for " + type.FullName +
+                        ". Valid values: " + string.Join(", ", Enum.GetNames(type)) + ".");
+                }
+            }
             if (IsNumericType(type))
                 return Convert.ChangeType(ParseJsonDouble(raw), type, CultureInfo.InvariantCulture);
             if (type == typeof(Vector2))
@@ -546,7 +571,11 @@ namespace Pie
                     ReadRequiredJsonFloat(raw, "b"),
                     TryReadJsonNumberMember(raw, "a", out var a) ? a : 1f);
 
-            throw new InvalidOperationException("Unsupported component property type: " + type.FullName);
+            // List what ConvertJsonValue CAN do so the model can pick a
+            // convertible representation instead of guessing again.
+            throw new InvalidOperationException(
+                "Unsupported component property type: " + type.FullName +
+                ". Supported: string, bool, enum, numeric, Vector2, Vector3, Color.");
         }
 
         private static bool IsNumericType(Type type)

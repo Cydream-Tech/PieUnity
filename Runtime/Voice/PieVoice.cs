@@ -92,6 +92,12 @@ namespace Pie
                 "Voice transcription returned no result.")));
         }
 
+        private static string BuildUploadLogUrl(PieVoiceOptions options)
+        {
+            var baseUrl = string.IsNullOrWhiteSpace(options?.ApiBaseUrl) ? "https://token.magicshell.ai" : options.ApiBaseUrl.Trim().TrimEnd('/');
+            return baseUrl + "/voice/transcribe";
+        }
+
         internal static PieVoiceResult BuildResultFromResponse(string responseJson, float durationSeconds)
         {
             try
@@ -166,6 +172,7 @@ namespace Pie
             CancellationToken cancellationToken,
             Action<PieVoiceResult> callback)
         {
+            UnityEngine.Debug.Log($"[PieVoice] upload start {audioBytes?.Length ?? 0} bytes -> {BuildUploadLogUrl(options)}");
             Task.Run(async () =>
             {
                 try

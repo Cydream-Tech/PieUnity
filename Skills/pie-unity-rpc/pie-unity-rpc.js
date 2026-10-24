@@ -70,12 +70,29 @@ export function loadRegistry(directoryPath = REGISTRY_DIR) {
 	return dedupeInstances(items.filter(Boolean));
 }
 
+function isRegistryPidAlive(pid) {
+	const value = Number(pid || 0);
+	if (!Number.isInteger(value) || value <= 0) return true; // unknown pid: keep, rely on heartbeat TTL
+	try {
+		process.kill(value, 0);
+		return true;
+	} catch (err) {
+		return err?.code === "EPERM"; // alive but owned by another user
+	}
+}
+
 export function getActiveInstances(instances, nowUnix = Math.floor(Date.now() / 1000)) {
 	const recent = instances.filter((item) => {
 		const lastSeenUnix = Number(item?.lastSeenUnix || 0);
-		return lastSeenUnix > 0 && nowUnix - lastSeenUnix <= ACTIVE_INSTANCE_MAX_AGE_SEC;
+		if (!(lastSeenUnix > 0 && nowUnix - lastSeenUnix <= ACTIVE_INSTANCE_MAX_AGE_SEC)) return false;
+		// A fresh heartbeat from a dead process (killed editor/player) is stale;
+		// without this, discovery goes ambiguous until the TTL expires.
+		return isRegistryPidAlive(item?.pid);
 	});
-	return recent.length > 0 ? recent : instances;
+	if (recent.length > 0) return recent;
+	// Fallback for stale heartbeats (clock skew etc.): keep entries that are at
+	// least process-alive (or pid-unknown). Never resurrect a known-dead pid.
+	return instances.filter((item) => isRegistryPidAlive(item?.pid));
 }
 
 function basenameMatch(left, right) {
@@ -477,9 +494,9 @@ export async function runCli(argv = process.argv) {
 		return;
 	}
 	if (command === "instances") {
-		const nowUnix = Math.floor(Date.now() / 1000);
-		const recent = loadRegistry().filter((item) => nowUnix - Number(item?.lastSeenUnix || 0) <= ACTIVE_INSTANCE_MAX_AGE_SEC);
-		const instances = await probeCandidateHealth(recent, flags);
+		// getActiveInstances applies heartbeat TTL + pid-liveness so freshly
+		// killed editors/players do not linger in the listing.
+		const instances = await probeCandidateHealth(getActiveInstances(loadRegistry()), flags);
 		const filtered = flags.project
 			? instances.filter((item) => computeProjectMatchScore(flags.project, item.projectPath || "") > 0)
 			: instances;
@@ -864,6 +881,7 @@ function filterDiscoverableInstances(items) {
 export const __testOnly = {
 	findMatchingInstance,
 	formatCandidate,
+	getActiveInstances,
 };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

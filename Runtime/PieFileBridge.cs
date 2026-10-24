@@ -284,6 +284,14 @@ namespace Pie
             return Task.Run(() => Convert.ToBase64String(File.ReadAllBytes(path)));
         }
 
+        // Synchronous variant: the JS-side Task conversion (puer.$promise) has
+        // been observed settling empty/invalid in some runtime hosts, so binary
+        // reads prefer this plain synchronous bridge call.
+        public static string ReadAllBytesBase64(string path)
+        {
+            return Convert.ToBase64String(File.ReadAllBytes(path));
+        }
+
         public static Task WriteAllTextAsync(string path, string content)
         {
             return Task.Run(() =>

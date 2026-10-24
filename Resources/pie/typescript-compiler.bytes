@@ -76,15 +76,260 @@ if(typeof URL==="undefined"){
   };
   globalThis.URL.prototype.toString=function(){return this.href;};
 }
-if(typeof Buffer==="undefined"){
-  globalThis.Buffer={
-    from:function(str,enc){if(typeof str==="string"){var s=enc==="utf-8"||enc==="utf8"||!enc?str:str;var n=0;for(var i=0;i<s.length;i++){var c=s.charCodeAt(i);if(c<0x80)n++;else if(c<0x800)n+=2;else if(c>=0xD800&&c<=0xDBFF&&i+1<s.length){n+=4;i++;}else n+=3;}return{length:n,toString:function(){return str;}};}return{length:str.length||0,toString:function(){return String(str);}};},
-    byteLength:function(str,enc){return Buffer.from(str,enc).length;},
-    isBuffer:function(obj){return false;},
-    concat:function(list){return{length:list.reduce(function(a,b){return a+(b.length||0);},0)};},
-    alloc:function(size){return{length:size};}
+"use strict";
+(() => {
+  // src/buffer-shim.ts
+  var alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  function encodingOf(value) {
+    if (value === void 0 || value === "") return "utf8";
+    switch (String(value).toLowerCase()) {
+      case "utf8":
+      case "utf-8":
+        return "utf8";
+      case "base64":
+        return "base64";
+      case "base64url":
+        return "base64url";
+      case "hex":
+        return "hex";
+      case "ascii":
+        return "ascii";
+      case "latin1":
+      case "binary":
+        return "latin1";
+      case "utf16le":
+      case "utf-16le":
+      case "ucs2":
+      case "ucs-2":
+        return "utf16le";
+      default:
+        throw new TypeError(`Unknown encoding: ${String(value)}`);
+    }
+  }
+  function encodeUtf8(text) {
+    const bytes = [];
+    for (let i = 0; i < text.length; i++) {
+      let code = text.charCodeAt(i);
+      if (code >= 55296 && code <= 56319) {
+        const low = text.charCodeAt(i + 1);
+        if (low >= 56320 && low <= 57343) {
+          code = 65536 + (code - 55296 << 10) + low - 56320;
+          i++;
+        } else code = 65533;
+      } else if (code >= 56320 && code <= 57343) code = 65533;
+      if (code < 128) bytes.push(code);
+      else if (code < 2048) bytes.push(192 | code >> 6, 128 | code & 63);
+      else if (code < 65536) bytes.push(224 | code >> 12, 128 | code >> 6 & 63, 128 | code & 63);
+      else bytes.push(240 | code >> 18, 128 | code >> 12 & 63, 128 | code >> 6 & 63, 128 | code & 63);
+    }
+    return bytes;
+  }
+  function decodeUtf8(bytes) {
+    let text = "";
+    for (let i = 0; i < bytes.length; ) {
+      const lead = bytes[i];
+      if (lead < 128) {
+        text += String.fromCharCode(lead);
+        i++;
+        continue;
+      }
+      if (lead < 194 || lead > 244) {
+        text += "\uFFFD";
+        i++;
+        continue;
+      }
+      const width = lead < 224 ? 2 : lead < 240 ? 3 : 4;
+      let code = lead & (width === 2 ? 31 : width === 3 ? 15 : 7);
+      let consumed = 1;
+      for (; consumed < width && i + consumed < bytes.length; consumed++) {
+        const byte = bytes[i + consumed];
+        const min = consumed === 1 && lead === 224 ? 160 : consumed === 1 && lead === 240 ? 144 : 128;
+        const max = consumed === 1 && lead === 237 ? 159 : consumed === 1 && lead === 244 ? 143 : 191;
+        if (byte < min || byte > max) break;
+        code = code << 6 | byte & 63;
+      }
+      text += consumed === width ? String.fromCodePoint(code) : "\uFFFD";
+      i += consumed;
+    }
+    return text;
+  }
+  function encode(text, encoding) {
+    if (encoding === "utf8") return encodeUtf8(text);
+    const bytes = [];
+    if (encoding === "base64" || encoding === "base64url" || encoding === "hex") {
+      text = text.replace(/[\u0100-\uffff]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) & 255));
+    }
+    if (encoding === "base64" || encoding === "base64url") {
+      const cleaned = text.split("=", 1)[0].replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/]/g, "");
+      const decoded = new Uint8Array(checkedSize(Math.floor(cleaned.length * 6 / 8)));
+      let offset = 0;
+      let bits = 0;
+      let value = 0;
+      for (const ch of cleaned) {
+        value = value << 6 | alphabet.indexOf(ch);
+        bits += 6;
+        if (bits >= 8) {
+          bits -= 8;
+          decoded[offset++] = value >>> bits & 255;
+        }
+      }
+      return decoded;
+    } else if (encoding === "hex") {
+      for (let i = 0; i + 1 < text.length; i += 2) {
+        const pair = text.slice(i, i + 2);
+        if (!/^[0-9a-f]{2}$/i.test(pair)) break;
+        bytes.push(parseInt(pair, 16));
+      }
+    } else {
+      for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        bytes.push(code & 255);
+        if (encoding === "utf16le") bytes.push(code >>> 8);
+      }
+    }
+    return bytes;
+  }
+  function decode(bytes, encoding) {
+    if (encoding === "utf8") return decodeUtf8(bytes);
+    let text = "";
+    if (encoding === "base64" || encoding === "base64url") {
+      for (let i = 0; i < bytes.length; i += 3) {
+        const value = bytes[i] << 16 | (bytes[i + 1] ?? 0) << 8 | (bytes[i + 2] ?? 0);
+        text += alphabet[value >>> 18 & 63] + alphabet[value >>> 12 & 63] + (i + 1 < bytes.length ? alphabet[value >>> 6 & 63] : "=") + (i + 2 < bytes.length ? alphabet[value & 63] : "=");
+      }
+      return encoding === "base64url" ? text.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "") : text;
+    }
+    for (let i = 0; i < bytes.length; i++) {
+      if (encoding === "hex") text += bytes[i].toString(16).padStart(2, "0");
+      else if (encoding === "utf16le") {
+        if (i + 1 < bytes.length) text += String.fromCharCode(bytes[i] | bytes[++i] << 8);
+      } else text += String.fromCharCode(encoding === "ascii" ? bytes[i] & 127 : bytes[i]);
+    }
+    return text;
+  }
+  function isArrayBuffer(value) {
+    return value instanceof ArrayBuffer || Object.prototype.toString.call(value) === "[object ArrayBuffer]";
+  }
+  function isBytes(value) {
+    return ArrayBuffer.isView(value) && Object.prototype.toString.call(value) === "[object Uint8Array]";
+  }
+  function checkedSize(size) {
+    if (typeof size !== "number") throw new TypeError("Buffer size must be a number");
+    if (!Number.isFinite(size) || size < 0 || size > 2147483647) throw new RangeError("Buffer size is out of range");
+    return Math.trunc(size);
+  }
+  var UnityBuffer = class _UnityBuffer extends Uint8Array {
+    static from(value, encodingOrOffset, length) {
+      if (typeof value === "string") {
+        const encoded = encode(value, encodingOf(typeof encodingOrOffset === "string" ? encodingOrOffset : void 0));
+        checkedSize(encoded.length);
+        return encoded instanceof Uint8Array ? new _UnityBuffer(encoded.buffer, encoded.byteOffset, encoded.length) : new _UnityBuffer(encoded);
+      }
+      if (isArrayBuffer(value)) {
+        const offset = Number(encodingOrOffset) || 0;
+        if (!Number.isFinite(offset) || offset < 0 || offset > value.byteLength) throw new RangeError("Buffer offset is out of range");
+        const start = Math.trunc(offset);
+        const size = checkedSize(length === void 0 ? value.byteLength - start : Number(length) || 0);
+        if (start + size > value.byteLength) throw new RangeError("Buffer length is out of range");
+        return new _UnityBuffer(value, start, size);
+      }
+      if (value !== null && typeof value === "object") {
+        if ("type" in value && value.type === "Buffer" && "data" in value && Array.isArray(value.data)) {
+          return _UnityBuffer.from(value.data);
+        }
+        if ("length" in value || ArrayBuffer.isView(value)) {
+          const source = value;
+          const length2 = source.length;
+          if (typeof length2 !== "number" || Number.isNaN(length2)) return new _UnityBuffer(0);
+          const size = length2 <= 0 ? 0 : checkedSize(length2);
+          const result = new _UnityBuffer(size);
+          for (let i = 0; i < size; i++) result[i] = source[i];
+          return result;
+        }
+      }
+      throw new TypeError("Buffer.from expects a string, ArrayBuffer, or array-like value");
+    }
+    static isBuffer(value) {
+      return value instanceof _UnityBuffer;
+    }
+    static isEncoding(value) {
+      if (typeof value !== "string" || !value) return false;
+      try {
+        encodingOf(value);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    static byteLength(value, encoding) {
+      if (isArrayBuffer(value) || ArrayBuffer.isView(value)) return value.byteLength;
+      if (typeof value !== "string") throw new TypeError("Buffer.byteLength expects a string or bytes");
+      let normalized;
+      try {
+        normalized = encodingOf(encoding);
+      } catch {
+        normalized = "utf8";
+      }
+      if (normalized === "hex") return Math.floor(value.length / 2);
+      if (normalized === "base64" || normalized === "base64url") {
+        let length = value.length;
+        if (length && value[length - 1] === "=") length--;
+        if (length && value[length - 1] === "=") length--;
+        return Math.floor(length * 3 / 4);
+      }
+      if (normalized === "ascii" || normalized === "latin1") return value.length;
+      if (normalized === "utf16le") return value.length * 2;
+      return encodeUtf8(value).length;
+    }
+    static alloc(size, fill, encoding) {
+      const result = new _UnityBuffer(checkedSize(size));
+      if (typeof fill === "number") result.fill(fill);
+      else if (fill !== void 0 && result.length > 0) {
+        const pattern = typeof fill === "string" ? _UnityBuffer.from(fill, encoding) : fill;
+        if (!isBytes(pattern)) throw new TypeError("Buffer fill must be a number, string, or Uint8Array");
+        if (pattern.length === 0) {
+          if (fill === "") return result;
+          throw new TypeError("Buffer fill must not be empty");
+        }
+        for (let i = 0; i < result.length; i++) result[i] = pattern[i % pattern.length];
+      }
+      return result;
+    }
+    static concat(list, totalLength) {
+      if (!Array.isArray(list) || !list.every(isBytes)) throw new TypeError("Buffer.concat expects an array of Uint8Array values");
+      if (list.length === 0) return _UnityBuffer.alloc(0);
+      const size = checkedSize(totalLength === void 0 ? list.reduce((sum, bytes) => sum + bytes.length, 0) : totalLength);
+      if (totalLength !== void 0 && size !== totalLength) throw new RangeError("Buffer.concat length must be an integer");
+      const result = _UnityBuffer.alloc(size);
+      let offset = 0;
+      for (const bytes of list) {
+        const count = Math.min(bytes.length, result.length - offset);
+        result.set(bytes.subarray(0, count), offset);
+        offset += count;
+        if (offset === result.length) break;
+      }
+      return result;
+    }
+    subarray(start, end) {
+      return super.subarray(start, end);
+    }
+    // Node Buffer.slice is a VIEW, unlike Uint8Array.slice.
+    slice(start, end) {
+      return this.subarray(start, end);
+    }
+    toString(encoding, start = 0, end = this.length) {
+      const first = Math.min(this.length, Math.max(0, Math.trunc(start) || 0));
+      const last = Math.min(this.length, Math.max(0, Math.trunc(end) || 0));
+      if (last <= first) return "";
+      return decode(this.subarray(first, last), encodingOf(encoding));
+    }
+    toJSON() {
+      return { type: "Buffer", data: Array.from(this) };
+    }
   };
-}
+  var globals = globalThis;
+  if (globals.Buffer === void 0) globals.Buffer = UnityBuffer;
+})();
 if(typeof AbortController==="undefined"){
   globalThis.AbortSignal=function AbortSignal(){this.aborted=false;this.reason=undefined;this._listeners=[];this.onabort=null;};
   globalThis.AbortSignal.prototype.addEventListener=function(t,fn){if(t!=="abort"||typeof fn!=="function")return;if(this._listeners.indexOf(fn)>=0)return;this._listeners.push(fn);};

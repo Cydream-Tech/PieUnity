@@ -621,7 +621,8 @@ namespace Pie
                 ApplyListPatch(property, listAction, listIndex, value, objectPath, objectComponentType);
                 return;
             }
-            throw new InvalidOperationException("Unsupported serialized action: " + action);
+            throw new InvalidOperationException(
+                "Unsupported serialized action: " + action + ". Valid actions: set_scalar, set_object_reference, list_patch.");
         }
 
         private static void ApplyListPatch(SerializedProperty property, string action, int index, string value, string objectPath, string objectComponentType)
@@ -642,7 +643,8 @@ namespace Pie
                 return;
             }
             if (!string.Equals(action, "add", StringComparison.OrdinalIgnoreCase) && !string.Equals(action, "set", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("Unsupported listAction: " + action);
+                throw new InvalidOperationException(
+                    "Unsupported listAction: " + action + ". Valid actions: add, set, remove, clear.");
             if (string.Equals(action, "add", StringComparison.OrdinalIgnoreCase))
             {
                 property.InsertArrayElementAtIndex(property.arraySize);
@@ -677,7 +679,9 @@ namespace Pie
                     property.enumValueIndex = ResolveEnumIndex(property, value);
                     return;
                 default:
-                    throw new InvalidOperationException("PROPERTY_NOT_SCALAR: " + property.propertyPath + " (" + property.propertyType + ")");
+                    throw new InvalidOperationException(
+                        "PROPERTY_NOT_SCALAR: " + property.propertyPath + " (" + property.propertyType + ")" +
+                        ". Supported scalar types: String, Boolean, Integer, Float, Enum.");
             }
         }
 
@@ -691,7 +695,8 @@ namespace Pie
                     || string.Equals(property.enumDisplayNames[i], value, StringComparison.OrdinalIgnoreCase))
                     return i;
             }
-            throw new InvalidOperationException("ENUM_VALUE_NOT_FOUND: " + value);
+            throw new InvalidOperationException(
+                "ENUM_VALUE_NOT_FOUND: " + value + ". Valid values: " + string.Join(", ", property.enumNames) + ".");
         }
 
         private static UnityEngine.Object ResolveObjectReference(string objectPath, string componentType)

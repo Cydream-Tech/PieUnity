@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "comment": "PuerTS CS.* binding surface of the embedded runtime bundle (Resources/pie/core.bytes). These calls are invisible to Unity's static linker, so every type listed here MUST stay preserved in Runtime/link.xml or IL2CPP players fail at runtime (dogfood P1: 'CS.System.IO.File.Copy is not a function'). Gate: npm run check:unity-binding-surface re-scans the built bundle; any CS.* chain not covered here fails the check — add the type to requiredTypes AND preserve it in link.xml in the same commit.",
+  "requiredTypes": [
+    { "name": "System.IO.Directory", "assembly": "mscorlib", "usedBy": "puerts-fs (packages/platform): session storage, file tools" },
+    { "name": "System.IO.DirectoryInfo", "assembly": "mscorlib", "usedBy": "puerts-fs enumeration" },
+    { "name": "System.IO.File", "assembly": "mscorlib", "usedBy": "puerts-fs read/write/copy/move" },
+    { "name": "System.IO.FileInfo", "assembly": "mscorlib", "usedBy": "puerts-fs stat" },
+    { "name": "System.IO.FileAttributes", "assembly": "mscorlib", "usedBy": "puerts-fs reparse-point checks" },
+    { "name": "System.IO.Path", "assembly": "mscorlib", "usedBy": "puerts-fs path handling" },
+    { "name": "System.Convert", "assembly": "mscorlib", "usedBy": "base64 encode for bridge file reads (image payloads)" },
+    { "name": "System.Environment", "assembly": "mscorlib", "usedBy": "home folder resolution for session/config paths" },
+    { "name": "System.Environment/SpecialFolder", "assembly": "mscorlib", "usedBy": "GetFolderPath(UserProfile)" },
+    { "name": "Pie.PieFileBridge", "assembly": "Pie.Runtime", "usedBy": "native file bridge (bounded reads, base64 fallback)" },
+    { "name": "Pie.PieBridge", "assembly": "Pie.Runtime", "usedBy": "LoadResourceText for the lazy TypeScript compiler (optional-chained probe)" },
+    { "name": "Pie.PieHttpBridge", "assembly": "Pie.Runtime", "usedBy": "LLM HTTP/SSE streaming (unity-http-client)" },
+    { "name": "Pie.PieDiagnostics", "assembly": "Pie.Runtime", "usedBy": "verbose logging from JS" }
+  ],
+  "optionalProbes": [
+    { "name": "AgentBridge", "usedBy": "packages/platform http.ts probes CS.AgentBridge?.HttpPostAsyncStart for a legacy host bridge; absent by design (optional chaining) and falls back to UnityWebRequest. Do NOT add to link.xml." }
+  ],
+  "engineRootedPrefixes": [
+    "UnityEngine.",
+    "UnityEditor."
+  ],
+  "engineRootedComment": "UnityEngine/UnityEditor types are rooted by the package's own C# (Pie.Runtime references them directly) and by Unity's engine stripping rules; they do not need link.xml entries. If a host player ever strips one anyway, move that specific type into requiredTypes with its UnityEngine.*Module assembly.",
+  "proactivePreservesComment": "link.xml MAY preserve more than this manifest (e.g. System.Text.*) as cheap insurance for dynamic access; extra preserves are reported as informational, not failures."
+}

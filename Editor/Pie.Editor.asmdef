@@ -3,7 +3,8 @@
   "rootNamespace": "Pie.Editor",
   "references": [
     "Pie.Runtime",
-    "com.tencent.puerts.core"
+    "com.tencent.puerts.core",
+    "com.tencent.puerts.core.Editor"
   ],
   "includePlatforms": [
     "Editor"

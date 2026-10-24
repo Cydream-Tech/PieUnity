@@ -76,15 +76,260 @@ if(typeof URL==="undefined"){
   };
   globalThis.URL.prototype.toString=function(){return this.href;};
 }
-if(typeof Buffer==="undefined"){
-  globalThis.Buffer={
-    from:function(str,enc){if(typeof str==="string"){var s=enc==="utf-8"||enc==="utf8"||!enc?str:str;var n=0;for(var i=0;i<s.length;i++){var c=s.charCodeAt(i);if(c<0x80)n++;else if(c<0x800)n+=2;else if(c>=0xD800&&c<=0xDBFF&&i+1<s.length){n+=4;i++;}else n+=3;}return{length:n,toString:function(){return str;}};}return{length:str.length||0,toString:function(){return String(str);}};},
-    byteLength:function(str,enc){return Buffer.from(str,enc).length;},
-    isBuffer:function(obj){return false;},
-    concat:function(list){return{length:list.reduce(function(a,b){return a+(b.length||0);},0)};},
-    alloc:function(size){return{length:size};}
+"use strict";
+(() => {
+  // src/buffer-shim.ts
+  var alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  function encodingOf(value) {
+    if (value === void 0 || value === "") return "utf8";
+    switch (String(value).toLowerCase()) {
+      case "utf8":
+      case "utf-8":
+        return "utf8";
+      case "base64":
+        return "base64";
+      case "base64url":
+        return "base64url";
+      case "hex":
+        return "hex";
+      case "ascii":
+        return "ascii";
+      case "latin1":
+      case "binary":
+        return "latin1";
+      case "utf16le":
+      case "utf-16le":
+      case "ucs2":
+      case "ucs-2":
+        return "utf16le";
+      default:
+        throw new TypeError(`Unknown encoding: ${String(value)}`);
+    }
+  }
+  function encodeUtf8(text) {
+    const bytes = [];
+    for (let i = 0; i < text.length; i++) {
+      let code = text.charCodeAt(i);
+      if (code >= 55296 && code <= 56319) {
+        const low = text.charCodeAt(i + 1);
+        if (low >= 56320 && low <= 57343) {
+          code = 65536 + (code - 55296 << 10) + low - 56320;
+          i++;
+        } else code = 65533;
+      } else if (code >= 56320 && code <= 57343) code = 65533;
+      if (code < 128) bytes.push(code);
+      else if (code < 2048) bytes.push(192 | code >> 6, 128 | code & 63);
+      else if (code < 65536) bytes.push(224 | code >> 12, 128 | code >> 6 & 63, 128 | code & 63);
+      else bytes.push(240 | code >> 18, 128 | code >> 12 & 63, 128 | code >> 6 & 63, 128 | code & 63);
+    }
+    return bytes;
+  }
+  function decodeUtf8(bytes) {
+    let text = "";
+    for (let i = 0; i < bytes.length; ) {
+      const lead = bytes[i];
+      if (lead < 128) {
+        text += String.fromCharCode(lead);
+        i++;
+        continue;
+      }
+      if (lead < 194 || lead > 244) {
+        text += "\uFFFD";
+        i++;
+        continue;
+      }
+      const width = lead < 224 ? 2 : lead < 240 ? 3 : 4;
+      let code = lead & (width === 2 ? 31 : width === 3 ? 15 : 7);
+      let consumed = 1;
+      for (; consumed < width && i + consumed < bytes.length; consumed++) {
+        const byte = bytes[i + consumed];
+        const min = consumed === 1 && lead === 224 ? 160 : consumed === 1 && lead === 240 ? 144 : 128;
+        const max = consumed === 1 && lead === 237 ? 159 : consumed === 1 && lead === 244 ? 143 : 191;
+        if (byte < min || byte > max) break;
+        code = code << 6 | byte & 63;
+      }
+      text += consumed === width ? String.fromCodePoint(code) : "\uFFFD";
+      i += consumed;
+    }
+    return text;
+  }
+  function encode(text, encoding) {
+    if (encoding === "utf8") return encodeUtf8(text);
+    const bytes = [];
+    if (encoding === "base64" || encoding === "base64url" || encoding === "hex") {
+      text = text.replace(/[\u0100-\uffff]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) & 255));
+    }
+    if (encoding === "base64" || encoding === "base64url") {
+      const cleaned = text.split("=", 1)[0].replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+/]/g, "");
+      const decoded = new Uint8Array(checkedSize(Math.floor(cleaned.length * 6 / 8)));
+      let offset = 0;
+      let bits = 0;
+      let value = 0;
+      for (const ch of cleaned) {
+        value = value << 6 | alphabet.indexOf(ch);
+        bits += 6;
+        if (bits >= 8) {
+          bits -= 8;
+          decoded[offset++] = value >>> bits & 255;
+        }
+      }
+      return decoded;
+    } else if (encoding === "hex") {
+      for (let i = 0; i + 1 < text.length; i += 2) {
+        const pair = text.slice(i, i + 2);
+        if (!/^[0-9a-f]{2}$/i.test(pair)) break;
+        bytes.push(parseInt(pair, 16));
+      }
+    } else {
+      for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        bytes.push(code & 255);
+        if (encoding === "utf16le") bytes.push(code >>> 8);
+      }
+    }
+    return bytes;
+  }
+  function decode(bytes, encoding) {
+    if (encoding === "utf8") return decodeUtf8(bytes);
+    let text = "";
+    if (encoding === "base64" || encoding === "base64url") {
+      for (let i = 0; i < bytes.length; i += 3) {
+        const value = bytes[i] << 16 | (bytes[i + 1] ?? 0) << 8 | (bytes[i + 2] ?? 0);
+        text += alphabet[value >>> 18 & 63] + alphabet[value >>> 12 & 63] + (i + 1 < bytes.length ? alphabet[value >>> 6 & 63] : "=") + (i + 2 < bytes.length ? alphabet[value & 63] : "=");
+      }
+      return encoding === "base64url" ? text.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "") : text;
+    }
+    for (let i = 0; i < bytes.length; i++) {
+      if (encoding === "hex") text += bytes[i].toString(16).padStart(2, "0");
+      else if (encoding === "utf16le") {
+        if (i + 1 < bytes.length) text += String.fromCharCode(bytes[i] | bytes[++i] << 8);
+      } else text += String.fromCharCode(encoding === "ascii" ? bytes[i] & 127 : bytes[i]);
+    }
+    return text;
+  }
+  function isArrayBuffer(value) {
+    return value instanceof ArrayBuffer || Object.prototype.toString.call(value) === "[object ArrayBuffer]";
+  }
+  function isBytes(value) {
+    return ArrayBuffer.isView(value) && Object.prototype.toString.call(value) === "[object Uint8Array]";
+  }
+  function checkedSize(size) {
+    if (typeof size !== "number") throw new TypeError("Buffer size must be a number");
+    if (!Number.isFinite(size) || size < 0 || size > 2147483647) throw new RangeError("Buffer size is out of range");
+    return Math.trunc(size);
+  }
+  var UnityBuffer = class _UnityBuffer extends Uint8Array {
+    static from(value, encodingOrOffset, length) {
+      if (typeof value === "string") {
+        const encoded = encode(value, encodingOf(typeof encodingOrOffset === "string" ? encodingOrOffset : void 0));
+        checkedSize(encoded.length);
+        return encoded instanceof Uint8Array ? new _UnityBuffer(encoded.buffer, encoded.byteOffset, encoded.length) : new _UnityBuffer(encoded);
+      }
+      if (isArrayBuffer(value)) {
+        const offset = Number(encodingOrOffset) || 0;
+        if (!Number.isFinite(offset) || offset < 0 || offset > value.byteLength) throw new RangeError("Buffer offset is out of range");
+        const start = Math.trunc(offset);
+        const size = checkedSize(length === void 0 ? value.byteLength - start : Number(length) || 0);
+        if (start + size > value.byteLength) throw new RangeError("Buffer length is out of range");
+        return new _UnityBuffer(value, start, size);
+      }
+      if (value !== null && typeof value === "object") {
+        if ("type" in value && value.type === "Buffer" && "data" in value && Array.isArray(value.data)) {
+          return _UnityBuffer.from(value.data);
+        }
+        if ("length" in value || ArrayBuffer.isView(value)) {
+          const source = value;
+          const length2 = source.length;
+          if (typeof length2 !== "number" || Number.isNaN(length2)) return new _UnityBuffer(0);
+          const size = length2 <= 0 ? 0 : checkedSize(length2);
+          const result = new _UnityBuffer(size);
+          for (let i = 0; i < size; i++) result[i] = source[i];
+          return result;
+        }
+      }
+      throw new TypeError("Buffer.from expects a string, ArrayBuffer, or array-like value");
+    }
+    static isBuffer(value) {
+      return value instanceof _UnityBuffer;
+    }
+    static isEncoding(value) {
+      if (typeof value !== "string" || !value) return false;
+      try {
+        encodingOf(value);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    static byteLength(value, encoding) {
+      if (isArrayBuffer(value) || ArrayBuffer.isView(value)) return value.byteLength;
+      if (typeof value !== "string") throw new TypeError("Buffer.byteLength expects a string or bytes");
+      let normalized;
+      try {
+        normalized = encodingOf(encoding);
+      } catch {
+        normalized = "utf8";
+      }
+      if (normalized === "hex") return Math.floor(value.length / 2);
+      if (normalized === "base64" || normalized === "base64url") {
+        let length = value.length;
+        if (length && value[length - 1] === "=") length--;
+        if (length && value[length - 1] === "=") length--;
+        return Math.floor(length * 3 / 4);
+      }
+      if (normalized === "ascii" || normalized === "latin1") return value.length;
+      if (normalized === "utf16le") return value.length * 2;
+      return encodeUtf8(value).length;
+    }
+    static alloc(size, fill, encoding) {
+      const result = new _UnityBuffer(checkedSize(size));
+      if (typeof fill === "number") result.fill(fill);
+      else if (fill !== void 0 && result.length > 0) {
+        const pattern = typeof fill === "string" ? _UnityBuffer.from(fill, encoding) : fill;
+        if (!isBytes(pattern)) throw new TypeError("Buffer fill must be a number, string, or Uint8Array");
+        if (pattern.length === 0) {
+          if (fill === "") return result;
+          throw new TypeError("Buffer fill must not be empty");
+        }
+        for (let i = 0; i < result.length; i++) result[i] = pattern[i % pattern.length];
+      }
+      return result;
+    }
+    static concat(list, totalLength) {
+      if (!Array.isArray(list) || !list.every(isBytes)) throw new TypeError("Buffer.concat expects an array of Uint8Array values");
+      if (list.length === 0) return _UnityBuffer.alloc(0);
+      const size = checkedSize(totalLength === void 0 ? list.reduce((sum, bytes) => sum + bytes.length, 0) : totalLength);
+      if (totalLength !== void 0 && size !== totalLength) throw new RangeError("Buffer.concat length must be an integer");
+      const result = _UnityBuffer.alloc(size);
+      let offset = 0;
+      for (const bytes of list) {
+        const count = Math.min(bytes.length, result.length - offset);
+        result.set(bytes.subarray(0, count), offset);
+        offset += count;
+        if (offset === result.length) break;
+      }
+      return result;
+    }
+    subarray(start, end) {
+      return super.subarray(start, end);
+    }
+    // Node Buffer.slice is a VIEW, unlike Uint8Array.slice.
+    slice(start, end) {
+      return this.subarray(start, end);
+    }
+    toString(encoding, start = 0, end = this.length) {
+      const first = Math.min(this.length, Math.max(0, Math.trunc(start) || 0));
+      const last = Math.min(this.length, Math.max(0, Math.trunc(end) || 0));
+      if (last <= first) return "";
+      return decode(this.subarray(first, last), encodingOf(encoding));
+    }
+    toJSON() {
+      return { type: "Buffer", data: Array.from(this) };
+    }
   };
-}
+  var globals = globalThis;
+  if (globals.Buffer === void 0) globals.Buffer = UnityBuffer;
+})();
 if(typeof AbortController==="undefined"){
   globalThis.AbortSignal=function AbortSignal(){this.aborted=false;this.reason=undefined;this._listeners=[];this.onabort=null;};
   globalThis.AbortSignal.prototype.addEventListener=function(t,fn){if(t!=="abort"||typeof fn!=="function")return;if(this._listeners.indexOf(fn)>=0)return;this._listeners.push(fn);};
@@ -4752,6 +4997,9 @@ var _PieAgent = (() => {
     }
     return CS.System.IO;
   }
+  function looksLikeBase64(value) {
+    return value.length > 0 && value.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(value);
+  }
   function getPieFileBridge() {
     if (typeof CS === "undefined" || !CS?.Pie?.PieFileBridge) {
       throw new Error("CS.Pie.PieFileBridge not available - runtime file bridge is missing");
@@ -4900,11 +5148,15 @@ var _PieAgent = (() => {
       }
       if (encoding === "base64") {
         if (typeof bridge2.ReadAllBytesBase64Async === "function") {
-          const content3 = await taskToPromise(bridge2.ReadAllBytesBase64Async(normalizedPath));
-          return String(content3 ?? "");
+          const content2 = await taskToPromise(bridge2.ReadAllBytesBase64Async(normalizedPath));
+          if (typeof content2 === "string" && looksLikeBase64(content2)) {
+            return content2;
+          }
+          console.warn(
+            `[pie] async base64 file bridge returned an empty/invalid result for '${path3}'; falling back to a synchronous read.`
+          );
         }
-        const content2 = CS.System.Convert.ToBase64String(IO.File.ReadAllBytes(normalizedPath));
-        return String(content2 ?? "");
+        return this.readBinaryAsBase64Sync(normalizedPath);
       }
       const content = await taskToPromise(bridge2.ReadAllTextAsync(normalizedPath));
       return String(content ?? "");
@@ -4916,9 +5168,17 @@ var _PieAgent = (() => {
         throw new Error(`ENOENT: no such file or directory, open '${path3}'`);
       }
       if (encoding === "base64") {
-        return String(CS.System.Convert.ToBase64String(IO.File.ReadAllBytes(normalizedPath)) ?? "");
+        return this.readBinaryAsBase64Sync(normalizedPath);
       }
       return IO.File.ReadAllText(normalizedPath);
+    }
+    readBinaryAsBase64Sync(normalizedPath) {
+      const bridge2 = typeof CS !== "undefined" && CS?.Pie?.PieFileBridge ? CS.Pie.PieFileBridge : null;
+      if (bridge2 && typeof bridge2.ReadAllBytesBase64 === "function") {
+        return String(bridge2.ReadAllBytesBase64(normalizedPath) ?? "");
+      }
+      const IO = getSystemIO();
+      return String(CS.System.Convert.ToBase64String(IO.File.ReadAllBytes(normalizedPath)) ?? "");
     }
     async readFilePrefix(path3, maxBytes) {
       const IO = getSystemIO();
@@ -6340,19 +6600,10 @@ var _PieAgent = (() => {
           return;
         }
         if (CS.System.IO.File.Exists(destination)) {
-          const staged = `${destination}.pie-replace-${Date.now()}.tmp`;
-          CS.System.IO.File.Copy(source, staged, false);
-          CS.System.IO.File.Delete(destination);
-          try {
-            CS.System.IO.File.Move(staged, destination);
-          } catch (error) {
-            try {
-              CS.System.IO.File.Move(staged, destination);
-            } catch {
-            }
-            throw error;
+          if (typeof CS.System.IO.File.Replace !== "function") {
+            throw new Error("File.Replace is unavailable; refusing unsafe file replacement");
           }
-          CS.System.IO.File.Delete(source);
+          CS.System.IO.File.Replace(source, destination, null);
           return;
         }
         CS.System.IO.File.Move(source, destination);
@@ -12967,6 +13218,13 @@ ${delta}`;
     localRequestCounter += 1;
     return `${prefix}-${localRequestCounter}-${Math.random().toString(36).slice(2, 8)}`;
   }
+  function timeoutSuffix(budgetMs, lagMs) {
+    const budget = budgetMs && budgetMs > 0 ? ` (budget ${Math.round(budgetMs / 1e3)}s)` : "";
+    if (lagMs > 1e3) {
+      return `${budget} \u2014 timer fired ${Math.round(lagMs / 1e3)}s late (system sleep or suspended process)`;
+    }
+    return budget;
+  }
   function monotonicNow() {
     const perf = globalThis.performance;
     return typeof perf?.now === "function" ? perf.now() : Date.now();
@@ -13254,7 +13512,9 @@ ${delta}`;
           internalTimeout = adapterTimeoutKind === "first_byte" ? "first_response" : "stream_idle";
         }
         const protocolFailure = !endedWithoutTerminal && (error instanceof ResponsesProtocolError || error instanceof SyntaxError || !transportLost && error instanceof TypeError);
-        message.errorMessage = providerErrorMessage ?? (internalTimeout && !protocolFailure ? `Responses request timeout (${internalTimeout}) after ${Math.round(monotonicNow() - startedAt)}ms` : error instanceof Error ? error.message : JSON.stringify(error));
+        const adapterBudgetMs = internalTimeout === "first_response" ? budgets?.firstResponseTimeoutMs : internalTimeout === "stream_idle" ? budgets?.streamIdleTimeoutMs : void 0;
+        const adapterAgeMs = Math.round(monotonicNow() - startedAt);
+        message.errorMessage = providerErrorMessage ?? (internalTimeout && !protocolFailure ? `Responses request timeout (${internalTimeout}) after ${adapterAgeMs}ms${timeoutSuffix(adapterBudgetMs, 0)}` : error instanceof Error ? error.message : JSON.stringify(error));
         const compat = getResponsesCompat(model);
         const streamLost = (endedWithoutTerminal || transportLost) && !protocolFailure && !internalTimeout && submitted && !localFailure && !providerRejected && message.stopReason === "error";
         if (internalTimeout && !message.remoteFailure && !protocolFailure && submitted && !providerRejected && !localFailure && !userAborted && compat.timeoutReplay) {
@@ -13512,6 +13772,8 @@ ${delta}`;
       let terminalEvents = [];
       let fallback = false;
       let timedOut;
+      let timedOutBudgetMs;
+      let timedOutLagMs;
       let providerRejected = false;
       let localFailure = true;
       let transportLost = false;
@@ -13626,17 +13888,25 @@ ${delta}`;
           if (timer !== void 0) clearTimeout(timer);
         }
       };
+      let phaseTimerInfo;
       const armPhaseTimer = (kind, timeoutMs) => {
         if (requestTimer !== void 0) {
           clearTimeout(requestTimer);
           requestTimer = void 0;
         }
-        if (timeoutMs === void 0 || timeoutMs <= 0 || finished) return;
+        if (timeoutMs === void 0 || timeoutMs <= 0 || finished) {
+          phaseTimerInfo = void 0;
+          return;
+        }
         const generation = requestGeneration;
+        phaseTimerInfo = { kind, budgetMs: timeoutMs, armedAt: monotonicNow() };
         requestTimer = setTimeout(() => {
           requestTimer = void 0;
           if (generation !== requestGeneration || finished || requestAbort.signal.aborted) return;
+          const info = phaseTimerInfo;
           timedOut = kind;
+          timedOutBudgetMs = info?.budgetMs;
+          timedOutLagMs = info ? Math.max(0, monotonicNow() - info.armedAt - info.budgetMs) : 0;
           retryDecision = sent ? "not_retryable_after_submission" : "not_submitted";
           lifecycle("timeout", {
             timeoutKind: kind,
@@ -13827,7 +14097,7 @@ ${delta}`;
               armPhaseTimer("stream_idle", budgets.streamIdleTimeoutMs);
               if (receivedMessageCount === 1) lifecycle("first_application_message");
               if (state.abort.signal.aborted || requestAbort.signal.aborted) {
-                throw new Error(timedOut ? `Responses request timeout (${timedOut})` : "Request aborted");
+                throw new Error(timedOut ? `Responses request timeout (${timedOut})${timeoutSuffix(timedOutBudgetMs, timedOutLagMs ?? 0)}` : "Request aborted");
               }
               let events;
               try {
@@ -13911,7 +14181,7 @@ ${delta}`;
           message.stopReason = userAborted || ownerDisposed ? "aborted" : "error";
           if (userAborted || ownerDisposed) delete message.remoteFailure;
           const protocolFailure = !endedWithoutTerminal && (error instanceof ResponsesProtocolError || error instanceof SyntaxError || !transportLost && error instanceof TypeError || error instanceof WebSocketTransportError && (error.kind === "protocol" || error.kind === "overflow"));
-          const cause = providerRejected && error instanceof WebSocketTransportError ? `${error.message} (HTTP status ${error.status})` : timedOut && !protocolFailure ? `Responses request timeout (${timedOut}) after ${ageMs()}ms` : error instanceof Error ? error.message : String(error);
+          const cause = providerRejected && error instanceof WebSocketTransportError ? `${error.message} (HTTP status ${error.status})` : timedOut && !protocolFailure ? `Responses request timeout (${timedOut}) after ${ageMs()}ms${timeoutSuffix(timedOutBudgetMs, timedOutLagMs ?? 0)}` : error instanceof Error ? error.message : String(error);
           message.errorMessage = cause;
           const streamLost = (endedWithoutTerminal || transportLost) && !protocolFailure && !localFailure && sent && !timedOut && !providerRejected && message.stopReason === "error";
           if (timedOut && timedOut !== "connect" && !message.remoteFailure && !protocolFailure && !localFailure && sent && !providerRejected && !userAborted && !ownerDisposed && compat.timeoutReplay) {
@@ -17650,6 +17920,11 @@ ${delta}`;
           }
         }
         stream.push({ type: "turn_end", message, toolResults });
+        if (hasMoreToolCalls && config.beforeToolContinuation) {
+          const replacement = await config.beforeToolContinuation(signal);
+          if (signal?.aborted) throw new Error("Request was aborted");
+          if (replacement) currentContext.messages = replacement.slice();
+        }
         if (steeringAfterTools && steeringAfterTools.length > 0) {
           pendingMessages = steeringAfterTools;
           steeringAfterTools = null;
@@ -17912,7 +18187,22 @@ ${delta}`;
       return false;
     }
     const type = value.type;
-    return type === "text" || type === "image" || type === "audio" || type === "video" || type === "fileRef";
+    return type === "text" || type === "image" || type === "audio" || type === "video" || type === "fileRef" || type === "hostContext";
+  }
+  async function awaitToolContinuation(handler, signal) {
+    let onAbort;
+    const cancelled = new Promise((_resolve, reject) => {
+      onAbort = () => reject(new Error("Request was aborted"));
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([Promise.resolve().then(() => {
+        if (signal.aborted) throw new Error("Request was aborted");
+        return handler(signal);
+      }), cancelled]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
   var Agent = class {
     _state;
@@ -17935,6 +18225,7 @@ ${delta}`;
     _thinkingBudgets;
     _maxRetryDelayMs;
     hooks;
+    beforeToolContinuation;
     /** Stable identity for this agent instance, bound onto every run signal
      *  handed to tools (signals themselves are per-run; see tool-caller-identity.ts). */
     toolCallerIdentity = createToolCallerIdentity();
@@ -18027,6 +18318,15 @@ ${delta}`;
     setHooks(hooks) {
       this.hooks = hooks;
     }
+    /** Single session-policy owner. Runs after the complete tool turn has been
+     * published to observers; replaceMessages here also updates the active loop.
+     * Removal does not detach a callback already captured by an active run. */
+    setBeforeToolContinuation(handler) {
+      this.beforeToolContinuation = handler;
+      return () => {
+        if (this.beforeToolContinuation === handler) this.beforeToolContinuation = void 0;
+      };
+    }
     replaceMessages(ms) {
       this.releaseTransport();
       this._state.messages = ms.slice();
@@ -18116,6 +18416,7 @@ ${delta}`;
       this._state.error = void 0;
       this.steeringQueue = [];
       this.followUpQueue = [];
+      this.resolveRunningPrompt?.();
       this.runningPrompt = void 0;
       this.resolveRunningPrompt = void 0;
       this.updateStatusSnapshot({
@@ -18138,6 +18439,7 @@ ${delta}`;
       this._state.error = void 0;
       this.steeringQueue = [];
       this.followUpQueue = [];
+      this.resolveRunningPrompt?.();
       this.runningPrompt = void 0;
       this.resolveRunningPrompt = void 0;
       this.abortController = void 0;
@@ -18252,6 +18554,8 @@ ${delta}`;
         tools: this._state.tools
       };
       let skipInitialSteeringPoll = options?.skipInitialSteeringPoll === true;
+      const beforeToolContinuation = this.beforeToolContinuation;
+      let acknowledgeToolTurn;
       const config = {
         model,
         reasoning,
@@ -18262,6 +18566,16 @@ ${delta}`;
         maxRetryDelayMs: this._maxRetryDelayMs,
         convertToLlm: this.convertToLlm,
         transformContext: this.transformContext,
+        beforeToolContinuation: beforeToolContinuation ? async () => {
+          await new Promise((resolve2) => {
+            acknowledgeToolTurn = resolve2;
+          });
+          acknowledgeToolTurn = void 0;
+          if (!ownsRun() || runController.signal.aborted) throw new Error("Request was aborted");
+          await awaitToolContinuation(beforeToolContinuation, runController.signal);
+          if (!ownsRun() || runController.signal.aborted) throw new Error("Request was aborted");
+          return this._state.messages.slice();
+        } : void 0,
         getApiKey: this.getApiKey,
         hooks: this.hooks,
         getSteeringMessages: async () => {
@@ -18323,6 +18637,7 @@ ${delta}`;
               break;
           }
           this.emit(event, ownsRun);
+          if (event.type === "turn_end") acknowledgeToolTurn?.();
         }
         if (ownsRun() && partial && partial.role === "assistant" && partial.content?.length > 0) {
           const onlyEmpty = !partial.content.some(
@@ -18357,6 +18672,7 @@ ${delta}`;
         this._state.error = err?.message || String(err);
         this.emit({ type: "agent_end", messages: [errorMsg] }, ownsRun);
       } finally {
+        acknowledgeToolTurn?.();
         if (ownsRun()) {
           this._state.isStreaming = false;
           this._state.streamMessage = null;
@@ -18893,7 +19209,9 @@ Preserve concrete identifiers, paths, exact test results, unresolved failures, a
     summaryPrefix: SUMMARY_PREFIX
   };
   var APPROX_BYTES_PER_TOKEN = 4;
-  var RESIZED_IMAGE_BYTES_ESTIMATE = 7373;
+  var IMAGE_MEDIA_BYTES_ESTIMATE = 7373;
+  var AUDIO_MEDIA_BYTES_ESTIMATE = 6800;
+  var VIDEO_MEDIA_BYTES_ESTIMATE = 16e3;
   function estimateTokens(message) {
     return approximateBytesAsTokens(estimateModelVisibleBytes(message));
   }
@@ -18927,20 +19245,16 @@ ${compactSummary}`;
     if (boundaries.length === 0) {
       return nonePlan("no-boundary");
     }
-    const prefix = new Array(summaries.length + 1).fill(0);
-    for (let i2 = 0; i2 < summaries.length; i2++) {
-      prefix[i2 + 1] = prefix[i2] + Math.max(0, Math.floor(summaries[i2].estTokens || 0));
-    }
     const groupEnd = boundaries.map((_, index) => boundaries[index + 1] ?? summaries.length);
     const planFrom = (startIndex, reason) => ({
       retainedTail: { kind: "from-entry", entryId: summaries[startIndex].id },
       entryIds: summaries.slice(startIndex).map((summary2) => summary2.id),
-      tailTokens: prefix[summaries.length] - prefix[startIndex],
+      tailTokens: estimateRetainedTailTokens(summaries, { kind: "from-entry", entryId: summaries[startIndex].id }),
       reason
     });
     let accumulated = 0;
     for (let k = boundaries.length - 1; k >= 0; k--) {
-      const groupTokens = prefix[groupEnd[k]] - prefix[boundaries[k]];
+      const groupTokens = summaries.slice(boundaries[k], groupEnd[k]).reduce((sum, summary2) => sum + Math.max(0, Math.floor(summary2.estTokens || 0)), 0);
       if (groupTokens > budget) {
         if (accumulated === 0) {
           return nonePlan("single-group-over-budget");
@@ -19016,6 +19330,9 @@ ${compactSummary}`;
     const tokensBefore = Math.max(0, params.tokensBefore);
     const tokenSavings = Math.max(0, tokensBefore - projectedTokens);
     const estimate = { summaryTokens, tailTokens, projectedTokens, tokenSavings };
+    if (!Number.isFinite(projectedTokens)) {
+      return { ...estimate, ok: false, reason: "retained context has unknown model-visible size; supply a compaction modelView" };
+    }
     if (params.budgetTokens !== void 0 && params.budgetTokens > 0 && projectedTokens > params.budgetTokens) {
       return {
         ...estimate,
@@ -19123,7 +19440,7 @@ ${compactSummary}`;
       return { type: "text", text: block.text };
     }
     if (block.type === "hostContext") {
-      return { type: "text", text: "x".repeat(512) };
+      return { type: "hostContext" };
     }
     if (block.type === "image") {
       return { type: "image", mimeType: block.mimeType };
@@ -19155,21 +19472,15 @@ ${compactSummary}`;
   }
   function estimateUserContentBlockMediaBytes(block) {
     if (block.type === "image") {
-      return estimateImageContentBytes(block);
+      return IMAGE_MEDIA_BYTES_ESTIMATE;
     }
     if (block.type === "audio") {
-      return estimateInlineDataBytes(block);
+      return AUDIO_MEDIA_BYTES_ESTIMATE;
     }
     if (block.type === "video") {
-      return estimateInlineDataBytes(block);
+      return VIDEO_MEDIA_BYTES_ESTIMATE;
     }
     return 0;
-  }
-  function estimateImageContentBytes(block) {
-    return Math.max(RESIZED_IMAGE_BYTES_ESTIMATE, estimateInlineDataBytes(block));
-  }
-  function estimateInlineDataBytes(block) {
-    return utf8ByteLength(block.data || "");
   }
   function approximateBytesAsTokens(bytes) {
     return Math.ceil(bytes / APPROX_BYTES_PER_TOKEN);
@@ -21768,10 +22079,26 @@ ${summary2}`;
     const agentOnlyFailure = excludedFailure === null && requireExclusion ? agentTail ?? null : null;
     const summaries = sessionManager.getActiveContextSummaries();
     const entries = sessionManager.getResidentContextEntries();
-    const effectiveSummaries = excludedFailure ? summaries.filter((summary2) => summary2.id !== excludedFailure.entryId) : summaries;
+    const sourceSummaries = excludedFailure ? summaries.filter((summary2) => summary2.id !== excludedFailure.entryId) : summaries;
     const effectiveEntries = excludedFailure ? entries.filter((entry) => entry.id !== excludedFailure.entryId) : entries;
     const summaryInput = excludedFailure || agentOnlyFailure ? messages.slice(0, -1) : messages;
-    const inputTokens = calculateTotalTokens(summaryInput);
+    const estimates = /* @__PURE__ */ new Map();
+    const estimate = (message) => {
+      const cached = estimates.get(message);
+      if (cached !== void 0) return cached;
+      const visible = params.modelView ? params.modelView(message) : message;
+      const unknown = visible.role === "user" && Array.isArray(visible.content) && visible.content.some((block) => block.type === "hostContext");
+      const tokens = unknown ? Infinity : estimateTokens(visible);
+      estimates.set(message, tokens);
+      return tokens;
+    };
+    const bodies = new Map(effectiveEntries.map((entry) => [entry.id, entry]));
+    const effectiveSummaries = sourceSummaries.map((summary2) => {
+      const entry = bodies.get(summary2.id);
+      return { ...summary2, estTokens: entry?.message ? estimate(entry.message) : summary2.type === "message" ? Infinity : summary2.estTokens };
+    });
+    const inputEstimate = summaryInput.reduce((sum, message) => sum + estimate(message), 0);
+    const inputTokens = Number.isFinite(inputEstimate) ? inputEstimate : calculateTotalTokens(summaryInput);
     const reductionLimit = inputTokens >= 1e3 ? inputTokens - Math.ceil(inputTokens * 0.1) : Infinity;
     const contextLimit = Math.min(
       reductionLimit,
@@ -21785,7 +22112,7 @@ ${summary2}`;
     let planned = planRetainedTail(effectiveSummaries, { ...params.compactionConfig, keepRecentTokens: tailBudget });
     if (planned.retainedTail.kind !== "none") {
       const validation = validateRetainedTailEntries({ entries: effectiveEntries, retainedTail: planned.retainedTail });
-      planned = validation.ok ? { ...planned, entryIds: validation.entryIds, tailTokens: validation.tailTokens } : { retainedTail: { kind: "none" }, entryIds: [], tailTokens: 0, reason: "pairing" };
+      planned = validation.ok ? { ...planned, entryIds: validation.entryIds, tailTokens: estimateRetainedTailTokens(effectiveSummaries, planned.retainedTail) } : { retainedTail: { kind: "none" }, entryIds: [], tailTokens: 0, reason: "pairing" };
     }
     return {
       sessionId: sessionManager.getActiveSessionId(),
@@ -21841,7 +22168,7 @@ ${summary2}`;
     const gain = estimateCompactionGain({
       summary: checkpointSummary,
       tailTokens: estimateRetainedTailTokens(params.preparation.summaries, retainedTail),
-      tokensBefore: params.result.tokensBefore ?? params.preparation.inputTokens,
+      tokensBefore: params.preparation.inputTokens,
       budgetTokens: params.preparation.budgetTokens
     });
     if (!gain.ok) {
@@ -22321,7 +22648,13 @@ ${summary2}`;
 
   // ../../packages/agent-framework/src/session/controller/pre-request-policy.ts
   async function runPreRequestAutoCompact(params) {
-    if (params.disposed || params.runtimeGuardTriggered || params.isStreaming || params.recoveryActive || params.agent.state.messages.length === 0) {
+    const boundary = params.toolContinuation;
+    const cancelled = () => params.isCurrent?.() === false || boundary?.signal.aborted === true;
+    if (boundary) {
+      await boundary.sync();
+      if (cancelled()) return;
+    }
+    if (params.disposed || params.runtimeGuardTriggered || params.isStreaming && !boundary || params.recoveryActive() || params.agent.state.messages.length === 0) {
       return;
     }
     const decision = params.getAutoCompactDecision?.({
@@ -22330,12 +22663,13 @@ ${summary2}`;
       cwd: params.cwd,
       messages: params.agent.state.messages.slice()
     });
-    if (decision?.reason !== "threshold") {
+    if (cancelled() || decision?.reason !== "threshold") {
       return;
     }
     try {
       await params.runAutoCompact();
-    } catch {
+    } catch (error) {
+      if (boundary) throw error;
       if (params.isCurrent?.() !== false) params.setRecoveryState("none");
     }
   }
@@ -22589,12 +22923,7 @@ ${summary2}`;
         return false;
       }
       this.options.emit({ type: "queued_turn_dispatched", queuedInput: cloneQueuedInput(dispatched) });
-      if (dispatched.deliveredToAgent || this.options.agent.state.messages.at(-1)?.role === "assistant") {
-        if (!dispatched.deliveredToAgent) {
-          this.options.queue.deliverToAgent(dispatched);
-        }
-        await this.options.continueTurn();
-      } else {
+      if (!dispatched.deliveredToAgent) {
         const prepared = await this.options.preparePromptMessages(dispatched.messages, {
           source: dispatched.source,
           streamingBehavior: dispatched.mode,
@@ -22604,13 +22933,20 @@ ${summary2}`;
           visibility: dispatched.visibility
         });
         if (generation !== this.generation) return false;
-        if (!prepared.handled) {
-          if (prepared.systemPrompt !== void 0) {
-            this.options.agent.setSystemPrompt(prepared.systemPrompt);
-          }
-          await this.options.agent.prompt(prepared.messages);
-          await this.options.syncNewAgentMessages();
+        if (prepared.handled) return true;
+        if (prepared.systemPrompt !== void 0) {
+          this.options.agent.setSystemPrompt(prepared.systemPrompt);
         }
+        dispatched.messages = prepared.messages;
+      }
+      if (dispatched.deliveredToAgent || this.options.agent.state.messages.at(-1)?.role === "assistant") {
+        if (!dispatched.deliveredToAgent) {
+          this.options.queue.deliverToAgent(dispatched);
+        }
+        await this.options.continueTurn();
+      } else {
+        await this.options.agent.prompt(dispatched.messages);
+        await this.options.syncNewAgentMessages();
       }
       return true;
     }
@@ -22731,6 +23067,95 @@ ${summary2}`;
     }
   };
 
+  // ../../packages/agent-framework/src/session/controller/retry-decision.ts
+  function getAgentSessionRetryLimit(retry, failure2) {
+    return Math.min(
+      (failure2 !== void 0 ? retry?.maxRetriesForFailure?.(failure2) : void 0) ?? retry?.maxRetries ?? 3,
+      failure2?.kind === "provider_confirmation" ? 1 : Infinity
+    );
+  }
+  var AgentSessionRetryEpisode = class {
+    constructor(retry) {
+      this.retry = retry;
+      this.replayCircuit = new ReplayStallCircuit(retry?.systemicReplayStallLimit);
+    }
+    retry;
+    retryAttempts = /* @__PURE__ */ new Map();
+    total = 0;
+    replayCircuit;
+    get totalRetryAttempts() {
+      return this.total;
+    }
+    /** A healthy response ends the current episode and proves endpoint liveness. */
+    succeed() {
+      this.replayCircuit.recordHealthyTurn();
+      const attempts = this.total;
+      this.resetAttempts();
+      return attempts;
+    }
+    /** Cancellation/invalidation resets counters, never the endpoint-health circuit. */
+    resetAttempts() {
+      this.retryAttempts.clear();
+      this.total = 0;
+    }
+    next(failure2) {
+      if (!this.retry || !failure2.retryable) {
+        if (failure2.kind !== "unknown" && failure2.kind !== "internal_error") {
+          this.replayCircuit.recordHealthyTurn();
+        }
+        const totalRetryAttempts2 = this.total;
+        this.resetAttempts();
+        return { action: "terminal", failure: failure2, totalRetryAttempts: totalRetryAttempts2 };
+      }
+      if (failure2.replayExempt === true && this.replayCircuit.isOpen) {
+        const openFailure = asTerminalFailure(
+          failure2,
+          `${failure2.message} (replay circuit open: ${this.replayCircuit.consecutiveTurnStalls} consecutive turns ended by timeout-replay exhaustion)`
+        );
+        const totalRetryAttempts2 = this.total;
+        this.resetAttempts();
+        return { action: "exhausted", failure: openFailure, maxRetries: 0, totalRetryAttempts: totalRetryAttempts2, reason: "circuit_open" };
+      }
+      const maxRetries = getAgentSessionRetryLimit(this.retry, failure2);
+      const kindAttempts = (this.retryAttempts.get(failure2.kind) ?? 0) + 1;
+      this.retryAttempts.set(failure2.kind, kindAttempts);
+      this.total += 1;
+      const totalRetryAttempts = this.total;
+      const totalBudget = this.retry.maxTotalRetries;
+      const kindExhausted = kindAttempts > maxRetries;
+      const totalExhausted = totalBudget !== void 0 && totalRetryAttempts > totalBudget;
+      const delayMs = resolveRetryDelay(
+        (this.retry.baseDelayMs ?? 2e3) * 2 ** (kindAttempts - 1),
+        this.retry.maxDelayMs,
+        failure2.retryAfterMs
+      );
+      if (kindExhausted || totalExhausted || delayMs === void 0) {
+        const terminalFailure = asTerminalFailure(
+          failure2,
+          delayMs === void 0 ? `${failure2.message} (Retry-After exceeds the allowed wait; automatic recovery paused)` : failure2.message
+        );
+        const circuit = failure2.replayExempt === true ? this.replayCircuit.recordReplayExhaustion() : void 0;
+        this.resetAttempts();
+        return {
+          action: "exhausted",
+          failure: terminalFailure,
+          maxRetries: totalExhausted ? totalBudget : maxRetries,
+          totalRetryAttempts,
+          reason: delayMs === void 0 ? "retry_after" : totalExhausted ? "total_budget" : "kind_budget",
+          ...circuit ? { circuit } : {}
+        };
+      }
+      return {
+        action: "retry",
+        failure: failure2,
+        attempt: kindAttempts,
+        maxRetries,
+        delayMs,
+        totalRetryAttempts
+      };
+    }
+  };
+
   // ../../packages/agent-framework/src/session/controller/retry-policy.ts
   function defaultSetTimeout4(callback, delay) {
     return setTimeout(callback, delay);
@@ -22745,21 +23170,14 @@ ${summary2}`;
       this.removeTrailingAssistantError = removeTrailingAssistantError2;
       this.continueTurn = continueTurn;
       this.setRecoveryState = setRecoveryState;
-      this.replayCircuit = new ReplayStallCircuit(retry?.systemicReplayStallLimit);
+      this.episode = new AgentSessionRetryEpisode(retry);
     }
     retry;
     emit;
     removeTrailingAssistantError;
     continueTurn;
     setRecoveryState;
-    /** Attempts consumed per failure KIND: budgets are granted per kind (a
-     *  10-attempt network budget must not be eaten by interleaved provider
-     *  errors, and vice versa), so each kind counts its own attempts. */
-    retryAttempts = /* @__PURE__ */ new Map();
-    /** Total attempts across kinds in this recovery episode, for reporting. */
-    totalRetryAttempts = 0;
-    /** L2 systemic-stall circuit (see replay-stall-circuit.ts). */
-    replayCircuit;
+    episode;
     retryTimer;
     retryEpoch = 0;
     pendingRetry;
@@ -22773,72 +23191,45 @@ ${summary2}`;
     waitForRetry() {
       return this.pendingRetry ?? Promise.resolve();
     }
-    /** L2 circuit: healthy turn (success or an actively-answered failure). */
-    noteEndpointHealthy() {
-      this.replayCircuit.recordHealthyTurn();
-    }
     async handleTurnEnd(message, failure2) {
       if (!this.retry || !message || message.role !== "assistant") {
         this.settleStrandedRetry(failure2);
         return;
       }
       if (!failure2) {
-        this.noteEndpointHealthy();
-        if (this.totalRetryAttempts > 0) {
-          this.emit({ type: "retry_succeeded", attempts: this.totalRetryAttempts });
-          this.emit({ type: "turn_retry_succeeded", attempts: this.totalRetryAttempts });
-          this.resetAttempts();
+        const attempts = this.episode.succeed();
+        if (attempts > 0) {
+          this.emit({ type: "retry_succeeded", attempts });
+          this.emit({ type: "turn_retry_succeeded", attempts });
           this.setRecoveryState("none");
           this.resolvePending();
         }
         return;
       }
-      if (!failure2.retryable) {
-        if (failure2.kind !== "unknown" && failure2.kind !== "internal_error") {
-          this.noteEndpointHealthy();
-        }
-        if (this.totalRetryAttempts > 0) {
-          this.resetAttempts();
+      const decision = this.episode.next(failure2);
+      if (decision.action === "terminal") {
+        if (decision.totalRetryAttempts > 0) {
           this.setRecoveryState("none");
           this.resolvePending();
         }
         return;
       }
-      if (failure2.replayExempt === true && this.replayCircuit.isOpen) {
-        const openFailure = asTerminalFailure(failure2, `${failure2.message} (replay circuit open: ${this.replayCircuit.consecutiveTurnStalls} consecutive turns ended by timeout-replay exhaustion)`);
-        this.emit({ type: "retry_exhausted", errorMessage: openFailure.message, maxRetries: 0 });
-        this.emit({ type: "turn_failed_terminal", failure: openFailure, message });
-        this.emit({ type: "turn_settled" });
-        this.resetAttempts();
-        this.setRecoveryState("terminal");
-        this.resolvePending();
-        return;
-      }
-      const maxRetries = Math.min(this.retry.maxRetriesForFailure?.(failure2) ?? this.retry.maxRetries ?? 3, failure2.kind === "provider_confirmation" ? 1 : Infinity);
-      const kindAttempts = (this.retryAttempts.get(failure2.kind) ?? 0) + 1;
-      this.retryAttempts.set(failure2.kind, kindAttempts);
-      this.totalRetryAttempts += 1;
-      const totalBudget = this.retry.maxTotalRetries;
-      const kindExhausted = kindAttempts > maxRetries;
-      const totalExhausted = totalBudget !== void 0 && this.totalRetryAttempts > totalBudget;
-      const delayMs = resolveRetryDelay((this.retry.baseDelayMs ?? 2e3) * 2 ** (kindAttempts - 1), this.retry.maxDelayMs, failure2.retryAfterMs);
-      if (kindExhausted || totalExhausted || delayMs === void 0) {
-        const terminalFailure = asTerminalFailure(failure2, delayMs === void 0 ? `${failure2.message} (Retry-After exceeds the allowed wait; automatic recovery paused)` : failure2.message);
-        if (failure2.replayExempt === true) {
-          const outcome = this.replayCircuit.recordReplayExhaustion();
-          if (outcome.opened) {
-            this.emit({ type: "retry_exhausted", errorMessage: `systemic timeout-stall: ${outcome.consecutive} consecutive turns ended by timeout-replay exhaustion`, maxRetries: totalExhausted ? totalBudget : maxRetries });
-          }
+      if (decision.action === "exhausted") {
+        if (decision.circuit?.opened) {
+          this.emit({
+            type: "retry_exhausted",
+            errorMessage: `systemic timeout-stall: ${decision.circuit.consecutive} consecutive turns ended by timeout-replay exhaustion`,
+            maxRetries: decision.maxRetries
+          });
         }
-        this.emit({ type: "retry_exhausted", errorMessage: terminalFailure.message, maxRetries: totalExhausted ? totalBudget : maxRetries });
-        this.emit({ type: "turn_failed_terminal", failure: terminalFailure, message });
+        this.emit({ type: "retry_exhausted", errorMessage: decision.failure.message, maxRetries: decision.maxRetries });
+        this.emit({ type: "turn_failed_terminal", failure: decision.failure, message });
         this.emit({ type: "turn_settled" });
-        this.resetAttempts();
         this.setRecoveryState("terminal");
         this.resolvePending();
         return;
       }
-      const attempt = kindAttempts;
+      const { attempt, maxRetries, delayMs } = decision;
       this.ensurePending();
       const epoch = this.retryEpoch;
       const pending = this.pendingRetry;
@@ -22865,7 +23256,7 @@ ${summary2}`;
           this.emit({ type: "retry_exhausted", errorMessage, maxRetries });
           this.emit({ type: "turn_failed_terminal", failure: terminalFailure, message });
           this.emit({ type: "turn_settled" });
-          this.resetAttempts();
+          this.episode.resetAttempts();
           this.setRecoveryState("terminal");
           this.resolvePending(pending);
         });
@@ -22890,23 +23281,19 @@ ${summary2}`;
         userAbort: false,
         terminal: true
       });
-      const maxRetries = Math.min((failure2 !== void 0 ? this.retry?.maxRetriesForFailure?.(failure2) : void 0) ?? this.retry?.maxRetries ?? 3, failure2?.kind === "provider_confirmation" ? 1 : Infinity);
+      const maxRetries = getAgentSessionRetryLimit(this.retry, failure2);
       this.emit({ type: "retry_exhausted", errorMessage: terminalFailure.message, maxRetries });
       this.emit({ type: "turn_failed_terminal", failure: terminalFailure });
       this.emit({ type: "turn_settled" });
-      this.resetAttempts();
+      this.episode.resetAttempts();
       this.setRecoveryState("terminal");
       this.resolvePending();
     }
     cancel() {
       this.retryEpoch++;
       this.cancelTimerOnly();
-      this.resetAttempts();
+      this.episode.resetAttempts();
       this.resolvePending();
-    }
-    resetAttempts() {
-      this.retryAttempts.clear();
-      this.totalRetryAttempts = 0;
     }
     cancelTimerOnly() {
       if (this.retryTimer === void 0) {
@@ -23246,7 +23633,8 @@ ${summary2}`;
       const preparation = prepareSessionCompaction({
         sessionManager: params.sessionManager,
         messages: params.agent.state.messages,
-        budgetTokens: params.compactionBudgetTokens?.()
+        budgetTokens: params.compactionBudgetTokens?.(),
+        modelView: params.compaction.modelView
       });
       let result = await params.compaction.compact({
         reason: params.reason,
@@ -23525,6 +23913,8 @@ ${summary2}`;
     autoContinue;
     unsubscribeAgent;
     unsubscribeSemantic;
+    unsubscribeToolContinuation;
+    compactionOwner;
     lastSyncedMessageCount = 0;
     disposed = false;
     transitioning = false;
@@ -23628,6 +24018,7 @@ ${summary2}`;
       });
       this.syncFromActiveSession();
       this.unsubscribeAgent = this.agent.subscribe((event) => this.handleAgentEvent(event));
+      this.unsubscribeToolContinuation = this.agent.setBeforeToolContinuation((signal) => this.runPreRequestAutoCompactIfNeeded(signal));
       this.unsubscribeSemantic = this.agent.subscribeSemantic((event) => {
         this.emit({ type: "semantic_event", event });
       });
@@ -23678,6 +24069,7 @@ ${summary2}`;
       this.transitioning = true;
       try {
         this.generation++;
+        if (this.isStreaming) this.agent.resetProcessingState();
         this.cancelScheduledWork();
         this.recoveryState = "none";
         this.pendingCompactionFailure = void 0;
@@ -23809,48 +24201,61 @@ ${summary2}`;
       const generation = this.generation;
       if (this.disposed || this.transitioning) throw new Error("Controller disposed or transitioning");
       const isCurrent = () => generation === this.generation && !this.disposed;
-      return this.convergence.run(() => runAgentSessionControllerAutoCompact({
-        isCurrent,
-        reason,
-        willRetry,
-        signal: options?.signal,
-        compaction: this.compaction,
-        agent: this.agent,
-        sessionManager: this.sessionManager,
-        cwd: this.cwd,
-        pendingFailure: this.pendingCompactionFailure,
-        emit: (event) => {
-          if (isCurrent()) this.emit(event);
-        },
-        setRecoveryState: (state) => {
-          this.recoveryState = state;
-        },
-        getRecoveryState: () => this.recoveryState,
-        getDisposed: () => this.disposed,
-        cancelRetry: () => this.retryController.cancel(),
-        clearPendingFailure: () => {
-          this.pendingCompactionFailure = void 0;
-        },
-        getCompactionBudgetTokens: this.compactionSettings.getCompactionBudgetTokens,
-        removeTrailingAssistantError: () => this.removeTrailingAssistantError(),
-        replaceMessagesAndMarkSynced: (messages) => this.replaceMessagesAndMarkSynced(messages),
-        markSyncedToAgentState: () => this.markSyncedToAgentState(),
-        continueTurn: () => this.continue(),
-        handleAgentEndHook: (messages) => this.handleAgentEndHook(messages),
-        emitSettled: options?.emitSettled,
-        runAfterAgentEndHook: options?.runAfterAgentEndHook,
-        cancelOnAbort: options?.cancelOnAbort
-      }));
+      if (this.compactionOwner) throw new Error("Compaction already running");
+      const owner = this.compactionOwner = {};
+      try {
+        return await this.convergence.run(() => runAgentSessionControllerAutoCompact({
+          isCurrent,
+          reason,
+          willRetry,
+          signal: options?.signal,
+          compaction: this.compaction,
+          agent: this.agent,
+          sessionManager: this.sessionManager,
+          cwd: this.cwd,
+          pendingFailure: this.pendingCompactionFailure,
+          emit: (event) => {
+            if (isCurrent()) this.emit(event);
+          },
+          setRecoveryState: (state) => {
+            this.recoveryState = state;
+          },
+          getRecoveryState: () => this.recoveryState,
+          getDisposed: () => this.disposed,
+          cancelRetry: () => this.retryController.cancel(),
+          clearPendingFailure: () => {
+            this.pendingCompactionFailure = void 0;
+          },
+          getCompactionBudgetTokens: this.compactionSettings.getCompactionBudgetTokens,
+          removeTrailingAssistantError: () => this.removeTrailingAssistantError(),
+          replaceMessagesAndMarkSynced: (messages) => this.replaceMessagesAndMarkSynced(messages),
+          markSyncedToAgentState: () => this.markSyncedToAgentState(),
+          continueTurn: async () => {
+            if (!isCurrent() || options?.signal?.aborted) return;
+            if (this.compactionOwner === owner) this.compactionOwner = void 0;
+            this.recoveryState = "none";
+            await this.continue();
+          },
+          handleAgentEndHook: (messages) => this.handleAgentEndHook(messages),
+          emitSettled: options?.emitSettled,
+          runAfterAgentEndHook: options?.runAfterAgentEndHook,
+          cancelOnAbort: options?.cancelOnAbort
+        }));
+      } finally {
+        if (this.compactionOwner === owner) this.compactionOwner = void 0;
+      }
     }
     dispose() {
       if (this.disposed) return;
       this.disposed = true;
+      if (this.isStreaming) this.agent.resetProcessingState();
       this.agent.releaseTransport?.();
       this.generation++;
       this.pendingEndOperations.clear();
       this.cancelScheduledWork();
       this.unsubscribeAgent?.();
       this.unsubscribeSemantic?.();
+      this.unsubscribeToolContinuation?.();
       this.queue.clear();
       this.convergence.invalidate("dispose");
       this.listeners.clear();
@@ -23874,19 +24279,26 @@ ${summary2}`;
         });
       }
     }
-    async runPreRequestAutoCompactIfNeeded() {
+    async runPreRequestAutoCompactIfNeeded(signal) {
       const generation = this.generation;
       return runPreRequestAutoCompact({
         isCurrent: () => generation === this.generation && !this.disposed,
         disposed: this.disposed,
         runtimeGuardTriggered: this.runtimeGuard.triggered,
         isStreaming: this.isStreaming,
-        recoveryActive: this.isRecoveryActive(),
+        recoveryActive: () => this.isRecoveryActive(),
         agent: this.agent,
         sessionManager: this.sessionManager,
         cwd: this.cwd,
         getAutoCompactDecision: this.compactionSettings.getAutoCompactDecision,
-        runAutoCompact: () => this.runAutoCompact("threshold", false, { emitSettled: false, runAfterAgentEndHook: false, cancelOnAbort: false }).then(() => void 0),
+        toolContinuation: signal ? { signal, sync: async () => {
+          await this.pendingEndOperations.wait();
+          if (generation === this.generation && !this.disposed && !signal.aborted) await this.syncNewAgentMessages();
+        } } : void 0,
+        runAutoCompact: async () => {
+          const result = await this.runAutoCompact("threshold", false, { signal, emitSettled: false, runAfterAgentEndHook: false, cancelOnAbort: false });
+          if (signal && (!result || result.aborted)) throw new Error("Tool-continuation compaction was aborted");
+        },
         setRecoveryState: (state) => {
           this.recoveryState = state;
         }
@@ -24031,6 +24443,7 @@ ${summary2}`;
       return this.recoveryState !== "none" || this.retryController.hasPendingRetry || this.autoCompact.hasPendingAutoCompact;
     }
     cancelScheduledWork() {
+      this.compactionOwner = void 0;
       this.retryController.cancel();
       this.autoCompact.cancel();
       this.queueDispatcher.cancel();
@@ -25819,7 +26232,7 @@ ${summary2}`;
   ].map((name) => name.toLowerCase()));
   var PLAN_POWERSHELL_READ_ALIASES = /* @__PURE__ */ new Set(["cat", "ls", "pwd", "echo", "sort"]);
   var PLAN_POWERSHELL_SAFE_PARAMETERS = /^(?:-(?:Raw|TotalCount|Head|Tail|First|Last|Wait|LiteralPath|Path|Name|Pattern|Recurse|Filter|Include|Exclude|SimpleMatch|CaseSensitive|Quiet|Word|Line|Character|Encoding|ErrorAction|WarningAction))$/i;
-  var PLAN_POWERSHELL_SEPARATORS = /[;\n\r\t]|[<>]{1,2}|\||&&|\|\|/;
+  var PLAN_POWERSHELL_SEPARATORS = /[;\n\r\t&<>|]/;
   var PLAN_POWERSHELL_NON_ASCII = /[^\x20-\x7E]/;
   var PLAN_POWERSHELL_UNSAFE_TOKENS = /\$\(|`|%\{|[(){}\[\]]|\bsource\b|\.\s+[/~]|\b(bash|sh|zsh|pwsh|powershell|cmd|npm|npx|node|python3?)\b/i;
   function isPlanModeSafePowerShellCommand(command) {
@@ -26356,6 +26769,9 @@ Focus: ${request.question.trim()}` : ""}` },
 ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
     };
   }
+  function isRetryableSubagentFailure(message) {
+    return isRetryableSubagentFailureFrom({ errorMessage: message });
+  }
   function isRetryableSubagentFailureFrom(facts) {
     if (facts.retryable === false) return false;
     if (facts.replayClass === "stream_lost" || facts.replayClass === "stream_lost_partial") return true;
@@ -26377,89 +26793,365 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
       if (signal?.aborted) finish();
     });
   }
+  function factsFromMessage(message) {
+    return {
+      errorMessage: message.errorMessage,
+      retryable: message.retryable,
+      replayClass: message.replayClass,
+      replayEligible: message.replayEligible,
+      remoteFailure: message.remoteFailure,
+      stopReason: message.stopReason
+    };
+  }
   function factsOf(error) {
     if (error instanceof Error) {
       const carrier = error;
-      return { errorMessage: error.message, retryable: carrier.retryable, replayClass: carrier.replayClass };
+      return {
+        errorMessage: carrier.subagentFailure?.errorMessage ?? error.message,
+        retryable: carrier.subagentFailure?.retryable ?? carrier.retryable,
+        replayClass: carrier.subagentFailure?.replayClass ?? carrier.replayClass,
+        replayEligible: carrier.subagentFailure?.replayEligible ?? carrier.replayEligible,
+        remoteFailure: carrier.subagentFailure?.remoteFailure ?? carrier.remoteFailure,
+        stopReason: carrier.subagentFailure?.stopReason ?? carrier.stopReason ?? (carrier.subagentFailure?.classification?.userAbort ? "aborted" : "error")
+      };
     }
-    return { errorMessage: String(error) };
+    return { errorMessage: String(error), stopReason: "error" };
   }
-  function withSubagentResponseRecovery(stream, backoffMs = 2e3, onRetry, onActivity, hooks) {
-    return async (model, context, options) => {
-      for (let attempt = 0; ; attempt++) {
-        if (hooks) {
-          hooks.terminalText = void 0;
-          hooks.terminalStopReason = void 0;
+  function assistantFromFacts(facts) {
+    return {
+      role: "assistant",
+      api: "unknown",
+      provider: "unknown",
+      model: "unknown",
+      content: [],
+      timestamp: 0,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: facts.stopReason ?? "error",
+      errorMessage: facts.errorMessage,
+      ...facts.retryable !== void 0 ? { retryable: facts.retryable } : {},
+      ...facts.replayClass !== void 0 ? { replayClass: facts.replayClass } : {},
+      ...facts.replayEligible !== void 0 ? { replayEligible: facts.replayEligible } : {},
+      ...facts.remoteFailure !== void 0 ? { remoteFailure: facts.remoteFailure } : {}
+    };
+  }
+  function boundedClassification(failure2) {
+    return { ...failure2, message: failure2.message.slice(0, 2e3) };
+  }
+  function failureDetails(facts, classification, recovery) {
+    return {
+      errorMessage: (classification.message || facts.errorMessage || "Subagent response failed").slice(0, 2e3),
+      ...facts.retryable !== void 0 ? { retryable: facts.retryable } : {},
+      ...facts.replayClass !== void 0 ? { replayClass: facts.replayClass } : {},
+      ...facts.replayEligible !== void 0 ? { replayEligible: facts.replayEligible } : {},
+      ...facts.remoteFailure !== void 0 ? {
+        remoteFailure: {
+          category: facts.remoteFailure.category,
+          ...typeof facts.remoteFailure.retryAfterMs === "number" && Number.isFinite(facts.remoteFailure.retryAfterMs) && facts.remoteFailure.retryAfterMs >= 0 ? { retryAfterMs: facts.remoteFailure.retryAfterMs } : {}
         }
-        if (options?.signal?.aborted) throw new Error("Subagent aborted by parent");
-        if (hooks?.hardDeadlineAt !== void 0 && Date.now() >= hooks.hardDeadlineAt) throw new Error("Subagent hard deadline reached");
-        let message;
-        const finishUsage = hooks?.usage ? beginSubagentUsage(hooks.usage, model) : void 0;
-        try {
-          const response = await stream(model, context, options);
-          let terminal;
-          const iterator = response[Symbol.asyncIterator]();
-          try {
-            while (true) {
-              const next = await iterator.next();
-              if (next.done) break;
-              try {
-                onActivity?.(next.value.type);
-              } catch {
-              }
-              if (next.value.type === "done") {
-                terminal = next.value.message;
-                finishUsage?.(terminal);
-              }
-              if (next.value.type === "error") {
-                terminal = next.value.error;
-                finishUsage?.(terminal);
-              }
-              if (hooks && (next.value.type === "done" || next.value.type === "error")) {
-                const reportTerminal = terminal && ["stop", "length", "error", "aborted"].includes(terminal.stopReason) && !terminal.content.some((block) => block.type === "toolCall");
-                hooks.terminalStopReason = reportTerminal && terminal ? terminal.stopReason : void 0;
-                hooks.terminalText = reportTerminal && terminal ? terminal.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").slice(0, 24001) : void 0;
-              }
-            }
-          } finally {
-            try {
-              await iterator.return?.();
-            } catch {
-            }
-          }
-          if (!terminal) throw new Error("Provider protocol error: response ended without a terminal event");
-          message = terminal;
-        } catch (error) {
-          finishUsage?.();
-          if (!options?.signal?.aborted && attempt < 2 && isRetryableSubagentFailureFrom(factsOf(error))) {
-            try {
-              onRetry?.();
-            } catch {
-            }
-            await cancellableBackoff(backoffMs * (attempt + 1), options?.signal);
-            continue;
-          }
-          throw error;
-        }
-        if (options?.signal?.aborted) throw new Error("Subagent aborted by parent");
-        if (message.stopReason === "error" && attempt < 2 && isRetryableSubagentFailureFrom({ errorMessage: message.errorMessage, retryable: message.retryable, replayClass: message.replayClass })) {
-          try {
-            onRetry?.();
-          } catch {
-          }
-          await cancellableBackoff(backoffMs * (attempt + 1), options?.signal);
-          continue;
-        }
-        const result = new AssistantMessageEventStream();
-        if (message.stopReason === "error" || message.stopReason === "aborted") {
-          result.push({ type: "error", reason: message.stopReason, error: { ...message, content: [] } });
-        } else {
-          result.push({ type: "done", reason: message.stopReason, message });
-        }
-        result.end();
-        return result;
+      } : {},
+      ...facts.stopReason === "aborted" ? { stopReason: facts.stopReason } : {},
+      classification: boundedClassification(classification),
+      recovery
+    };
+  }
+  function legacyRecovery(backoffMs) {
+    return {
+      policy: {
+        isRetryableError: (message) => isRetryableSubagentFailure(message),
+        maxRetries: 2,
+        baseDelayMs: backoffMs
+      },
+      classifyFailure: (context) => {
+        const facts = context.message?.role === "assistant" ? factsFromMessage(context.message) : { errorMessage: context.errorMessage, stopReason: "error" };
+        const retryable = isRetryableSubagentFailureFrom({ ...facts, errorMessage: context.errorMessage });
+        return {
+          kind: retryable ? "provider_transient" : "unknown",
+          retryable,
+          compactable: false,
+          userAbort: false,
+          terminal: !retryable,
+          message: context.errorMessage
+        };
       }
     };
+  }
+  function resolveRecovery(options, backoffMs) {
+    if (!options) return legacyRecovery(backoffMs);
+    const fallback = legacyRecovery(backoffMs);
+    return {
+      policy: options.policy ?? fallback.policy,
+      // An explicitly supplied policy without a classifier must reach its own
+      // isRetryableError predicate, exactly as in the main controller. Only the
+      // no-host compatible default installs the legacy prose classifier.
+      classifyFailure: options.classifyFailure ?? (options.policy ? void 0 : fallback.classifyFailure)
+    };
+  }
+  function classify(facts, recovery) {
+    const message = assistantFromFacts(facts);
+    return createFailureClassification({
+      message,
+      errorMessage: facts.errorMessage ?? "Subagent response failed",
+      phase: "stream"
+    }, recovery.policy, recovery.classifyFailure);
+  }
+  var DEFAULT_ITERATOR_CLEANUP_MS = 2e3;
+  async function closeIterator(iterator, hooks, signal) {
+    const cleanup = Promise.resolve().then(() => iterator.return?.()).then(() => void 0).catch(() => void 0);
+    const remaining = hooks?.hardDeadlineAt === void 0 ? DEFAULT_ITERATOR_CLEANUP_MS : Math.max(0, hooks.hardDeadlineAt - Date.now());
+    const waitMs = Math.min(DEFAULT_ITERATOR_CLEANUP_MS, remaining);
+    if (waitMs <= 0 || signal?.aborted) return;
+    let timer;
+    let onAbort;
+    try {
+      await Promise.race([
+        cleanup,
+        new Promise((resolve2) => {
+          timer = setTimeout(resolve2, waitMs);
+          onAbort = () => resolve2();
+          signal?.addEventListener("abort", onAbort, { once: true });
+        })
+      ]);
+    } finally {
+      if (timer !== void 0) clearTimeout(timer);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+    }
+  }
+  function singleResponse(message) {
+    const result = new AssistantMessageEventStream();
+    if (message.stopReason === "error" || message.stopReason === "aborted") {
+      result.push({ type: "error", reason: message.stopReason, error: { ...message, content: [] } });
+    } else {
+      result.push({ type: "done", reason: message.stopReason, message });
+    }
+    result.end();
+    return result;
+  }
+  function throwWithDetails(error, details) {
+    const failure2 = new Error(details.classification?.message ?? (error instanceof Error ? error.message : String(error)));
+    failure2.cause = error;
+    failure2.subagentFailure = details;
+    throw failure2;
+  }
+  function withSubagentResponseRecovery(stream, backoffMs = 2e3, onRetry, onActivity, hooks, recoveryOptions) {
+    const recovery = resolveRecovery(recoveryOptions, backoffMs);
+    const episode = recoveryOptions?.episode ?? hooks?.recoveryEpisode ?? new AgentSessionRetryEpisode(recovery.policy);
+    if (hooks) hooks.recoveryEpisode = episode;
+    return async (model, context, options) => {
+      let attempts = 0;
+      let retries = 0;
+      if (hooks) hooks.failure = void 0;
+      try {
+        for (; ; ) {
+          if (hooks) {
+            hooks.terminalText = void 0;
+            hooks.terminalStopReason = void 0;
+          }
+          if (options?.signal?.aborted) {
+            episode.resetAttempts();
+            throw new Error("Subagent aborted by parent");
+          }
+          if (hooks?.hardDeadlineAt !== void 0 && Date.now() >= hooks.hardDeadlineAt) throw new Error("Subagent hard deadline reached");
+          let message;
+          const finishUsage = hooks?.usage ? beginSubagentUsage(hooks.usage, model) : void 0;
+          attempts += 1;
+          try {
+            const response = await stream(model, context, options);
+            let terminal;
+            const iterator = response[Symbol.asyncIterator]();
+            try {
+              for (; ; ) {
+                const next = await iterator.next();
+                if (next.done) break;
+                try {
+                  onActivity?.(next.value.type);
+                } catch {
+                }
+                if (next.value.type === "done") {
+                  terminal = next.value.message;
+                  finishUsage?.(terminal);
+                }
+                if (next.value.type === "error") {
+                  terminal = next.value.error;
+                  finishUsage?.(terminal);
+                }
+                if (next.value.type === "done" || next.value.type === "error") {
+                  if (hooks && terminal) {
+                    const reportTerminal = ["stop", "length", "error", "aborted"].includes(terminal.stopReason) && !terminal.content.some((block) => block.type === "toolCall");
+                    hooks.terminalStopReason = reportTerminal ? terminal.stopReason : void 0;
+                    hooks.terminalText = reportTerminal ? terminal.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").slice(0, 24001) : void 0;
+                  }
+                  break;
+                }
+              }
+            } finally {
+              await closeIterator(iterator, hooks, options?.signal);
+            }
+            if (!terminal) throw new Error("Provider protocol error: response ended without a terminal event");
+            message = terminal;
+          } catch (error) {
+            finishUsage?.();
+            if (options?.signal?.aborted) {
+              episode.resetAttempts();
+              throw error;
+            }
+            const facts2 = factsOf(error);
+            if (facts2.stopReason === "aborted") {
+              episode.resetAttempts();
+              const classification3 = {
+                kind: "user_abort",
+                retryable: false,
+                compactable: false,
+                userAbort: true,
+                terminal: true,
+                message: facts2.errorMessage ?? "Subagent aborted"
+              };
+              const details = failureDetails(facts2, classification3, { outcome: "terminal", attempts, retries, reason: "cancelled" });
+              if (hooks) hooks.failure = details;
+              throwWithDetails(error, details);
+            }
+            const classification2 = classify(facts2, recovery);
+            const failure3 = await resolveFailure({
+              facts: facts2,
+              classification: classification2,
+              attempts,
+              retries,
+              episode,
+              hooks,
+              onRetry,
+              options
+            });
+            if (failure3.retry) {
+              retries += 1;
+              continue;
+            }
+            throwWithDetails(error, failure3.details);
+          }
+          if (options?.signal?.aborted) {
+            episode.resetAttempts();
+            throw new Error("Subagent aborted by parent");
+          }
+          if (hooks?.hardDeadlineAt !== void 0 && Date.now() >= hooks.hardDeadlineAt) {
+            episode.resetAttempts();
+            throw new Error("Subagent hard deadline reached");
+          }
+          if (message.stopReason !== "error" && message.stopReason !== "aborted") {
+            episode.succeed();
+            if (hooks) hooks.failure = void 0;
+            return singleResponse(message);
+          }
+          if (message.stopReason === "aborted") {
+            episode.resetAttempts();
+            if (hooks) hooks.failure = void 0;
+            return singleResponse(message);
+          }
+          const facts = factsFromMessage(message);
+          const classification = classify(facts, recovery);
+          const failure2 = await resolveFailure({
+            facts,
+            classification,
+            attempts,
+            retries,
+            episode,
+            hooks,
+            onRetry,
+            options
+          });
+          if (failure2.retry) {
+            retries += 1;
+            continue;
+          }
+          const finalMessage = failure2.details.classification?.message && failure2.details.classification.message !== message.errorMessage ? { ...message, errorMessage: failure2.details.classification.message } : message;
+          return singleResponse(finalMessage);
+        }
+      } finally {
+        episode.resetAttempts();
+      }
+    };
+  }
+  async function resolveFailure(params) {
+    const { facts, classification, attempts, retries, episode, hooks, onRetry, options } = params;
+    if (options?.signal?.aborted) {
+      episode.resetAttempts();
+      throw new Error("Subagent aborted by parent");
+    }
+    if (classification.userAbort) {
+      episode.resetAttempts();
+      const cancellation = {
+        ...classification,
+        kind: "user_abort",
+        retryable: false,
+        compactable: false,
+        userAbort: true,
+        terminal: true
+      };
+      const details2 = failureDetails({ ...facts, stopReason: "aborted" }, cancellation, {
+        outcome: "terminal",
+        attempts,
+        retries,
+        reason: "cancelled"
+      });
+      if (hooks) hooks.failure = details2;
+      return { retry: false, details: details2 };
+    }
+    if (classification.compactable) {
+      const details2 = failureDetails(facts, classification, {
+        outcome: "overflow",
+        attempts,
+        retries,
+        reason: "compaction_unavailable"
+      });
+      if (hooks) hooks.failure = details2;
+      return { retry: false, details: details2 };
+    }
+    let decision = episode.next(classification);
+    if (decision.action === "retry") {
+      const remaining = hooks?.hardDeadlineAt === void 0 ? Infinity : hooks.hardDeadlineAt - Date.now();
+      if (remaining <= 0) {
+        episode.resetAttempts();
+        throw new Error("Subagent hard deadline reached");
+      }
+      if (decision.delayMs > remaining) {
+        const deadlineClassification = {
+          ...classification,
+          retryable: false,
+          terminal: true,
+          message: `${classification.message} (recovery delay ${decision.delayMs}ms exceeds the remaining subagent deadline ${Math.max(0, Math.round(remaining))}ms)`
+        };
+        const details2 = failureDetails(facts, deadlineClassification, {
+          outcome: "exhausted",
+          attempts,
+          retries,
+          maxRetries: decision.maxRetries,
+          reason: "deadline"
+        });
+        if (hooks) hooks.failure = details2;
+        return { retry: false, details: details2 };
+      }
+      try {
+        onRetry?.();
+      } catch {
+      }
+      await cancellableBackoff(decision.delayMs, options?.signal);
+      if (options?.signal?.aborted) {
+        episode.resetAttempts();
+        throw new Error("Subagent aborted by parent");
+      }
+      if (hooks?.hardDeadlineAt !== void 0 && Date.now() >= hooks.hardDeadlineAt) {
+        episode.resetAttempts();
+        throw new Error("Subagent hard deadline reached");
+      }
+      return { retry: true };
+    }
+    const finalClassification = decision.action === "exhausted" ? decision.failure : classification;
+    const details = failureDetails(facts, finalClassification, {
+      outcome: decision.action === "exhausted" ? "exhausted" : "terminal",
+      attempts,
+      retries,
+      ...decision.action !== "terminal" ? { maxRetries: decision.maxRetries } : {},
+      ...decision.action === "exhausted" ? { reason: decision.reason } : {}
+    });
+    if (hooks) hooks.failure = details;
+    return { retry: false, details };
   }
 
   // ../../packages/shared-headless-capabilities/src/subagent-sessions.ts
@@ -26636,14 +27328,14 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
       "i"
     );
   }
-  function splitShellSegments(command) {
+  function splitShellSegments(command, shell = "bash") {
     const segments = [];
     let current2 = "";
     let quote;
     for (let index = 0; index < command.length; index += 1) {
       const char = command[index];
       if (quote) {
-        if (quote === '"' && char === "\\" && index + 1 < command.length) {
+        if (quote === '"' && char === (shell === "powershell" ? "`" : "\\") && index + 1 < command.length) {
           current2 += char;
           current2 += command[index + 1];
           index += 1;
@@ -26658,13 +27350,13 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
         current2 += char;
         continue;
       }
-      if (char === "\\" && index + 1 < command.length) {
+      if (char === (shell === "powershell" ? "`" : "\\") && index + 1 < command.length) {
         current2 += char;
         current2 += command[index + 1];
         index += 1;
         continue;
       }
-      if (char === "&" || char === "|" || char === ";" || char === "\n") {
+      if (char === "&" || char === "|" || char === ";" || char === "\n" || shell === "powershell" && /[(){}]/.test(char)) {
         if ((char === "&" || char === "|") && command[index + 1] === char) {
           index += 1;
         }
@@ -26677,7 +27369,7 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
     segments.push(current2);
     return segments.map((part) => part.trim()).filter(Boolean);
   }
-  function splitShellWords(segment) {
+  function splitShellWords(segment, shell = "bash") {
     const words = [];
     let current2 = "";
     let quote;
@@ -26686,7 +27378,7 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
       if (quote) {
         if (char === quote) {
           quote = void 0;
-        } else if (quote === '"' && char === "\\" && index + 1 < segment.length) {
+        } else if (quote === '"' && char === (shell === "powershell" ? "`" : "\\") && index + 1 < segment.length) {
           current2 += segment[index + 1];
           index += 1;
         } else {
@@ -26698,7 +27390,7 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
         quote = char;
         continue;
       }
-      if (char === "\\") {
+      if (char === (shell === "powershell" ? "`" : "\\")) {
         if (index + 1 >= segment.length) return void 0;
         current2 += segment[index + 1];
         index += 1;
@@ -26907,7 +27599,7 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
     const warnings = [];
     let commandClass = "unknown_shell";
     let destructive = false;
-    const destructivePatterns = shell === "powershell" ? [...POWERSHELL_DESTRUCTIVE_PATTERNS, ...DESTRUCTIVE_PATTERNS] : shell === "cmd" ? [...CMD_DESTRUCTIVE_PATTERNS, ...DESTRUCTIVE_PATTERNS] : DESTRUCTIVE_PATTERNS;
+    const destructivePatterns = shell === "cmd" ? [...CMD_DESTRUCTIVE_PATTERNS, ...DESTRUCTIVE_PATTERNS] : DESTRUCTIVE_PATTERNS;
     const removeWarnings = recursiveRemoveWarnings(command);
     if (removeWarnings.length > 0) {
       if (shell === "bash" && isStaticallyScopedRecursiveForceRemove(command, options)) {
@@ -26924,6 +27616,37 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
       commandClass = "unknown_shell";
       destructive = true;
     }
+    if (shell === "powershell") {
+      const segments = splitShellSegments(command, shell);
+      const simple = !/[$`#@{}()[\]=<>]/.test(command) && segments.every((segment) => {
+        const words2 = splitShellWords(segment, shell);
+        if (!words2?.length) return false;
+        const head = words2[0] === "." ? words2[1] : words2[0];
+        return !!head && /^[A-Za-z0-9_.\\/][A-Za-z0-9_.\\/:-]*$/.test(head) && !/^(?:return|throw|exit|if|elseif|else|switch|foreach|for|while|do|until|try|catch|finally|function|filter|class|begin|process|end|trap|data|using|workflow|configuration|break|continue|inlinescript|parallel|sequence)$/i.test(head);
+      });
+      if (!simple) {
+        for (const entry of POWERSHELL_DESTRUCTIVE_PATTERNS) {
+          if (!entry.pattern.test(command)) continue;
+          warnings.push(entry.warning);
+          commandClass = entry.commandClass;
+          destructive = true;
+        }
+      }
+      for (const segment of segments) {
+        const words2 = splitShellWords(segment, shell) ?? segment.split(/\s+/);
+        if (words2[0] === ".") words2.shift();
+        if (!words2[0]) continue;
+        words2[0] = executableName(words2[0]);
+        for (const entry of POWERSHELL_DESTRUCTIVE_PATTERNS) {
+          const pattern = new RegExp(`^(?:${entry.pattern.source})`, entry.pattern.flags);
+          if (pattern.test(words2.join(" "))) {
+            warnings.push(entry.warning);
+            commandClass = entry.commandClass;
+            destructive = true;
+          }
+        }
+      }
+    }
     for (const entry of destructivePatterns) {
       if (entry.pattern.test(command)) {
         warnings.push(entry.warning);
@@ -26939,8 +27662,6 @@ ${SUBAGENT_FINALIZATION_HINT}` } : context, options);
     const primary = words[0] || firstWord(normalized);
     if (shell === "powershell" && /\b(invoke-webrequest|iwr|invoke-restmethod|irm)\b/.test(normalized)) {
       commandClass = "network";
-    } else if (shell === "powershell" && /\b(new-item|set-content|add-content|copy-item|move-item|rename-item)\b/.test(normalized)) {
-      commandClass = "filesystem_write";
     } else if (shell === "cmd" && /\b(curl|bitsadmin|certutil)\b/.test(normalized)) {
       commandClass = "network";
     } else if (shell === "cmd" && /\b(copy|xcopy|robocopy|move|mkdir|md|ren|rename)\b/.test(normalized)) {
@@ -27184,7 +27905,7 @@ ${formatSkillsForPrompt(skills ?? [])}`;
         hooks.observation.lastWorkAt = Date.now();
         hooks.observation.lastActivity = "response_event";
       }
-    }, hooks);
+    }, hooks, deps.recovery);
     if (deps.createAgent) {
       const agent3 = deps.createAgent({
         streamFn,
@@ -27658,10 +28379,21 @@ ${DELEGATION_REPORT_INSTRUCTION}`;
           throw new Error(`Subagent output token limit reached (stopReason=length): the provider cut the final response before the report was produced${messages.some(messageHasOwnText) ? " (earlier-turn narration discarded)" : ", no text response"}. The output/thinking budget was too small for this task at its reasoning level. Rerun with a narrower task or a lower thinkingLevel.`);
         }
         const detail = terminalError ? `: ${terminalError.slice(0, 200)}` : "";
-        const failure2 = new Error(`Subagent response failed (provider/transport failure before the report was produced, stopReason=${terminalStopReason ?? "none"}${collectedResponse ? ", partial transcript discarded" : ", no text response"})${detail}`);
+        const hooks2 = agentRunHooks.get(subagent);
+        const fallbackFailure = lastAssistant && (lastAssistant.retryable !== void 0 || lastAssistant.replayClass !== void 0 || lastAssistant.replayEligible !== void 0 || lastAssistant.remoteFailure !== void 0) ? {
+          errorMessage: terminalError,
+          retryable: lastAssistant.retryable,
+          replayClass: lastAssistant.replayClass,
+          replayEligible: lastAssistant.replayEligible,
+          remoteFailure: lastAssistant.remoteFailure
+        } : void 0;
+        const subagentFailure = hooks2?.failure ?? fallbackFailure;
+        const overflow = subagentFailure?.recovery?.outcome === "overflow";
+        const failure2 = new Error(overflow ? `Subagent context overflow requires compaction, but no subagent compactor is configured${detail}` : `Subagent response failed (provider/transport failure before the report was produced, stopReason=${terminalStopReason ?? "none"}${collectedResponse ? ", partial transcript discarded" : ", no text response"})${detail}`);
         const carrier = failure2;
-        carrier.retryable = lastAssistant?.retryable;
-        carrier.replayClass = lastAssistant?.replayClass;
+        carrier.retryable = subagentFailure?.retryable;
+        carrier.replayClass = subagentFailure?.replayClass;
+        carrier.subagentFailure = subagentFailure;
         throw failure2;
       }
       let response;
@@ -27708,8 +28440,15 @@ ${DELEGATION_REPORT_INSTRUCTION}`;
       phaseProgress(task.observation.phase);
       task.error = errorMessage.slice(0, 2e3);
       const failureCarrier = error;
-      if (failureCarrier && (failureCarrier.retryable !== void 0 || failureCarrier.replayClass !== void 0)) {
-        task.failure = { ...failureCarrier.retryable !== void 0 ? { retryable: failureCarrier.retryable } : {}, ...failureCarrier.replayClass !== void 0 ? { replayClass: failureCarrier.replayClass } : {} };
+      if (failureCarrier?.subagentFailure) {
+        task.failure = failureCarrier.subagentFailure;
+      } else if (failureCarrier && (failureCarrier.retryable !== void 0 || failureCarrier.replayClass !== void 0 || failureCarrier.replayEligible !== void 0 || failureCarrier.remoteFailure !== void 0)) {
+        task.failure = {
+          ...failureCarrier.retryable !== void 0 ? { retryable: failureCarrier.retryable } : {},
+          ...failureCarrier.replayClass !== void 0 ? { replayClass: failureCarrier.replayClass } : {},
+          ...failureCarrier.replayEligible !== void 0 ? { replayEligible: failureCarrier.replayEligible } : {},
+          ...failureCarrier.remoteFailure !== void 0 ? { remoteFailure: failureCarrier.remoteFailure } : {}
+        };
       } else {
         task.failure = void 0;
       }
@@ -27794,6 +28533,11 @@ ${DELEGATION_REPORT_INSTRUCTION}`;
 `;
       if (task.observation) resultText += `Tools: ${task.observation.toolStarts} started, ${task.observation.toolEnds} ended, ${task.observation.toolErrors} errors
 `;
+      if (task.failure?.recovery) {
+        const recovery = task.failure.recovery;
+        resultText += `Recovery: ${task.failure.classification?.kind ?? "unclassified"}; outcome=${recovery.outcome}${recovery.reason ? ` (${recovery.reason})` : ""}; attempts=${recovery.attempts}; retries=${recovery.retries}${recovery.maxRetries !== void 0 ? `; budget=${recovery.maxRetries}` : ""}
+`;
+      }
       if (task.status === "completed" && task.result) {
         resultText += `${task.result}
 `;
@@ -28045,40 +28789,8 @@ ${SPAWN_USAGE_HINT}` }],
         toolContext.log?.(`Spawning ${tasks.length} parallel subagents: ${tasks.map((task) => task.name).join(", ")}`);
         toolContext.reportProgress?.({ message: `Launching ${tasks.length} parallel subagents...`, increment: 5 });
         const startTime = Date.now();
-        const runTask = async (task) => {
-          await run(task, toolContext.reportProgress, signal);
-          if (task.wasRecall || task.mode !== "read" || task.status !== "failed" || !task.error) return;
-          if (signal?.aborted) return;
-          if (!isRetryableSubagentFailureFrom({ errorMessage: task.error, retryable: task.failure?.retryable, replayClass: task.failure?.replayClass })) return;
-          observeDelegationPhase(task.observation, "task_replay");
-          const settleMs = Math.max(0, (deps.transientRetryBackoffMs ?? 2e3) * 10);
-          toolContext.reportProgress?.({ message: `[${task.name}] Provider/transport failure \u2014 replaying the read task once after ${Math.round(settleMs / 1e3)}s`, increment: 0 });
-          await cancellableBackoff(settleMs, signal);
-          if (signal.aborted) {
-            task.status = "cancelled";
-            task.error = "Subagent cancelled during replay backoff";
-            task.failure = void 0;
-            observeDelegationPhase(task.observation, "cancelled");
-            task.completedAt = Date.now();
-            return;
-          }
-          task.evidence = [];
-          task.confidenceSignals = [];
-          task.runtimeEvidence = [];
-          task.reportedEvidence = [];
-          task.error = void 0;
-          task.failure = void 0;
-          task.report = void 0;
-          task.result = void 0;
-          task.details = void 0;
-          task.parentHandoffRequired = false;
-          task.sessionId = void 0;
-          task.requestedMode = void 0;
-          task.wasRecall = void 0;
-          await run(task, toolContext.reportProgress, signal);
-        };
         const batch = Promise.resolve().then(() => runWithConcurrencyLimit(
-          tasks.map((task) => () => runTask(task)),
+          tasks.map((task) => () => run(task, toolContext.reportProgress, signal)),
           Math.max(1, deps.maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS)
         ));
         pending.add(batch);
@@ -28121,9 +28833,8 @@ ${SPAWN_USAGE_HINT}` }],
               observation: task.observation,
               parentHandoffRequired: task.parentHandoffRequired,
               failureReason: task.error,
-              // Structured provider verdict so the parent model can distinguish
-              // stream loss (safe to re-dispatch; no tool calls executed) from hard
-              // provider vetoes (auth/quota/config — not recoverable here).
+              // Structured provider facts plus the actual recovery outcome. Failed-
+              // response tool calls never execute; do not infer their absence.
               failure: task.failure,
               details: task.details
             })),
@@ -28346,7 +29057,11 @@ When a todo list exists, keep executing from the current in-progress item until 
         };
       }
       default:
-        return rejectTodoAction("read", `unknown action: ${args.action}`, safeCurrentTodos);
+        return rejectTodoAction(
+          "read",
+          `unknown action: ${args.action}. Valid actions: create, read, complete_current, clear.`,
+          safeCurrentTodos
+        );
     }
   }
 
@@ -29207,6 +29922,7 @@ When a todo list exists, keep executing from the current in-progress item until 
   var resolveReadPath = resolveInSandbox;
 
   // ../../packages/shared-headless-capabilities/src/builtin/fs/schema-utils.ts
+  var SCOPE_BASELINE_SENTENCE = "Absolute paths outside the sandbox are accepted only within configured access roots or when the current runtime mode's allowlist permits them; the effective scope is stated in the runtime-mode context, not in this description.";
   function formatPrefixes(prefixes) {
     if (!prefixes || prefixes.length === 0) {
       return "";
@@ -29215,6 +29931,11 @@ When a todo list exists, keep executing from the current in-progress item until 
       const trimmed = prefix.trim();
       return trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
     }).join(", ");
+  }
+  function arraysEqual(a, b) {
+    if (a === b) return true;
+    if (a.length !== b.length) return false;
+    return a.every((value, index) => value === b[index]);
   }
   function buildRootParameterSchema(sandboxRoot, options) {
     const roots = getAvailableRoots(options);
@@ -29239,8 +29960,11 @@ When a todo list exists, keep executing from the current in-progress item until 
   function buildPathResolutionDescription(sandboxRoot, options) {
     const roots = getAvailableRoots(options);
     const allowlistedDirs = options?.allowlistedDirs ?? [];
-    const hasGlobalAllowlist = allowlistedDirs.some((dir) => dir.trim() === "/");
-    const allowlistSentence = hasGlobalAllowlist ? "Absolute paths anywhere on the local filesystem are accepted in the current runtime mode." : allowlistedDirs.length > 0 ? `Absolute paths inside allowlisted directories are accepted: ${allowlistedDirs.join(", ")}.` : "";
+    const descriptionOverride = options?.descriptionAllowlistedDirs;
+    const describedAllowlist = descriptionOverride ?? allowlistedDirs;
+    const viewsEqual = arraysEqual(describedAllowlist, allowlistedDirs);
+    const hasGlobalAllowlist = describedAllowlist.some((dir) => dir.trim() === "/") && viewsEqual;
+    const allowlistSentence = hasGlobalAllowlist ? "Absolute paths anywhere on the local filesystem are accepted in the current runtime mode." : viewsEqual ? describedAllowlist.length > 0 ? `Absolute paths inside allowlisted directories are accepted: ${describedAllowlist.join(", ")}.` : "" : SCOPE_BASELINE_SENTENCE;
     if (roots.length === 0) {
       return ["Relative paths resolve against the workspace root.", allowlistSentence].filter(Boolean).join(" ");
     }
@@ -29765,9 +30489,10 @@ Focus: ${question.trim()}` : ""}` },
                   return;
                 }
                 if (magicInfo?.kind === "image") {
+                  const inlineSupported = INLINE_IMAGE_MIME_TYPES.has(magicInfo.mimeType);
                   resolve2({
-                    content: [{ type: "text", text: `Cannot attach image file ${path3}: unsupported image payload ${magicInfo.mimeType}.` }],
-                    details: { understanding: { kind: "image", mimeType: magicInfo.mimeType, fallbackReason: "unsupported inline image format" } },
+                    content: [{ type: "text", text: inlineSupported ? `Cannot attach image file ${path3}: the host filesystem bridge returned no usable image data for ${magicInfo.mimeType} (see logs for readImageInfo diagnostics).` : `Cannot attach image file ${path3}: unsupported image payload ${magicInfo.mimeType}.` }],
+                    details: { understanding: { kind: "image", mimeType: magicInfo.mimeType, fallbackReason: inlineSupported ? "image bridge read failed" : "unsupported inline image format" } },
                     isError: true
                   });
                   return;
@@ -30174,11 +30899,10 @@ Base directory: ${dirname(absolutePath)}
   async function readImageInfo(path3, fs) {
     try {
       let base64 = "";
-      const size = (await fs.stat(path3).catch(() => void 0))?.size ?? 0;
       if (typeof fs.readFile === "function") {
         base64 = await fs.readFile(path3, "base64").catch(() => "");
       }
-      if (!base64 && size > 0 && typeof fs.readFileSync === "function") {
+      if (!base64 && typeof fs.readFileSync === "function") {
         base64 = fs.readFileSync(path3, "base64");
       }
       if (!base64) {
@@ -30206,6 +30930,8 @@ Base directory: ${dirname(absolutePath)}
       if (bytes.length >= 12 && asciiAt(bytes, 0, 4) === "RIFF" && asciiAt(bytes, 8, 12 - 8) === "WEBP") {
         return { mimeType: "image/webp", base64, ...parseWebpDimensions(bytes) };
       }
+      console.error(`[pie] readImageInfo decoded ${bytes.length} bytes for ${path3} but no known image signature matched`);
+      return void 0;
     } catch (error) {
       console.error(`[pie] readImageInfo failed for ${path3}: ${error instanceof Error ? error.message : String(error)}`);
       return void 0;
@@ -30213,7 +30939,7 @@ Base directory: ${dirname(absolutePath)}
     return void 0;
   }
   function decodeBase64ToBytes(base64) {
-    if (typeof Buffer !== "undefined") {
+    if (hasUsableNodeBuffer()) {
       return Buffer.from(base64, "base64");
     }
     const clean2 = base64.replace(/[^A-Za-z0-9+/=]/g, "");
@@ -30231,6 +30957,17 @@ Base directory: ${dirname(absolutePath)}
       if (padding < 1) bytes[at2++] = n & 255;
     }
     return bytes.subarray(0, at2);
+  }
+  function hasUsableNodeBuffer() {
+    if (typeof Buffer === "undefined" || typeof Buffer.from !== "function") {
+      return false;
+    }
+    try {
+      const probe = Buffer.from("aGk=", "base64");
+      return probe.length === 2 && probe[0] === 104;
+    } catch {
+      return false;
+    }
   }
   function readUIntBE(bytes, offset2, length) {
     let value = 0;
@@ -45206,6 +45943,37 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
     return Parser.parse(input, options);
   }
 
+  // src/step-guards.ts
+  function injectStepGuardsIntoSource(source, sourceType) {
+    const text = String(source || "");
+    const ast = parse4(text, { ecmaVersion: "latest", sourceType });
+    const inserts = [];
+    const visit = (value) => {
+      if (!value || typeof value !== "object") return;
+      if (Array.isArray(value)) {
+        value.forEach(visit);
+        return;
+      }
+      const node = value;
+      if (["ForStatement", "ForInStatement", "ForOfStatement", "WhileStatement", "DoWhileStatement"].includes(String(node.type))) {
+        const body = node.body;
+        if (body) {
+          if (body.type === "BlockStatement") inserts.push({ at: body.start + 1, text: " __pieStepGuard(); " });
+          else {
+            inserts.push({ at: body.start, text: "{ __pieStepGuard(); " });
+            inserts.push({ at: body.end, text: " }" });
+          }
+        }
+      }
+      for (const child of Object.values(node)) visit(child);
+    };
+    visit(ast);
+    inserts.sort((a, b) => b.at - a.at);
+    let output = text;
+    for (const insertion of inserts) output = `${output.slice(0, insertion.at)}${insertion.text}${output.slice(insertion.at)}`;
+    return output;
+  }
+
   // src/unity-runtime-access.ts
   function isRecord8(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
@@ -45480,33 +46248,7 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
     return `${text.slice(0, runExport.start)}${text.slice(runExport.declaration.start)}`;
   }
   function injectStepGuards(source) {
-    const text = String(source || "");
-    const ast = parse4(text, { ecmaVersion: "latest", sourceType: "module" });
-    const inserts = [];
-    const visit = (value) => {
-      if (!value || typeof value !== "object") return;
-      if (Array.isArray(value)) {
-        value.forEach(visit);
-        return;
-      }
-      const node = value;
-      if (["ForStatement", "ForInStatement", "ForOfStatement", "WhileStatement", "DoWhileStatement"].includes(String(node.type))) {
-        const body = node.body;
-        if (body) {
-          if (body.type === "BlockStatement") inserts.push({ at: body.start + 1, text: " __pieStepGuard(); " });
-          else {
-            inserts.push({ at: body.start, text: "{ __pieStepGuard(); " });
-            inserts.push({ at: body.end, text: " }" });
-          }
-        }
-      }
-      for (const child of Object.values(node)) visit(child);
-    };
-    visit(ast);
-    inserts.sort((a, b) => b.at - a.at);
-    let output = text;
-    for (const insertion of inserts) output = `${output.slice(0, insertion.at)}${insertion.text}${output.slice(insertion.at)}`;
-    return output;
+    return injectStepGuardsIntoSource(source, "module");
   }
   function isStepTimeoutError(error) {
     return isRecord9(error) && (error.code === STEP_TIMEOUT_ERROR_CODE || error.name === "PieStepTimeoutError");
@@ -46692,13 +47434,14 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       ),
       createDevRpcTool(
         "unity_screenshot",
-        "Capture the current game view as a PNG screenshot rendered from the active camera (or a named camera). The capture is saved under the persistent root at PieScreenshots/; the result returns path plus absolutePath. To visually inspect the capture afterwards, call read_file with root=persistent and the returned path (optionally with a question) so the image is analyzed by the understanding model.",
+        "Capture the current game view as a PNG screenshot rendered from the active camera (or a named camera). The capture is saved under the persistent root at PieScreenshots/; the result returns path plus absolutePath. Captures are sRGB-encoded in both gamma and linear color space projects. To visually inspect the capture afterwards, call read_file with root=persistent and the returned path (optionally with a question) so the image is analyzed by the understanding model.",
         "unity_screenshot",
         Type.Object({
           width: Type.Optional(Type.Number({ description: "Capture width in pixels (64-3840, default 1280)." })),
           height: Type.Optional(Type.Number({ description: "Capture height in pixels (64-3840, default 720)." })),
           cameraName: Type.Optional(Type.String({ description: "Capture from this named camera instead of the active one." })),
           path: Type.Optional(Type.String({ description: "Relative path under PieScreenshots/ for the PNG (default: timestamped capture_*.png). No '..' segments." })),
+          includeUI: Type.Optional(Type.Boolean({ description: "Set false to capture via a camera render with UI canvases temporarily disabled (chat panels, HUD); that fresh render can differ from the final presented frame. Default true (play mode, no cameraName) captures the final game view including overlay UI." })),
           full: Type.Optional(Type.Boolean({ description: "Return untruncated model-facing output when the result is large." }))
         })
       ),
@@ -48261,6 +49004,8 @@ ${extensionSection.join("\n\n---\n\n")}
       await persistCurrentSession2();
     }
     return {
+      // Shared switch epoch: persistence does not advance it; even same-id restores do.
+      getSessionEpoch: () => sessionGeneration,
       syncSessionInfo,
       persistCurrentSession: persistCurrentSession2,
       persistCurrentSessionForRecovery: persistCurrentSessionForRecovery2,
@@ -49675,8 +50420,75 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     return { images };
   }
   function installUnityPublicApi(host) {
+    let sessionGeneration = 0;
+    async function bindSession(action, data2, generation) {
+      const requestId = stringField(data2, "requestId");
+      const requestedSessionId = stringField(data2, "sessionId")?.trim() || "";
+      let targetId = host.getCurrentSession().id;
+      let epoch = host.getSessionEpoch();
+      const superseded = () => generation !== sessionGeneration || epoch !== host.getSessionEpoch() || targetId !== host.getCurrentSession().id;
+      const ack = (ok, code = "") => {
+        if (superseded()) {
+          ok = false;
+          code = "SESSION_REQUEST_SUPERSEDED";
+        }
+        host.bridge.sendToUnity("session_binding_result", {
+          requestId,
+          operation: action,
+          requestedSessionId,
+          ok,
+          code,
+          sessionId: ok ? targetId : ""
+        });
+      };
+      const captureTarget = () => {
+        targetId = host.getCurrentSession().id;
+        epoch = host.getSessionEpoch();
+      };
+      const check = () => {
+        if (superseded()) return "SESSION_REQUEST_SUPERSEDED";
+        if (host.isRuntimeChatTurnActive()) return "SESSION_TURN_ACTIVE";
+        return "";
+      };
+      try {
+        if (action === "resume_session" && !requestedSessionId) return ack(false, "SESSION_ID_REQUIRED");
+        if (action === "resume_session" && host.getCurrentSession().id === requestedSessionId) {
+          host.emitSessionSync();
+          return ack(true);
+        }
+        let code = check();
+        if (code) return ack(false, code);
+        if (action === "resume_session") {
+          const loaded = await host.loadSession(host.projectRoot, requestedSessionId);
+          code = check();
+          if (code) return ack(false, code);
+          if (!loaded) return ack(false, "SESSION_NOT_FOUND");
+          host.restoreSessionRecord(isRecord14(data2) && data2.recoverInterrupted === true ? host.trimInterruptedTail(loaded, stringField(data2, "lastUserText") || "") : loaded);
+          captureTarget();
+        } else {
+          await host.persistCurrentSession();
+          code = check();
+          if (code) return ack(false, code);
+          host.startFreshSession();
+          captureTarget();
+          code = check();
+          if (code) return ack(false, code);
+          await host.persistCurrentSessionForRecovery();
+          code = check();
+          if (code) return ack(false, code);
+        }
+        host.emitSessionSync();
+        ack(true);
+      } catch {
+        ack(false, "SESSION_BINDING_FAILED");
+      }
+    }
     globalThis.pie = {
       handleCSharpMessage: async function(action, data2) {
+        const isSessionRequest = action === "new_session" || action === "resume_session";
+        const generation = isSessionRequest ? ++sessionGeneration : sessionGeneration;
+        const epoch = isSessionRequest ? host.getSessionEpoch() : void 0;
+        if (isSessionRequest && stringField(data2, "requestId")) return bindSession(action, data2, generation);
         try {
           switch (action) {
             case "send_message": {
@@ -49753,7 +50565,30 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               break;
             }
             case "new_session":
+              if (host.isRuntimeChatTurnActive()) {
+                const message = "Cannot start a new session while a turn is streaming. Abort it first.";
+                host.bridge.log("warn", "[pie/index] new_session rejected: turn active");
+                host.emitRuntimeError(message, {
+                  code: "SESSION_TURN_ACTIVE",
+                  category: "session",
+                  retryable: true
+                });
+                host.bridge.sendToUnity("error", { message });
+                break;
+              }
               await host.persistCurrentSession();
+              if (generation !== sessionGeneration || epoch !== host.getSessionEpoch()) break;
+              if (host.isRuntimeChatTurnActive()) {
+                const message = "Cannot start a new session while a turn is streaming. Abort it first.";
+                host.bridge.log("warn", "[pie/index] new_session rejected after persist: turn became active");
+                host.emitRuntimeError(message, {
+                  code: "SESSION_TURN_ACTIVE",
+                  category: "session",
+                  retryable: true
+                });
+                host.bridge.sendToUnity("error", { message });
+                break;
+              }
               host.startFreshSession();
               await host.persistCurrentSessionForRecovery();
               break;
@@ -49770,8 +50605,39 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 host.bridge.sendToUnity("error", { message });
                 break;
               }
+              if (host.isRuntimeChatTurnActive()) {
+                const currentId = host.getCurrentSession()?.id ?? "";
+                if (currentId && currentId === sessionId) {
+                  host.bridge.log("info", `[pie/index] resume_session ${sessionId} skipped: turn already active on this session`);
+                  host.emitSessionSync();
+                  break;
+                }
+                const message = "Cannot resume a different session while a turn is streaming. Abort it first.";
+                host.bridge.log("warn", `[pie/index] resume_session ${sessionId} rejected: turn active on ${currentId || "<none>"}`);
+                host.emitRuntimeError(message, {
+                  code: "SESSION_TURN_ACTIVE",
+                  category: "session",
+                  retryable: true,
+                  sessionId
+                });
+                host.bridge.sendToUnity("error", { message });
+                break;
+              }
               host.bridge.log("info", `[pie/index] resume_session ${sessionId}`);
               const loaded = await host.loadSession(host.projectRoot, sessionId);
+              if (generation !== sessionGeneration || epoch !== host.getSessionEpoch()) break;
+              if (loaded && host.isRuntimeChatTurnActive()) {
+                const message = "Cannot resume a session while a turn is streaming. Abort it first.";
+                host.bridge.log("warn", `[pie/index] resume_session ${sessionId} rejected after load: turn became active`);
+                host.emitRuntimeError(message, {
+                  code: "SESSION_TURN_ACTIVE",
+                  category: "session",
+                  retryable: true,
+                  sessionId
+                });
+                host.bridge.sendToUnity("error", { message });
+                break;
+              }
               if (loaded) {
                 const recoverInterrupted = isRecord14(data2) && data2.recoverInterrupted === true;
                 const lastUserText = stringField(data2, "lastUserText") || "";
@@ -49830,6 +50696,10 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 break;
               }
               await host.persistCurrentSession();
+              if (host.isRuntimeChatTurnActive()) {
+                host.bridge.sendToUnity("error", { message: "Cannot rewind or fork while a turn is streaming. Abort it first." });
+                break;
+              }
               const record = host.getCurrentSession();
               const truncated = truncateMessagesAroundTurn(
                 record.messages || [],
@@ -50149,6 +51019,64 @@ ${initialAgentsFile}`);
       }
       return false;
     };
+  }
+
+  // src/debug-local-stream.ts
+  function sleep3(ms) {
+    return new Promise((resolve2) => setTimeout(resolve2, ms));
+  }
+  async function runDebugLocalStream(host, commandText, promptText) {
+    const visibleUserText = (promptText || "").trim() || commandText;
+    const userMessage = {
+      role: "user",
+      content: [{ type: "text", text: visibleUserText }],
+      timestamp: Date.now()
+    };
+    const agent2 = host.getAgent();
+    const baseMessages = agent2.state.messages.slice();
+    agent2.replaceMessages([...baseMessages, userMessage]);
+    host.emitSessionSync();
+    await host.persistCurrentSessionForRecovery();
+    const bridge2 = host.bridge;
+    bridge2.sendToUnity("state_event", { name: "agent_start", detail: "debug local stream started" });
+    bridge2.sendToUnity("state_event", { name: "turn_start", detail: "debug local stream" });
+    bridge2.sendToUnity("state_event", { name: "message_start", detail: "debug local stream" });
+    const slowMode = /interrupt|slow|long/i.test(promptText || "");
+    const chunks = slowMode ? Array.from({ length: 40 }, (_, i2) => `Line ${i2 + 1}
+`) : [
+      "One\n",
+      "Two\n",
+      "Three\n",
+      "Four\n",
+      "Five\n",
+      "Six\n",
+      "Seven\n",
+      "Eight\n",
+      "Nine\n",
+      "Ten"
+    ];
+    const chunkDelayMs = slowMode ? 400 : 250;
+    for (const chunk of chunks) {
+      bridge2.sendToUnity("message_update", { type: "text_delta", delta: chunk });
+      await sleep3(chunkDelayMs);
+    }
+    const assistantText2 = chunks.join("");
+    const assistantMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: assistantText2 }],
+      api: agent2.state.model.api,
+      provider: agent2.state.model.provider,
+      model: agent2.state.model.id,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop",
+      timestamp: Date.now()
+    };
+    agent2.replaceMessages([...baseMessages, userMessage, assistantMessage]);
+    await host.persistCurrentSession();
+    host.emitSessionSync();
+    bridge2.sendToUnity("state_event", { name: "message_end", detail: "debug local stream complete" });
+    bridge2.sendToUnity("turn_end", { role: "assistant", stopReason: "stop" });
+    bridge2.sendToUnity("agent_end", {});
   }
 
   // src/unity-fetch-adapter.ts
@@ -50883,59 +51811,17 @@ ${initialAgentsFile}`);
     bridge.sendToUnity("turn_end", { role: "assistant", stopReason: "stop" });
     bridge.sendToUnity("agent_end", {});
   }
-  function sleep3(ms) {
-    return new Promise((resolve2) => setTimeout(resolve2, ms));
-  }
-  async function runDebugLocalStream(commandText, promptText) {
-    const visibleUserText = (promptText || "").trim() || commandText;
-    const userMessage = {
-      role: "user",
-      content: [{ type: "text", text: visibleUserText }],
-      timestamp: Date.now()
-    };
-    const baseMessages = agent.state.messages.slice();
-    agent.replaceMessages([...baseMessages, userMessage]);
-    emitSessionSync();
-    await persistCurrentSessionForRecovery();
-    bridge.sendToUnity("state_event", { name: "agent_start", detail: "debug local stream started" });
-    bridge.sendToUnity("state_event", { name: "turn_start", detail: "debug local stream" });
-    bridge.sendToUnity("state_event", { name: "message_start", detail: "debug local stream" });
-    const slowMode = /interrupt|slow|long/i.test(promptText || "");
-    const chunks = slowMode ? Array.from({ length: 40 }, (_, i2) => `Line ${i2 + 1}
-`) : [
-      "One\n",
-      "Two\n",
-      "Three\n",
-      "Four\n",
-      "Five\n",
-      "Six\n",
-      "Seven\n",
-      "Eight\n",
-      "Nine\n",
-      "Ten"
-    ];
-    const chunkDelayMs = slowMode ? 400 : 250;
-    for (const chunk of chunks) {
-      bridge.sendToUnity("message_update", { type: "text_delta", delta: chunk });
-      await sleep3(chunkDelayMs);
-    }
-    const assistantText2 = chunks.join("");
-    const assistantMessage = {
-      role: "assistant",
-      content: [{ type: "text", text: assistantText2 }],
-      api: agent.state.model.api,
-      provider: agent.state.model.provider,
-      model: agent.state.model.id,
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-      stopReason: "stop",
-      timestamp: Date.now()
-    };
-    agent.replaceMessages([...baseMessages, userMessage, assistantMessage]);
-    await persistCurrentSession();
-    emitSessionSync();
-    bridge.sendToUnity("state_event", { name: "message_end", detail: "debug local stream complete" });
-    bridge.sendToUnity("turn_end", { role: "assistant", stopReason: "stop" });
-    bridge.sendToUnity("agent_end", {});
+  var debugStreamHost = {
+    bridge,
+    getAgent: () => agent,
+    getCurrentSessionId: () => _currentSession.id,
+    serialize: serializeSessionPersistence,
+    persistCurrentSession,
+    persistCurrentSessionForRecovery,
+    emitSessionSync: () => emitSessionSync()
+  };
+  function runDebugLocalStream2(commandText, promptText) {
+    return runDebugLocalStream(debugStreamHost, commandText, promptText);
   }
   function emitSessionSync(record) {
     const sourceRecord = record || _currentSession;
@@ -50972,32 +51858,38 @@ ${initialAgentsFile}`);
       bridge.log("error", `[pie/index] Failed to persist session: ${err instanceof Error ? err.message : String(err)}`);
     });
   }
+  var runtimeChatTurnOpen = false;
   function beginRuntimeChatTurn(displayContent, clientTurnId) {
+    runtimeChatTurnOpen = true;
     return runtimeChat.beginTurn(displayContent, clientTurnId);
   }
   function emitRuntimeError(message, overrides) {
     return runtimeChat.emitError(message, overrides);
   }
   async function finalizeRuntimeChatTurn(outcome, stopReason, errorMessage) {
-    const generation = persistenceSessionGeneration;
-    const turnId = runtimeChat.activeClientTurnId;
-    const isCurrent = () => generation === persistenceSessionGeneration && turnId === runtimeChat.activeClientTurnId;
-    if (errorMessage) runtimeChat.emitError(errorMessage);
     try {
-      await persistCurrentSession();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      bridge.log("error", `[pie/index] Failed to persist terminal session snapshot: ${message}`);
+      const generation = persistenceSessionGeneration;
+      const turnId = runtimeChat.activeClientTurnId;
+      const isCurrent = () => generation === persistenceSessionGeneration && turnId === runtimeChat.activeClientTurnId;
+      if (errorMessage) runtimeChat.emitError(errorMessage);
+      try {
+        await persistCurrentSession();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        bridge.log("error", `[pie/index] Failed to persist terminal session snapshot: ${message}`);
+        if (!isCurrent()) return;
+        runtimeChat.emitError(message, {
+          code: "SESSION_PERSIST_FAILED",
+          category: "session",
+          retryable: false
+        });
+      }
       if (!isCurrent()) return;
-      runtimeChat.emitError(message, {
-        code: "SESSION_PERSIST_FAILED",
-        category: "session",
-        retryable: false
-      });
+      emitSessionSync();
+      runtimeChat.finishTurn(outcome, stopReason);
+    } finally {
+      runtimeChatTurnOpen = false;
     }
-    if (!isCurrent()) return;
-    emitSessionSync();
-    runtimeChat.finishTurn(outcome, stopReason);
   }
   async function applyModelSelection(provider, modelId) {
     const resolved = resolveModelWithRuntimeOverrides(provider, modelId);
@@ -51034,7 +51926,7 @@ ${initialAgentsFile}`);
     rebuildAgentSurface,
     reloadProjectExtensions,
     restoreSessionRecord,
-    runDebugLocalStream,
+    runDebugLocalStream: runDebugLocalStream2,
     runUnitySelfCheck: runUnitySelfCheck2,
     setAgentSystemPrompt: (systemPrompt) => agent.setSystemPrompt(systemPrompt),
     startFreshSession,
@@ -51104,9 +51996,10 @@ ${initialAgentsFile}`);
     restoreSessionRecord,
     startFreshSession,
     trimInterruptedTail,
+    getSessionEpoch: sessionRuntime.getSessionEpoch,
     getCurrentSession: () => _currentSession,
     forkFromRecord,
-    isRuntimeChatTurnActive: () => agent.state.isStreaming === true,
+    isRuntimeChatTurnActive: () => runtimeChatTurnOpen || agent.state.isStreaming === true,
     getTodoLoopState: () => todoLoopState,
     setTodoLoopState: (loop) => {
       todoLoopState = loop;
