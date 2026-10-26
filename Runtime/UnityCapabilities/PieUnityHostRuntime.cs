@@ -95,7 +95,28 @@ namespace Pie
         public static string RefreshJson()
         {
 #if UNITY_EDITOR
-            UnityEditor.AssetDatabase.Refresh(UnityEditor.ImportAssetOptions.ForceSynchronousImport);
+            // ForceSynchronousImport turned every refresh into a synchronous
+            // import pass — hundreds of ms to seconds on the main thread, paid
+            // on the exact frame the agent called the tool. A plain Refresh()
+            // batches imports instead, and in Play Mode it is deferred to the
+            // editor's next idle via delayCall so a running game frame never
+            // hosts the import pass at all.
+            if (UnityEditor.EditorApplication.isPlaying)
+            {
+                UnityEditor.EditorApplication.delayCall += () =>
+                {
+                    try
+                    {
+                        UnityEditor.AssetDatabase.Refresh();
+                    }
+                    catch (Exception ex)
+                    {
+                        PieDiagnostics.Warning($"[PieUnityHostRuntime] Deferred refresh failed: {ex.Message}");
+                    }
+                };
+                return "{\"refreshed\":true,\"deferred\":true,\"summary\":\"Editor assets refresh deferred to editor idle (play mode).\"}";
+            }
+            UnityEditor.AssetDatabase.Refresh();
             return "{\"refreshed\":true,\"summary\":\"Editor assets refreshed.\"}";
 #else
             return "{\"refreshed\":false,\"summary\":\"Refresh is a no-op in runtime mode.\"}";
@@ -877,6 +898,15 @@ namespace Pie
                 CollectMatches(transform.GetChild(i).gameObject, payload, results, limit);
         }
 
+        // Reusable component scratch list for Matches' type filter: a type-
+        // filtered scene query walks the whole hierarchy and used to allocate
+        // one Component[] per visited object (O(objects × components) garbage
+        // in a single synchronous query). GetComponents(List<T>) fills the
+        // pooled list instead; [ThreadStatic] keeps it safe if a query is
+        // ever dispatched off the main thread through PieDevRpcDispatcher.
+        [ThreadStatic]
+        private static List<Component> _matchComponentScratch;
+
         private static bool Matches(GameObject gameObject, PieUnityQueryPayload payload)
         {
             if (gameObject == null)
@@ -896,12 +926,18 @@ namespace Pie
 
             if (!string.IsNullOrWhiteSpace(payload.type))
             {
-                var components = gameObject.GetComponents<Component>();
+                // Name/path mismatches already short-circuited above; only now
+                // pay the component scan, and reuse the scratch list so the
+                // per-object array allocation is gone.
+                var scratch = _matchComponentScratch ??= new List<Component>(16);
+                scratch.Clear();
+                gameObject.GetComponents(scratch);
                 var matched = false;
-                for (var i = 0; i < components.Length; i++)
+                for (var i = 0; i < scratch.Count; i++)
                 {
-                    var typeName = components[i] != null ? components[i].GetType().Name : "";
-                    var fullName = components[i] != null ? components[i].GetType().FullName : "";
+                    var component = scratch[i];
+                    var typeName = component != null ? component.GetType().Name : "";
+                    var fullName = component != null ? component.GetType().FullName : "";
                     if (string.Equals(typeName, payload.type, StringComparison.OrdinalIgnoreCase)
                         || string.Equals(fullName, payload.type, StringComparison.OrdinalIgnoreCase))
                     {

@@ -71,6 +71,11 @@ namespace Pie
         public int messageCount;
         public PieSessionMessage[] messages = Array.Empty<PieSessionMessage>();
         public PieTimelineItem[] timelineItems = Array.Empty<PieTimelineItem>();
+        // schemaVersion 2 incremental fields: baseMessageCount > 0 marks an
+        // incremental frame whose messages extend that many already-synced
+        // messages; "full" marks a resync/recovery answer.
+        public int baseMessageCount;
+        public bool full;
     }
 
     [Serializable]

@@ -78,6 +78,7 @@ namespace Pie
 
         private void OnDisable()
         {
+            _bridge?.TickPerformance.SetEnabled(false);
             CancelConfirmations();
             if (_bridge?.IsInitialized == true) _bridge.SendToJs("abort", "{}");
         }
@@ -208,9 +209,32 @@ namespace Pie
 
         private void Update()
         {
-            PieDevRpcDispatcher.Tick();
-            PieUnityCapabilitiesBootstrap.HeartbeatRuntime();
-            _bridge?.Tick();
+            var perf = _bridge?.TickPerformance;
+            perf?.BeginRunnerFrame();
+            bool complete = false;
+            try
+            {
+                try
+                {
+                    perf?.BeginRunnerStage(PieTickPerformanceMonitor.StageDispatcher);
+                    PieDevRpcDispatcher.Tick(); // May invoke JS independently of PieBridge.Tick.
+                }
+                finally { perf?.EndRunnerStage(); }
+                try
+                {
+                    perf?.BeginRunnerStage(PieTickPerformanceMonitor.StageHeartbeat);
+                    PieUnityCapabilitiesBootstrap.HeartbeatRuntime();
+                }
+                finally { perf?.EndRunnerStage(); }
+                try
+                {
+                    perf?.BeginRunnerStage(PieTickPerformanceMonitor.StageBridge);
+                    _bridge?.Tick();
+                }
+                finally { perf?.EndRunnerStage(); }
+                complete = true;
+            }
+            finally { perf?.EndRunnerFrame(complete); }
         }
 
         private void OnApplicationPause(bool paused)
@@ -361,6 +385,9 @@ namespace Pie
             });
         }
 
+        /// <summary>False on transport failure or a matching synchronous request
+        /// rejection. True is not a promise of successful model completion; observe
+        /// OnRuntimeError/OnTurnFinished for accepted-turn outcomes.</summary>
         public bool SendChatMessage(PieChatRequest request)
         {
             if (_bridge?.IsInitialized != true || request == null) return false;
@@ -368,7 +395,8 @@ namespace Pie
             request.displayContent = string.IsNullOrEmpty(request.displayContent)
                 ? request.content
                 : request.displayContent;
-            request.clientTurnId = request.clientTurnId ?? "";
+            request.clientTurnId = string.IsNullOrWhiteSpace(request.clientTurnId)
+                ? Guid.NewGuid().ToString("N") : request.clientTurnId.Trim();
             var json = JsonUtility.ToJson(request);
             var bridge = _bridge;
             var eventVersion = _runtimeRpcEventVersion;
@@ -395,12 +423,16 @@ namespace Pie
                 _runtimeStatusText = previousStatus;
                 _runtimeIsStreaming = wasStreaming;
             };
+            var rejected = false;
             var previousRestore = _restoreRejectedRuntimeSend;
             _restoreRejectedRuntimeSend = error =>
             {
                 if (ReferenceEquals(_bridge, bridge)
                     && string.Equals(error.clientTurnId ?? "", request.clientTurnId.Trim(), StringComparison.Ordinal))
+                {
+                    rejected = true;
                     restore();
+                }
             };
             try
             {
@@ -408,7 +440,7 @@ namespace Pie
                 // A transport rejection with no callback restores the same snapshot.
                 if (!dispatched && _runtimeRpcEventVersion == eventVersion && ReferenceEquals(_bridge, bridge))
                     restore();
-                return dispatched;
+                return dispatched && !rejected;
             }
             finally { _restoreRejectedRuntimeSend = previousRestore; }
         }
@@ -1024,6 +1056,33 @@ namespace Pie
                             snapshot.messages = Array.Empty<PieSessionMessage>();
                         if (snapshot.timelineItems == null)
                             snapshot.timelineItems = Array.Empty<PieTimelineItem>();
+                        // Incremental frame (schemaVersion 2): extend the
+                        // already-synced history instead of replacing it. The
+                        // base must match what we hold for the same session;
+                        // otherwise fall through to the full replace below,
+                        // which loses the suffix — so a base mismatch asks the
+                        // runtime for a full resync instead.
+                        var current = CurrentSession;
+                        if (snapshot.baseMessageCount > 0
+                            && current != null
+                            && string.Equals(ActiveSessionId, snapshot.id ?? "", StringComparison.Ordinal)
+                            && current.messages != null
+                            && current.messages.Length == snapshot.baseMessageCount)
+                        {
+                            var merged = new PieSessionMessage[current.messages.Length + snapshot.messages.Length];
+                            current.messages.CopyTo(merged, 0);
+                            snapshot.messages.CopyTo(merged, current.messages.Length);
+                            snapshot.messages = merged;
+                            snapshot.baseMessageCount = 0;
+                            CurrentSession = snapshot;
+                            OnSessionChanged?.Invoke(snapshot);
+                            break;
+                        }
+                        if (snapshot.baseMessageCount > 0)
+                        {
+                            _bridge?.SendToJs("resync_session", "{}");
+                            break;
+                        }
                         if (!string.IsNullOrEmpty(ActiveSessionId)
                             && !string.Equals(ActiveSessionId, snapshot.id ?? "", StringComparison.Ordinal))
                             ResetRuntimeRpcHistory();

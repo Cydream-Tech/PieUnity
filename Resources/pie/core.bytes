@@ -3142,8 +3142,8 @@ var _PieAgent = (() => {
   function Record(key, type, options = {}) {
     return IsUnion(key) ? FromUnionKey(key.anyOf, type, options) : IsTemplateLiteral(key) ? FromTemplateLiteralKey(key, type, options) : IsLiteral(key) ? FromLiteralKey(key.const, type, options) : IsBoolean3(key) ? FromBooleanKey(key, type, options) : IsInteger2(key) ? FromIntegerKey(key, type, options) : IsNumber3(key) ? FromNumberKey(key, type, options) : IsRegExp2(key) ? FromRegExpKey(key, type, options) : IsString3(key) ? FromStringKey(key, type, options) : IsAny(key) ? FromAnyKey(key, type, options) : IsNever(key) ? FromNeverKey(key, type, options) : Never(options);
   }
-  function RecordPattern(record) {
-    return globalThis.Object.getOwnPropertyNames(record.patternProperties)[0];
+  function RecordPattern(record2) {
+    return globalThis.Object.getOwnPropertyNames(record2.patternProperties)[0];
   }
   function RecordKey2(type) {
     const pattern = RecordPattern(type);
@@ -4297,6 +4297,21 @@ var _PieAgent = (() => {
   var sha256 = /* @__PURE__ */ createHasher(() => new SHA256());
 
   // ../../packages/platform/src/sha256.ts
+  var utf8Owner;
+  function installUtf8Sha256HasherFactory(factory) {
+    const owner = { factory };
+    utf8Owner = owner;
+    return () => {
+      if (utf8Owner === owner) utf8Owner = void 0;
+    };
+  }
+  function tryCreateUtf8Sha256Hasher() {
+    try {
+      return utf8Owner?.factory();
+    } catch {
+      return void 0;
+    }
+  }
   function createSha256Hasher() {
     const hash = sha256.create();
     return {
@@ -5044,6 +5059,14 @@ var _PieAgent = (() => {
       return Promise.resolve(existing);
     }
     return new Promise((resolve2) => store.waiters.set(requestId, resolve2));
+  }
+  async function waitForPieFileBridgeRequest(requestId) {
+    const bridge2 = getPieFileBridge();
+    try {
+      return await waitForFileCompletion(requestId);
+    } finally {
+      if (typeof bridge2.ReleaseRequest === "function") bridge2.ReleaseRequest(requestId);
+    }
   }
   function toJsStringArray(value) {
     if (Array.isArray(value)) {
@@ -6112,10 +6135,10 @@ var _PieAgent = (() => {
           request.uploadHandler = new UnityEngine.Networking.UploadHandlerRaw(bodyData);
         }
         request.downloadHandler = new UnityEngine.Networking.DownloadHandlerBuffer();
-        let aborted = false;
+        let aborted2 = false;
         if (options.signal) {
           const onAbort = () => {
-            aborted = true;
+            aborted2 = true;
             request.Abort();
             reject(new Error("Request was aborted"));
           };
@@ -6123,7 +6146,7 @@ var _PieAgent = (() => {
         }
         const asyncOp = request.SendWebRequest();
         const checkComplete = () => {
-          if (aborted) return;
+          if (aborted2) return;
           if (asyncOp.isDone) {
             const status = request.responseCode;
             const ok = status >= 200 && status < 300;
@@ -6171,10 +6194,10 @@ var _PieAgent = (() => {
               setTimeout(checkComplete, 10);
             } else {
               const startWait = Date.now();
-              const wait = () => {
+              const wait2 = () => {
                 if (!asyncOp.isDone && Date.now() - startWait < 3e4) {
                   if (typeof setImmediate !== "undefined") {
-                    setImmediate(wait);
+                    setImmediate(wait2);
                   } else {
                     checkComplete();
                   }
@@ -6182,7 +6205,7 @@ var _PieAgent = (() => {
                   checkComplete();
                 }
               };
-              wait();
+              wait2();
             }
           }
         };
@@ -13551,100 +13574,119 @@ ${delta}`;
     return hashJson(value);
   }
   function hashJson(value, parts) {
-    const hash = createSha256Hasher();
-    const bytes = new Uint8Array(8192);
-    let used = 0;
-    const byte = (n) => {
-      bytes[used++] = n;
-      if (used === bytes.length) {
-        hash.update(bytes);
-        used = 0;
-      }
-    };
-    const emit = (text) => {
-      for (let i2 = 0; i2 < text.length; i2++) {
-        const cp = text.codePointAt(i2);
-        if (cp < 128) byte(cp);
-        else if (cp < 2048) {
-          byte(192 | cp >> 6);
-          byte(128 | cp & 63);
-        } else if (cp < 65536) {
-          byte(224 | cp >> 12);
-          byte(128 | cp >> 6 & 63);
-          byte(128 | cp & 63);
-        } else {
-          byte(240 | cp >> 18);
-          byte(128 | cp >> 12 & 63);
-          byte(128 | cp >> 6 & 63);
-          byte(128 | cp & 63);
-          i2++;
+    const utf8 = tryCreateUtf8Sha256Hasher();
+    try {
+      const hash = utf8 ? void 0 : createSha256Hasher();
+      const bytes = new Uint8Array(utf8 ? 0 : 8192);
+      let fragments = "";
+      let used = 0;
+      const byte = (n) => {
+        bytes[used++] = n;
+        if (used === bytes.length) {
+          hash.update(bytes);
+          used = 0;
         }
-      }
-    };
-    const string = (text) => {
-      emit('"');
-      for (let start = 0; start < text.length; ) {
-        let end = Math.min(start + 2048, text.length);
-        if (end < text.length && text.charCodeAt(end - 1) >= 55296 && text.charCodeAt(end - 1) <= 56319) end--;
-        const escaped = JSON.stringify(text.slice(start, end));
-        emit(escaped.slice(1, -1));
-        start = end;
-      }
-      emit('"');
-    };
-    const ancestors = /* @__PURE__ */ new Set();
-    const omitted = (v) => v === void 0 || typeof v === "function" || typeof v === "symbol";
-    const visit = (v) => {
-      if (typeof v === "string") {
-        string(v);
-        return;
-      }
-      if (v === null || typeof v !== "object") {
-        const encoded = JSON.stringify(v);
-        if (encoded === void 0) throw new TypeError("Not a JSON value");
-        emit(encoded);
-        return;
-      }
-      const prototype = Object.getPrototypeOf(v);
-      if (!Array.isArray(v) && prototype !== Object.prototype && prototype !== null || typeof v.toJSON === "function") throw new TypeError("Not a JSON snapshot");
-      if (ancestors.has(v)) throw new TypeError("Circular JSON snapshot");
-      ancestors.add(v);
-      if (Array.isArray(v)) {
+      };
+      const emit = (text) => {
+        if (utf8) {
+          if (fragments.length + text.length > 8192) {
+            if (fragments) utf8.updateUtf8(fragments);
+            fragments = "";
+          }
+          if (text.length >= 8192) utf8.updateUtf8(text);
+          else fragments += text;
+          return;
+        }
+        for (let i2 = 0; i2 < text.length; i2++) {
+          const cp = text.codePointAt(i2);
+          if (cp < 128) byte(cp);
+          else if (cp < 2048) {
+            byte(192 | cp >> 6);
+            byte(128 | cp & 63);
+          } else if (cp < 65536) {
+            byte(224 | cp >> 12);
+            byte(128 | cp >> 6 & 63);
+            byte(128 | cp & 63);
+          } else {
+            byte(240 | cp >> 18);
+            byte(128 | cp >> 12 & 63);
+            byte(128 | cp >> 6 & 63);
+            byte(128 | cp & 63);
+            i2++;
+          }
+        }
+      };
+      const string = (text) => {
+        emit('"');
+        for (let start = 0; start < text.length; ) {
+          let end = Math.min(start + 2048, text.length);
+          if (end < text.length && text.charCodeAt(end - 1) >= 55296 && text.charCodeAt(end - 1) <= 56319) end--;
+          const escaped = JSON.stringify(text.slice(start, end));
+          emit(escaped.slice(1, -1));
+          start = end;
+        }
+        emit('"');
+      };
+      const ancestors = /* @__PURE__ */ new Set();
+      const omitted = (v) => v === void 0 || typeof v === "function" || typeof v === "symbol";
+      const visit = (v) => {
+        if (typeof v === "string") {
+          string(v);
+          return;
+        }
+        if (v === null || typeof v !== "object") {
+          const encoded = JSON.stringify(v);
+          if (encoded === void 0) throw new TypeError("Not a JSON value");
+          emit(encoded);
+          return;
+        }
+        const prototype = Object.getPrototypeOf(v);
+        if (!Array.isArray(v) && prototype !== Object.prototype && prototype !== null || typeof v.toJSON === "function") throw new TypeError("Not a JSON snapshot");
+        if (ancestors.has(v)) throw new TypeError("Circular JSON snapshot");
+        ancestors.add(v);
+        if (Array.isArray(v)) {
+          emit("[");
+          for (let i2 = 0; i2 < v.length; i2++) {
+            if (Object.getOwnPropertyDescriptor(v, i2)?.get) throw new TypeError("Not a JSON snapshot");
+            if (i2) emit(",");
+            visit(omitted(v[i2]) ? null : v[i2]);
+          }
+          emit("]");
+        } else {
+          emit("{");
+          let first = true;
+          for (const key of Object.keys(v)) {
+            if (Object.getOwnPropertyDescriptor(v, key)?.get) throw new TypeError("Not a JSON snapshot");
+            const entry = v[key];
+            if (omitted(entry)) continue;
+            if (!first) emit(",");
+            first = false;
+            string(key);
+            emit(":");
+            visit(entry);
+          }
+          emit("}");
+        }
+        ancestors.delete(v);
+      };
+      if (parts) {
         emit("[");
-        for (let i2 = 0; i2 < v.length; i2++) {
-          if (Object.getOwnPropertyDescriptor(v, i2)?.get) throw new TypeError("Not a JSON snapshot");
+        for (let i2 = 0; i2 < parts.count + parts.output.length; i2++) {
           if (i2) emit(",");
-          visit(omitted(v[i2]) ? null : v[i2]);
+          const item = i2 < parts.count ? parts.input[i2] : parts.output[i2 - parts.count];
+          visit(omitted(item) ? null : item);
         }
         emit("]");
-      } else {
-        emit("{");
-        let first = true;
-        for (const key of Object.keys(v)) {
-          if (Object.getOwnPropertyDescriptor(v, key)?.get) throw new TypeError("Not a JSON snapshot");
-          const entry = v[key];
-          if (omitted(entry)) continue;
-          if (!first) emit(",");
-          first = false;
-          string(key);
-          emit(":");
-          visit(entry);
-        }
-        emit("}");
+      } else visit(value);
+      if (utf8) {
+        if (fragments) utf8.updateUtf8(fragments);
+        return utf8.digestHex();
       }
-      ancestors.delete(v);
-    };
-    if (parts) {
-      emit("[");
-      for (let i2 = 0; i2 < parts.count + parts.output.length; i2++) {
-        if (i2) emit(",");
-        const item = i2 < parts.count ? parts.input[i2] : parts.output[i2 - parts.count];
-        visit(omitted(item) ? null : item);
-      }
-      emit("]");
-    } else visit(value);
-    if (used) hash.update(bytes.subarray(0, used));
-    return hash.digestHex();
+      if (used) hash.update(bytes.subarray(0, used));
+      return hash.digestHex();
+    } finally {
+      utf8?.dispose();
+    }
   }
   function inputSha256(input, count = input.length, output = []) {
     return hashJson(void 0, { input, count, output });
@@ -23359,8 +23401,8 @@ ${summary2}`;
     if (Array.isArray(value)) {
       return `[${value.map(stableStringify).join(",")}]`;
     }
-    const record = value;
-    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(",")}}`;
+    const record2 = value;
+    return `{${Object.keys(record2).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record2[key])}`).join(",")}}`;
   }
   function summarizeToolResultForGuard(result) {
     if (!result || typeof result !== "object") {
@@ -23673,18 +23715,18 @@ ${summary2}`;
         signal: params.signal
       });
       if (isAborted() || result?.aborted) {
-        const aborted = { ...result, aborted: true };
-        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted });
-        return aborted;
+        const aborted2 = { ...result, aborted: true };
+        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted2 });
+        return aborted2;
       }
       if (!isCompactionPreparationCurrent({
         preparation,
         sessionManager: params.sessionManager,
         messages: params.agent.state.messages
       })) {
-        const aborted = { ...result, aborted: true };
-        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted });
-        return aborted;
+        const aborted2 = { ...result, aborted: true };
+        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted2 });
+        return aborted2;
       }
       if (result?.summary && (result.retainedTail || result.firstKeptEntryId)) {
         const verified = verifyPreparedCompactionCommit({
@@ -23700,9 +23742,9 @@ ${summary2}`;
         });
         if (verified.ok === false) {
           if (verified.kind === "stale") {
-            const aborted = { ...result, aborted: true };
-            params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted });
-            return aborted;
+            const aborted2 = { ...result, aborted: true };
+            params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted2 });
+            return aborted2;
           }
           throw new Error(`Compaction abandoned: ${verified.reason}`);
         }
@@ -23724,16 +23766,16 @@ ${summary2}`;
         throw new Error("Compaction abandoned: the handler returned a summary without a retained tail or cut anchor.");
       }
       if (isAborted()) {
-        const aborted = { ...result, aborted: true };
-        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted });
-        return aborted;
+        const aborted2 = { ...result, aborted: true };
+        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted2 });
+        return aborted2;
       }
       params.markSyncedToAgentState();
       await params.sessionManager.save();
       if (isAborted()) {
-        const aborted = { ...result, aborted: true };
-        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted });
-        return aborted;
+        const aborted2 = { ...result, aborted: true };
+        params.emit({ type: "auto_compaction_end", reason: params.reason, willRetry: params.willRetry, result: aborted2 });
+        return aborted2;
       }
       if (committed && !result?.aborted) {
         params.emit({ type: "compaction_committed", reason: params.reason, willRetry: params.willRetry });
@@ -25719,7 +25761,7 @@ ${summary2}`;
 
   // ../../packages/agent-framework/src/delegation.ts
   var DELEGATION_REPORT_MAX_CHARS = 24e3;
-  var DELEGATION_REPORT_INSTRUCTION = 'Return your final response once as a JSON object: {"summary":string,"result":string,"remainingWork"?:string[],"evidenceRefs"?:string[]}. Keep the entire JSON response within 24,000 characters: give concise conclusions and bounded evidence references, not repeated drafting notes. Do not make an extra tool call to report. Evidence references are your claims, not runtime verification.';
+  var DELEGATION_REPORT_INSTRUCTION = 'Return your final response once as a JSON object: {"summary":string,"result":string,"remainingWork"?:string[],"evidenceRefs"?:string[]}. Keep the entire JSON response within 24,000 characters: give concise conclusions and bounded evidence references, not repeated drafting notes. Do not make an extra tool call to report. Evidence references are your claims, not runtime verification. Emit the raw JSON object only \u2014 no markdown code fences around it, and no raw line breaks inside JSON string values (escape them as \\n); anything JSON.parse rejects is treated as no report.';
   function parseDelegationReport(text, runId, truncated = false) {
     const raw = (text ?? "").slice(0, DELEGATION_REPORT_MAX_CHARS);
     const base = { version: 1, runId: runId.slice(0, 160), raw };
@@ -27980,84 +28022,84 @@ ${formatSkillsForPrompt(skills ?? [])}`;
   function isParentHandoffRequired(task) {
     return task.report?.availability !== "available" || task.mode === "edit" || task.status === "timeout" || task.status === "failed" || task.confidenceSignals.some((signal) => signal.type === "tool_error" || signal.type === "no_tool_use" || signal.type === "no_text_report");
   }
-  function shellFromRecord(record) {
+  function shellFromRecord(record2) {
     return {
-      id: record.id,
-      name: record.name,
-      mode: record.mode,
-      priority: record.priority,
-      originalTask: record.originalTask,
-      modelOverride: record.modelOverride,
-      thinkingLevel: record.thinkingLevel,
-      timeoutSeconds: record.timeoutSeconds,
+      id: record2.id,
+      name: record2.name,
+      mode: record2.mode,
+      priority: record2.priority,
+      originalTask: record2.originalTask,
+      modelOverride: record2.modelOverride,
+      thinkingLevel: record2.thinkingLevel,
+      timeoutSeconds: record2.timeoutSeconds,
       agent: null,
-      pendingMessages: record.messages,
-      reports: Array.isArray(record.reports) ? record.reports.slice(-4).map((report) => {
+      pendingMessages: record2.messages,
+      reports: Array.isArray(record2.reports) ? record2.reports.slice(-4).map((report) => {
         const parsed = parseDelegationReport(typeof report?.raw === "string" ? report.raw : void 0, typeof report?.runId === "string" ? report.runId : "legacy", report?.stopReason ?? report?.availability === "truncated");
         if (["empty", "invalid_json", "invalid_shape", "char_cap", "provider_length", "error", "aborted", "deadline", "cancelled", "no_terminal"].includes(report?.reason ?? "")) parsed.reason = report.reason;
         return parsed;
       }) : void 0,
-      usageRuns: restoreSubagentUsageRuns(record.usageRuns),
-      createdAt: record.createdAt,
-      lastUsedAt: record.lastUsedAt,
-      runCount: record.runCount,
+      usageRuns: restoreSubagentUsageRuns(record2.usageRuns),
+      createdAt: record2.createdAt,
+      lastUsedAt: record2.lastUsedAt,
+      runCount: record2.runCount,
       // The restored record IS our durable base line: its revision (0 for
       // legacy records that predate the field) is both our current revision
       // and our known-persisted revision.
-      revision: record.revision ?? 0,
-      persistedRevision: record.revision ?? 0,
+      revision: record2.revision ?? 0,
+      persistedRevision: record2.revision ?? 0,
       busy: true
     };
   }
   async function resolveRecallSession(deps, id, sessions, maxLiveSessions) {
     let live = sessions ? touchLiveSession(sessions, id) : void 0;
     if (live?.busy) throw new Error(`Subagent session "${id}" is busy with another task; wait for it to settle.`);
-    let record;
+    let record2;
     if (deps.sessionStore) {
       try {
-        record = await deps.sessionStore.load(id);
+        record2 = await deps.sessionStore.load(id);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         debugLog(deps, "session", "session store load failed", { id, error: detail });
         throw new Error(`Subagent session "${id}" could not be read from the session store (${detail}); refusing to recall without verifying session freshness. Retry the recall, or spawn a fresh task.`);
       }
     }
-    if (record && typeof record.version === "number" && record.version !== SUBAGENT_SESSION_RECORD_VERSION) {
-      throw new Error(`Subagent session "${id}" is persisted in record format version ${record.version}, which this build cannot read (supported: ${SUBAGENT_SESSION_RECORD_VERSION}); refusing to recall so the newer record is not overwritten. Use the matching Pie version, or spawn a fresh task.`);
+    if (record2 && typeof record2.version === "number" && record2.version !== SUBAGENT_SESSION_RECORD_VERSION) {
+      throw new Error(`Subagent session "${id}" is persisted in record format version ${record2.version}, which this build cannot read (supported: ${SUBAGENT_SESSION_RECORD_VERSION}); refusing to recall so the newer record is not overwritten. Use the matching Pie version, or spawn a fresh task.`);
     }
-    if (record && (record.version !== SUBAGENT_SESSION_RECORD_VERSION || record.id !== id || !Array.isArray(record.messages))) {
-      record = void 0;
+    if (record2 && (record2.version !== SUBAGENT_SESSION_RECORD_VERSION || record2.id !== id || !Array.isArray(record2.messages))) {
+      record2 = void 0;
     }
     live = sessions ? touchLiveSession(sessions, id) : void 0;
     if (live?.busy) throw new Error(`Subagent session "${id}" is busy with another task; wait for it to settle.`);
     if (live) {
       const liveTranscriptLength = live.agent?.state.messages.length ?? live.pendingMessages?.length ?? 0;
-      const recordIsNewer = record !== void 0 && (record.revision !== void 0 ? record.revision > live.revision : record.runCount > live.runCount || record.runCount === live.runCount && record.lastUsedAt > live.lastUsedAt || record.runCount === live.runCount && record.lastUsedAt === live.lastUsedAt && record.messages.length > liveTranscriptLength);
-      const forked = record?.revision !== void 0 && record.revision > (live.persistedRevision ?? 0) && live.revision > (live.persistedRevision ?? 0);
-      if (forked && record?.revision !== void 0) {
+      const recordIsNewer = record2 !== void 0 && (record2.revision !== void 0 ? record2.revision > live.revision : record2.runCount > live.runCount || record2.runCount === live.runCount && record2.lastUsedAt > live.lastUsedAt || record2.runCount === live.runCount && record2.lastUsedAt === live.lastUsedAt && record2.messages.length > liveTranscriptLength);
+      const forked = record2?.revision !== void 0 && record2.revision > (live.persistedRevision ?? 0) && live.revision > (live.persistedRevision ?? 0);
+      if (forked && record2?.revision !== void 0) {
         debugLog(deps, "session", "live and durable sessions diverged after failed persistence", {
           id,
           liveRevision: live.revision,
-          persistedRevision: record.revision,
+          persistedRevision: record2.revision,
           lastSharedRevision: live.persistedRevision
         });
         releaseLiveSession(live);
         sessions?.delete(id);
-        throw new Error(`Subagent session "${id}" diverged across processes: this process holds unsaved work (revision ${live.revision}, last durable sync ${live.persistedRevision ?? 0}) while another process advanced the stored record (revision ${record.revision}). The diverged in-memory branch was discarded; recall again to continue from the last durable transcript, or spawn a fresh task.`);
+        throw new Error(`Subagent session "${id}" diverged across processes: this process holds unsaved work (revision ${live.revision}, last durable sync ${live.persistedRevision ?? 0}) while another process advanced the stored record (revision ${record2.revision}). The diverged in-memory branch was discarded; recall again to continue from the last durable transcript, or spawn a fresh task.`);
       }
-      if (recordIsNewer && record) {
+      if (recordIsNewer && record2) {
         debugLog(deps, "session", "live session behind the durable record; adopting the persisted record", {
           id,
           liveMessages: liveTranscriptLength,
-          persistedMessages: record.messages.length,
+          persistedMessages: record2.messages.length,
           liveRevision: live.revision,
-          persistedRevision: record.revision,
+          persistedRevision: record2.revision,
           liveRunCount: live.runCount,
-          persistedRunCount: record.runCount,
+          persistedRunCount: record2.runCount,
           liveLastUsedAt: live.lastUsedAt,
-          persistedLastUsedAt: record.lastUsedAt
+          persistedLastUsedAt: record2.lastUsedAt
         });
-        const shell2 = shellFromRecord(record);
+        const shell2 = shellFromRecord(record2);
         if (sessions) {
           retainLiveSession(sessions, shell2, maxLiveSessions);
         }
@@ -28066,8 +28108,8 @@ ${formatSkillsForPrompt(skills ?? [])}`;
       live.busy = true;
       return { session: live, restored: false };
     }
-    if (!record) return void 0;
-    const shell = shellFromRecord(record);
+    if (!record2) return void 0;
+    const shell = shellFromRecord(record2);
     if (sessions) {
       retainLiveSession(sessions, shell, maxLiveSessions);
     }
@@ -29633,11 +29675,11 @@ When a todo list exists, keep executing from the current in-progress item until 
   }
   function mergePermissionDetails(details, decision) {
     if (details && typeof details === "object" && !Array.isArray(details)) {
-      const record = details;
-      if (record.permissionDecision) {
-        return { ...record, capabilityPolicyDecision: decision };
+      const record2 = details;
+      if (record2.permissionDecision) {
+        return { ...record2, capabilityPolicyDecision: decision };
       }
-      return { ...record, permissionDecision: decision };
+      return { ...record2, permissionDecision: decision };
     }
     return { permissionDecision: decision };
   }
@@ -30445,9 +30487,9 @@ When a todo list exists, keep executing from the current in-progress item until 
               reject(new Error("Operation aborted"));
               return;
             }
-            let aborted = false;
+            let aborted2 = false;
             const onAbort = () => {
-              aborted = true;
+              aborted2 = true;
               reject(new Error("Operation aborted"));
             };
             if (signal) {
@@ -30463,7 +30505,7 @@ When a todo list exists, keep executing from the current in-progress item until 
                 if (!stat.isFile) {
                   throw new Error(`Refusing to read non-regular file: ${absolutePath}`);
                 }
-                if (aborted) return;
+                if (aborted2) return;
                 const prefix = await fs.readFilePrefix(absolutePath, BINARY_MAGIC_PREFIX_BYTES);
                 const magicInfo = detectBinaryMagic(prefix);
                 let binaryInfo = detectBinaryKind(absolutePath);
@@ -30772,7 +30814,7 @@ Base directory: ${dirname(absolutePath)}
                 }
                 outputText = sourceHeader + outputText;
                 const textContent = [{ type: "text", text: outputText }];
-                if (aborted) return;
+                if (aborted2) return;
                 if (signal) {
                   signal.removeEventListener("abort", onAbort);
                 }
@@ -30781,7 +30823,7 @@ Base directory: ${dirname(absolutePath)}
                   details
                 });
               } catch (error) {
-                if (!aborted) {
+                if (!aborted2) {
                   const message = error instanceof Error ? error.message : String(error);
                   if (/aborted/i.test(message)) {
                     reject(error);
@@ -31134,9 +31176,9 @@ Base directory: ${dirname(absolutePath)}
               reject(new Error("Operation aborted"));
               return;
             }
-            let aborted = false;
+            let aborted2 = false;
             const onAbort = () => {
-              aborted = true;
+              aborted2 = true;
               reject(new Error("Operation aborted"));
             };
             if (signal) {
@@ -31145,7 +31187,7 @@ Base directory: ${dirname(absolutePath)}
             (async () => {
               try {
                 await fs.mkdir(dir, { recursive: true });
-                if (aborted) return;
+                if (aborted2) return;
                 let fileExists = false;
                 try {
                   const stat = await fs.stat(absolutePath);
@@ -31177,7 +31219,7 @@ Base directory: ${dirname(absolutePath)}
                   absolutePath,
                   snapshotFromStatAndContent(writtenStat, content)
                 );
-                if (aborted) return;
+                if (aborted2) return;
                 if (signal) {
                   signal.removeEventListener("abort", onAbort);
                 }
@@ -31189,7 +31231,7 @@ Base directory: ${dirname(absolutePath)}
                 if (signal) {
                   signal.removeEventListener("abort", onAbort);
                 }
-                if (!aborted) {
+                if (!aborted2) {
                   reject(error);
                 }
               }
@@ -32261,11 +32303,11 @@ ${[...shown, ...suffix].join("\n")}`);
             reject(new Error("Operation aborted"));
             return;
           }
-          let aborted = false;
+          let aborted2 = false;
           let committing = false;
           const onAbort = () => {
             if (committing) return;
-            aborted = true;
+            aborted2 = true;
             reject(new Error("Operation aborted"));
           };
           if (signal) {
@@ -32274,7 +32316,7 @@ ${[...shown, ...suffix].join("\n")}`);
           (async () => {
             try {
               const throwIfAborted = () => {
-                if (aborted || signal?.aborted) throw new Error("Operation aborted");
+                if (aborted2 || signal?.aborted) throw new Error("Operation aborted");
               };
               try {
                 await fs.access(absolutePath);
@@ -32471,7 +32513,7 @@ ${diffResult.diff}`);
               if (signal) {
                 signal.removeEventListener("abort", onAbort);
               }
-              if (!aborted) {
+              if (!aborted2) {
                 const message = error instanceof Error ? error.message : String(error);
                 if (!committing && /aborted/i.test(message)) {
                   reject(error);
@@ -32509,9 +32551,9 @@ ${diffResult.diff}`);
             reject(new Error("Operation aborted"));
             return;
           }
-          let aborted = false;
+          let aborted2 = false;
           const onAbort = () => {
-            aborted = true;
+            aborted2 = true;
             reject(new Error("Operation aborted"));
           };
           signal?.addEventListener("abort", onAbort, { once: true });
@@ -32534,7 +32576,7 @@ ${diffResult.diff}`);
                 entries = directoryRead.entries;
                 directoryLimitReached = directoryRead.limitReached;
               } catch (e) {
-                if (aborted) return;
+                if (aborted2) return;
                 const message = String(e?.message || e || "Unknown error");
                 if (/scandir/i.test(message) || /not a directory/i.test(message)) {
                   reject(new Error(`Not a directory: ${targetPath}`));
@@ -32543,13 +32585,13 @@ ${diffResult.diff}`);
                 reject(new Error(`Cannot read directory: ${message}`));
                 return;
               }
-              if (aborted || signal?.aborted) return;
+              if (aborted2 || signal?.aborted) return;
               entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
               const results = [];
               let entryLimitReached = directoryLimitReached || entries.length > effectiveLimit;
               let skippedEntry = false;
               for (const entry of entries) {
-                if (aborted || signal?.aborted) return;
+                if (aborted2 || signal?.aborted) return;
                 if (results.length >= effectiveLimit) {
                   entryLimitReached = true;
                   break;
@@ -38783,6 +38825,21 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
   var sseBuffers = /* @__PURE__ */ new Map();
   var cancelNativeRequest = () => {
   };
+  function deferResolveToNextFrame(resolve2) {
+    const globals = globalThis;
+    const bridge2 = globals.CS?.Pie?.PieFileBridge;
+    const startDelay = typeof bridge2?.StartDelay === "function" ? bridge2.StartDelay : void 0;
+    if (typeof startDelay !== "function") {
+      queueMicrotask(resolve2);
+      return;
+    }
+    const requestId = Number(startDelay.call(bridge2, 17));
+    if (!Number.isSafeInteger(requestId) || requestId <= 0) {
+      queueMicrotask(resolve2);
+      return;
+    }
+    waitForPieFileBridgeRequest(requestId).catch(() => void 0).then(resolve2, resolve2);
+  }
   function isTruncatedStreamError(message) {
     const normalized = message.toLowerCase();
     return normalized.includes("expecting chunk trailer") || normalized.includes("premature eof") || normalized.includes("premature end") || normalized.includes("ended prematurely") || normalized.includes("unexpected eof") || normalized.includes("unexpected end") || normalized.includes("ended unexpectedly") || normalized.includes("response body was truncated");
@@ -38948,7 +39005,7 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
       if (buf.resolve) {
         const r = buf.resolve;
         buf.resolve = void 0;
-        r();
+        deferResolveToNextFrame(r);
       }
     };
     globals._pieSSETerminal = (requestId, error) => {
@@ -38968,7 +39025,7 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
       if (buf.resolve) {
         const r = buf.resolve;
         buf.resolve = void 0;
-        r();
+        deferResolveToNextFrame(r);
       }
     };
   }
@@ -39591,6 +39648,49 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
     })}`);
     lines.push("data: [DONE]");
     return lines;
+  }
+
+  // src/unity-sha256.ts
+  function installUnitySha256(resolve2 = () => typeof CS === "undefined" ? void 0 : CS.Pie?.PieUtf8Sha256) {
+    return installUtf8Sha256HasherFactory(() => {
+      const Type2 = resolve2();
+      if (typeof Type2 !== "function") return void 0;
+      const native = new Type2();
+      try {
+        if (typeof native.UpdateUtf8 !== "function" || typeof native.DigestHex !== "function" || typeof native.Dispose !== "function") {
+          if (typeof native.Dispose === "function") native.Dispose();
+          return void 0;
+        }
+      } catch (error) {
+        try {
+          native.Dispose?.();
+        } catch {
+        }
+        throw error;
+      }
+      let ended = false;
+      let disposed = false;
+      const check = () => {
+        if (ended || disposed) throw new Error("Hash is no longer active");
+      };
+      return {
+        updateUtf8(text) {
+          check();
+          native.UpdateUtf8(text);
+        },
+        digestHex() {
+          check();
+          ended = true;
+          return native.DigestHex();
+        },
+        dispose() {
+          if (!disposed) {
+            disposed = true;
+            native.Dispose();
+          }
+        }
+      };
+    });
   }
 
   // src/skills.ts
@@ -46204,6 +46304,7 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
   }
 
   // src/unity-script-host.ts
+  var SOFT_SLICE_MS = 4;
   var DEFAULT_TOTAL_TIMEOUT_MS = 3e4;
   var DEFAULT_PER_STEP_TIMEOUT_MS = 100;
   var DEFAULT_MAX_FRAMES = 1800;
@@ -46214,6 +46315,43 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
     if (!application?.isPlaying) return void 0;
     const frameCount = typeof CS !== "undefined" ? CS?.UnityEngine?.Time?.frameCount : void 0;
     return typeof frameCount === "number" ? frameCount : void 0;
+  }
+  function createSliceClock() {
+    const sources = [
+      () => {
+        const value = typeof CS !== "undefined" ? CS?.UnityEngine?.Time?.realtimeSinceStartupAsDouble : void 0;
+        return typeof value === "number" ? value * 1e3 : NaN;
+      },
+      () => typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : NaN,
+      () => Date.now()
+    ];
+    let selected = 0, offset2 = 0, fresh = true;
+    let last;
+    return () => {
+      while (selected < sources.length) {
+        let value = NaN;
+        try {
+          value = sources[selected]();
+        } catch {
+        }
+        if (Number.isFinite(value)) {
+          if (fresh) {
+            offset2 = last === void 0 ? 0 : last - value;
+            fresh = false;
+          }
+          last = Math.max(last ?? -Infinity, value + offset2);
+          return last;
+        }
+        fresh = true;
+        if (selected === sources.length - 1) return last ?? 0;
+        selected++;
+      }
+      return last ?? 0;
+    };
+  }
+  var defaultSliceClock = createSliceClock();
+  function sliceNowMs() {
+    return scriptScheduler.sliceNow?.() ?? defaultSliceClock();
   }
   var installedBridge = null;
   var scriptScheduler = {
@@ -46330,6 +46468,9 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
       protection: {
         model: "cooperative-yield",
         hardStepTermination,
+        slicePolicy: "post-action-awaited",
+        softSliceMs: SOFT_SLICE_MS,
+        sliceScope: "task-local; sequential awaited calls only; native calls are not preempted",
         note: "The task is frame-scheduled and guarded by a script-level step deadline on common loop shapes. pie-unity uses PuerTS 2.2.2 JsEnv + BackendType.V8 and does not rely on native V8 termination."
       }
     };
@@ -46488,12 +46629,15 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
         assertTaskActive(task);
       }
       if (result && typeof result.then === "function") {
-        return Promise.resolve(result).then((value) => {
+        const pending = Promise.resolve(result).then((value) => {
           assertTaskActive(task);
-          return value;
+          return deliverResult(value);
         });
+        void pending.catch(() => {
+        });
+        return pending;
       }
-      return Promise.resolve(result);
+      return deliverResult(result);
     };
     const createStepGate = (waitFrames, waitUntilMs) => {
       assertTaskActive(task);
@@ -46502,8 +46646,19 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
           resolve: resolve2,
           reject,
           waitFrames: Math.max(0, Math.floor(waitFrames)),
-          waitUntilMs
+          waitUntilMs,
+          createdHostFrame: scriptScheduler.frame?.()
         });
+      });
+      void pending.catch(() => {
+      });
+      return pending;
+    };
+    const deliverResult = (value) => {
+      if (sliceNowMs() - task.sliceStartMs < SOFT_SLICE_MS) return Promise.resolve(value);
+      const pending = createStepGate(1, 0).then(() => {
+        assertTaskActive(task);
+        return value;
       });
       void pending.catch(() => {
       });
@@ -46571,26 +46726,30 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
         return runHostAction(() => unity.refresh());
       },
       rollback() {
-        return runHostAction(() => {
-          const refs = [...task.createdRefs].reverse();
-          const failures = [];
-          let rolledBack = 0;
-          for (const ref2 of refs) {
-            assertTaskActive(task);
-            try {
-              unity.edit({ action: "destroy_scene_object", target: ref2 });
-              rolledBack += 1;
-              const index = task.createdRefs.lastIndexOf(ref2);
-              if (index >= 0) task.createdRefs.splice(index, 1);
-              task.mutations.push({ action: "rollback", target: toSerializable(ref2), summary: "destroyed 1 created object(s)" });
-            } catch (error) {
-              if (task.status !== "running") throw error;
-              failures.push({ target: toSerializable(ref2), error: error instanceof Error ? error.message : String(error) });
-            }
-            assertTaskActive(task);
+        const rollbackRefs = [...task.createdRefs].reverse();
+        const rollbackState = { rolledBack: 0, failures: [] };
+        let rollbackCursor = 0;
+        const destroyNext = () => runHostAction(() => {
+          assertTaskActive(task);
+          if (rollbackCursor >= rollbackRefs.length) return;
+          const ref2 = rollbackRefs[rollbackCursor];
+          rollbackCursor += 1;
+          try {
+            unity.edit({ action: "destroy_scene_object", target: ref2 });
+            rollbackState.rolledBack += 1;
+            const index = task.createdRefs.lastIndexOf(ref2);
+            if (index >= 0) task.createdRefs.splice(index, 1);
+            task.mutations.push({ action: "rollback", target: toSerializable(ref2), summary: "destroyed 1 created object(s)" });
+          } catch (error) {
+            if (task.status !== "running") throw error;
+            rollbackState.failures.push({ target: toSerializable(ref2), error: error instanceof Error ? error.message : String(error) });
           }
-          return { rolledBack, failures };
+          assertTaskActive(task);
         });
+        return (async () => {
+          while (rollbackCursor < rollbackRefs.length && task.status === "running") await destroyNext();
+          return { rolledBack: rollbackState.rolledBack, failures: rollbackState.failures };
+        })();
       },
       host: hostSelector,
       runtime: {
@@ -46693,6 +46852,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     if (task.gates.length === 0) return;
     const ready = [];
     task.gates = task.gates.filter((gate) => {
+      if (hostFrame !== void 0 && hostFrame === gate.createdHostFrame) return true;
       if (gate.waitUntilMs > 0 && now < gate.waitUntilMs) return true;
       if (gate.waitFrames > 0) gate.waitFrames -= 1;
       if (gate.waitFrames > 0) return true;
@@ -46701,6 +46861,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     });
     if (ready.length === 0) return;
     task.stepStartMs = now;
+    task.sliceStartMs = sliceNowMs();
     task.updatedAt = nowIso3();
     for (const gate of ready) gate.resolve();
     try {
@@ -46730,6 +46891,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       maxFrames: Math.floor(toPositiveNumber(payload.maxFrames, DEFAULT_MAX_FRAMES)),
       gates: [],
       stepStartMs: 0,
+      sliceStartMs: 0,
       waiters: []
     };
     getRunStore().set(task.id, task);
@@ -46742,6 +46904,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       const ctx = createTaskContext(bridge2, task, args);
       const entry = compileScriptEntry(script, task);
       task.stepStartMs = nowMs();
+      task.sliceStartMs = sliceNowMs();
       settleEntryResult(task, entry(ctx, args));
     } catch (error) {
       failTask(task, classifyScriptError(error), describeScriptError(error));
@@ -47296,14 +47459,14 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     }
     return out;
   }
-  function recoveryHelp(record, operation) {
-    const nested = isRecord10(record.result) ? record.result : {};
-    const code = String(nested.errorCode || record.errorCode || record.code || "");
-    if (record.executionStateUnknown === true || nested.executionStateUnknown === true || code === "HOST_TIMEOUT") return ["Query current Unity state before retrying; prior scene edits may have applied."];
-    if (nested.partial === true || record.partial === true) return ["Inspect appliedOperations and current Unity state before deciding whether to undo or continue."];
+  function recoveryHelp(record2, operation) {
+    const nested = isRecord10(record2.result) ? record2.result : {};
+    const code = String(nested.errorCode || record2.errorCode || record2.code || "");
+    if (record2.executionStateUnknown === true || nested.executionStateUnknown === true || code === "HOST_TIMEOUT") return ["Query current Unity state before retrying; prior scene edits may have applied."];
+    if (nested.partial === true || record2.partial === true) return ["Inspect appliedOperations and current Unity state before deciding whether to undo or continue."];
     if (code === "SCRIPT_CONTRACT") return ["Use export async function run(ctx, args) and await host calls or frame waits."];
     if (code === "RPC_UNAUTHORIZED") return ["Refresh the selected instance token and retry once."];
-    if (record.ok === false) return [operation ? `Inspect ${operation} arguments and the host manifest before retrying.` : "Inspect the error code and host manifest before retrying."];
+    if (record2.ok === false) return [operation ? `Inspect ${operation} arguments and the host manifest before retrying.` : "Inspect the error code and host manifest before retrying."];
     return [];
   }
   function formatAgentOutput(value, options = {}) {
@@ -47323,6 +47486,75 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     return encode(body);
   }
 
+  // src/unity-screenshot-request.ts
+  var METHODS = ["screenshot.begin", "screenshot.poll", "screenshot.cancel"];
+  function aborted(signal) {
+    if (signal?.aborted) throw new Error("Screenshot request aborted.");
+  }
+  function wait(ms, signal) {
+    return new Promise((resolve2, reject) => {
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        if (error) reject(error);
+        else resolve2();
+      };
+      const onAbort = () => finish(new Error("Screenshot request aborted."));
+      const timer = setTimeout(() => finish(), ms);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
+  }
+  function record(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid screenshot RPC response.");
+    return value;
+  }
+  async function requestUnityScreenshot(rpc, args, signal, options = {}) {
+    aborted(signal);
+    const inventory = record(rpc.call("rpc.list", {}));
+    if (!Array.isArray(inventory.methods) || !inventory.methods.every((name) => typeof name === "string"))
+      throw new Error("Invalid screenshot RPC inventory.");
+    aborted(signal);
+    if (!METHODS.every((method) => inventory.methods.includes(method))) {
+      return rpc.call("unity_screenshot", args);
+    }
+    const requestId = `shot_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+    const deadline = Date.now() + (options.timeoutMs ?? 45e3);
+    let succeeded = false;
+    try {
+      let response = record(rpc.call("screenshot.begin", { ...args, requestId }));
+      while (true) {
+        aborted(signal);
+        if (response.requestId !== requestId) throw new Error("Screenshot RPC returned a foreign request.");
+        if (response.status === "succeeded") {
+          const result = record(response.result);
+          if (typeof result.path !== "string" || typeof result.absolutePath !== "string" || typeof result.bytes !== "number" || result.bytes <= 0)
+            throw new Error("Invalid completed screenshot result.");
+          succeeded = true;
+          return result;
+        }
+        if (response.status !== "pending")
+          throw new Error(typeof response.error === "string" && response.error ? response.error : `Screenshot request ${String(response.status)}.`);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error("Screenshot request timed out.");
+        await wait(Math.min(options.pollIntervalMs ?? 25, remaining), signal);
+        aborted(signal);
+        if (Date.now() >= deadline) throw new Error("Screenshot request timed out.");
+        response = record(rpc.call("screenshot.poll", { requestId }));
+      }
+    } finally {
+      if (!succeeded) {
+        try {
+          rpc.call("screenshot.cancel", { requestId });
+        } catch {
+        }
+      }
+    }
+  }
+
   // src/tools/unity-dev-rpc.ts
   function requireBridge() {
     const bridge2 = globalThis.pieBridge;
@@ -47335,20 +47567,20 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     return value && typeof value === "object" ? value : {};
   }
   function splitToolParams(value) {
-    const record = asRecord(value);
-    const { full, ...rpcArgs } = record;
+    const record2 = asRecord(value);
+    const { full, ...rpcArgs } = record2;
     return { rpcArgs, full: full === true };
   }
-  function createDevRpcTool(name, description, method, parameters) {
+  function createDevRpcTool(name, description, method, parameters, executeRpc) {
     return {
       name,
       label: name,
       description,
       parameters,
-      execute: async (_toolCallId, params) => {
+      execute: async (_toolCallId, params, signal) => {
         try {
           const { rpcArgs, full } = splitToolParams(params);
-          const result = requireBridge().devRpc.call(method, rpcArgs);
+          const result = executeRpc ? await executeRpc(rpcArgs, signal) : requireBridge().devRpc.call(method, rpcArgs);
           const text = formatAgentOutput(result, { operation: name, full });
           return {
             content: [{ type: "text", text }],
@@ -47377,11 +47609,11 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
         }),
         execute: async (_toolCallId, params) => {
           try {
-            const record = asRecord(params);
-            const tool = String(record.tool || "").trim();
+            const record2 = asRecord(params);
+            const tool = String(record2.tool || "").trim();
             if (!tool) throw new Error("tool is required.");
-            const data2 = asRecord(record.data);
-            const full = record.full === true;
+            const data2 = asRecord(record2.data);
+            const full = record2.full === true;
             const result = requireBridge().devRpc.call(tool, data2);
             return {
               content: [{ type: "text", text: formatAgentOutput(result, { operation: tool, full }) }],
@@ -47487,12 +47719,13 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
           path: Type.Optional(Type.String({ description: "Relative path under PieScreenshots/ for the PNG (default: timestamped capture_*.png). No '..' segments." })),
           includeUI: Type.Optional(Type.Boolean({ description: "Set false to capture via a camera render with UI canvases temporarily disabled (chat panels, HUD); that fresh render can differ from the final presented frame. Default true (play mode, no cameraName) captures the final game view including overlay UI." })),
           full: Type.Optional(Type.Boolean({ description: "Return untruncated model-facing output when the result is large." }))
-        })
+        }),
+        (args, signal) => requestUnityScreenshot(requireBridge().devRpc, args, signal)
       ),
       {
         name: "unity_script_run",
         label: "unity_script_run",
-        description: 'Run an async JavaScript task against the live Unity instance. The script must define `export async function run(ctx, args)`. Await frame boundaries with `await ctx.nextFrame()`, `await ctx.waitFrames(n)`, or `await ctx.waitSeconds(s)`. Await engine/host calls such as `await ctx.edit({ action: "create_scene_object", name: "Player" })`, `await ctx.query(...)`, `await ctx.inspect(...)`, `await ctx.host(namespace).call(name, args)`, and `await ctx.runtime.call(path, argsArray)`. Do not pass C#, shader source, or plain file contents to this tool, and do not use it to create project files. Long synchronous loops fail with STEP_TIMEOUT; this tool does not promise arbitrary synchronous JS preemption. Scene edits applied before a failure are reported through `partial`/`appliedOperations`, and `await ctx.rollback()` best-effort destroys objects the run created. It returns only after the task completes, fails, or times out.',
+        description: 'Run an async JavaScript task against the live Unity instance. The script must define `export async function run(ctx, args)`. Await frame boundaries with `await ctx.nextFrame()`, `await ctx.waitFrames(n)`, or `await ctx.waitSeconds(s)`. Await engine/host calls such as `await ctx.edit({ action: "create_scene_object", name: "Player" })`, `await ctx.query(...)`, `await ctx.inspect(...)`, `await ctx.host(namespace).call(name, args)`, and `await ctx.runtime.call(path, argsArray)`. Do not pass C#, shader source, or plain file contents to this tool, and do not use it to create project files. Sequential awaited host calls automatically yield result delivery to the next frame after a task-local 4ms soft wall-time slice. Actions still dispatch immediately and are never replayed; hard perStepTimeoutMs/totalTimeoutMs/maxFrames limits are separate. Promise.all/unawaited calls, synchronous ctx helpers, rollback\'s internal destroy loop and single expensive native calls cannot be soft-preempted; this is not a global frame-time guarantee. Long synchronous loops fail with STEP_TIMEOUT; this tool does not promise arbitrary synchronous JS preemption. Scene edits applied before a failure are reported through `partial`/`appliedOperations`, and `await ctx.rollback()` best-effort destroys objects the run created. It returns only after the task completes, fails, or times out.',
         parameters: Type.Object({
           script: Type.String(),
           name: Type.Optional(Type.String()),
@@ -48087,6 +48320,7 @@ ${extensionSection.join("\n\n---\n\n")}
   }
 
   // src/session-store.ts
+  var REBUILD_BATCH_MESSAGES = 64;
   function getSessionsDir(projectRoot2) {
     const fromBridge = globalThis.pieBridge?.getSessionsDirectory?.();
     if (typeof fromBridge === "string" && fromBridge.length > 0) {
@@ -48094,17 +48328,27 @@ ${extensionSection.join("\n\n---\n\n")}
     }
     return getPlatformConfig().sessionsPath;
   }
+  var cachedSessionsGateway;
   function getSessionGateway(projectRoot2) {
-    const sessionsDir = getSessionsDir(projectRoot2);
-    return new FileSystemGateway({
-      allowedRoots: [sessionsDir, getPlatformConfig().dataPath]
+    const dir = getSessionsDir(projectRoot2);
+    if (cachedSessionsGateway?.dir === dir) {
+      return cachedSessionsGateway.gateway;
+    }
+    const gateway = new FileSystemGateway({
+      allowedRoots: [dir, getPlatformConfig().dataPath]
     });
+    cachedSessionsGateway = { dir, gateway };
+    return gateway;
   }
+  var knownSessionsDirs;
   function ensureSessionsDir(projectRoot2) {
     const dir = getSessionsDir(projectRoot2);
-    const gateway = getSessionGateway(projectRoot2);
-    if (!gateway.exists(dir)) {
-      gateway.mkdir(dir, { recursive: true });
+    if (!knownSessionsDirs?.has(dir)) {
+      const gateway = getSessionGateway(projectRoot2);
+      if (!gateway.exists(dir)) {
+        gateway.mkdir(dir, { recursive: true });
+      }
+      (knownSessionsDirs ??= /* @__PURE__ */ new Set()).add(dir);
     }
     return dir;
   }
@@ -48129,8 +48373,8 @@ ${extensionSection.join("\n\n---\n\n")}
     } else if (Array.isArray(contentValue)) {
       content = contentValue.map((block) => {
         if (!block || typeof block !== "object") return "";
-        const record = block;
-        return record.type === "text" && typeof record.text === "string" ? record.text : "";
+        const record2 = block;
+        return record2.type === "text" && typeof record2.text === "string" ? record2.text : "";
       }).join(" ");
     }
     const compact2 = String(content || "New Session").replace(/\s+/g, " ").trim();
@@ -48176,10 +48420,10 @@ ${extensionSection.join("\n\n---\n\n")}
       executionState: params.executionState ? restoreExecutionState(params.executionState) : void 0
     };
   }
-  function isSessionEmpty(record) {
-    if (!record) return true;
-    const messageCount = Array.isArray(record.messages) ? record.messages.length : 0;
-    const todoCount = Array.isArray(record.todoState) ? record.todoState.length : 0;
+  function isSessionEmpty(record2) {
+    if (!record2) return true;
+    const messageCount = Array.isArray(record2.messages) ? record2.messages.length : 0;
+    const todoCount = Array.isArray(record2.todoState) ? record2.todoState.length : 0;
     return messageCount === 0 && todoCount === 0;
   }
   var SESSION_IMAGE_BUDGET_CHARS = 6 * 1024 * 1024;
@@ -48236,39 +48480,154 @@ ${extensionSection.join("\n\n---\n\n")}
       autoSaveInterval: 0
     });
   }
-  async function saveSession(projectRoot2, record) {
+  var residentManagers = /* @__PURE__ */ new Map();
+  var saveChains = /* @__PURE__ */ new Map();
+  function serializeSave(sessionId, action) {
+    const previous = saveChains.get(sessionId) ?? Promise.resolve();
+    const run = previous.then(action, action);
+    const settled = () => {
+      if (saveChains.get(sessionId) === tail) saveChains.delete(sessionId);
+    };
+    const tail = run.then(settled, settled);
+    saveChains.set(sessionId, tail);
+    return run;
+  }
+  async function yieldToNextTick() {
+    const bridge2 = typeof CS !== "undefined" ? CS.Pie?.PieFileBridge : void 0;
+    const startDelay = typeof bridge2?.StartDelay === "function" ? bridge2.StartDelay : void 0;
+    if (typeof startDelay !== "function") {
+      await new Promise((resolve2) => setTimeout(resolve2, 0));
+      return;
+    }
+    const requestId = Number(startDelay.call(bridge2, 17));
+    if (!Number.isSafeInteger(requestId) || requestId <= 0) {
+      await new Promise((resolve2) => setTimeout(resolve2, 0));
+      return;
+    }
+    const completion = await waitForPieFileBridgeRequest(requestId);
+    if (completion.error) {
+      await new Promise((resolve2) => setTimeout(resolve2, 0));
+    }
+  }
+  function residentKey(projectRoot2, sessionId) {
+    return `${getSessionsDir(projectRoot2)}::${sessionId}`;
+  }
+  function takeResidentManager(projectRoot2, sessionId) {
+    const key = residentKey(projectRoot2, sessionId);
+    const resident = residentManagers.get(key);
+    if (!resident) return void 0;
+    if (resident.manager.getActiveSessionId() !== sessionId) {
+      residentManagers.delete(key);
+      resident.manager.dispose();
+      return void 0;
+    }
+    return resident;
+  }
+  async function loadResidentManager(projectRoot2, sessionId, title, options) {
+    const existing = takeResidentManager(projectRoot2, sessionId);
+    if (existing) return existing;
+    const manager = createManager(projectRoot2);
+    const loaded = await manager.loadSession(sessionId, { warnIfMissing: false });
+    if (!loaded) {
+      if (options?.createIfMissing === false) {
+        manager.dispose();
+        return null;
+      }
+      await manager.createSession(title, void 0, sessionId);
+      return registerResident({ manager, committedMessages: [], sessionId }, projectRoot2);
+    }
+    return registerResident({ manager, committedMessages: manager.getMessages(), sessionId }, projectRoot2);
+  }
+  function registerResident(resident, projectRoot2) {
+    const key = residentKey(projectRoot2, resident.sessionId);
+    const existing = residentManagers.get(key);
+    if (existing && existing !== resident) {
+      resident.manager.dispose();
+      return existing;
+    }
+    residentManagers.set(key, resident);
+    return resident;
+  }
+  function dropResidentManager(projectRoot2, sessionId) {
+    const key = residentKey(projectRoot2, sessionId);
+    const resident = residentManagers.get(key);
+    if (!resident) return;
+    residentManagers.delete(key);
+    resident.manager.dispose();
+  }
+  async function saveSession(projectRoot2, record2) {
     ensureSessionsDir(projectRoot2);
+    const now = isoNow();
+    const rawMessages = Array.isArray(record2.messages) ? record2.messages : [];
+    const messagesNeedImageCap = rawMessages.some(hasImageBlocks);
     const normalized = {
-      ...record,
-      createdAt: record.createdAt || isoNow(),
-      updatedAt: isoNow(),
-      messageCount: Array.isArray(record.messages) ? record.messages.length : 0,
+      ...record2,
+      createdAt: record2.createdAt || now,
+      updatedAt: now,
+      messageCount: rawMessages.length,
       // Single gate bounding the base64 image payload in the persisted record
       // (placeholder overflow), regardless of caller. A capped older message no
       // longer matches its committed copy, which routes the save to the rebuild
       // path below instead of an incremental append.
-      messages: capSessionImagePayload(Array.isArray(record.messages) ? record.messages : []),
-      todoState: normalizeTodoState(record.todoState)
+      messages: messagesNeedImageCap ? capSessionImagePayload(rawMessages) : rawMessages,
+      todoState: normalizeTodoState(record2.todoState)
     };
     if (isSessionEmpty(normalized)) {
-      await deleteSession(projectRoot2, normalized.id);
+      await serializeSave(normalized.id, () => deleteSessionLocked(projectRoot2, normalized.id));
       return normalized;
     }
-    const manager = createManager(projectRoot2);
+    return serializeSave(normalized.id, () => saveSessionLocked(projectRoot2, normalized));
+  }
+  async function saveSessionLocked(projectRoot2, normalized) {
+    const resident = await loadResidentManager(projectRoot2, normalized.id, normalized.title);
+    if (!resident) {
+      throw new Error(`Failed to open resident session manager for ${normalized.id}`);
+    }
+    const { manager } = resident;
     try {
-      await manager.createSession(normalized.title, void 0, normalized.id);
-      const loaded = await manager.loadSession(normalized.id, { warnIfMissing: false });
-      const committedMessages = loaded ? manager.getMessages() : [];
-      const isPrefix = committedMessages.length <= normalized.messages.length && committedMessages.every((message, index) => message === normalized.messages[index]);
+      const committed = resident.committedMessages;
+      const isPrefix = committed.length <= normalized.messages.length && committed.every((message, index) => message === normalized.messages[index]);
       if (!isPrefix) {
         await manager.deleteSession(normalized.id);
         await manager.createSession(normalized.title, void 0, normalized.id);
-        for (const message of normalized.messages) {
-          manager.addMessage(message);
+        resident.committedMessages = [];
+        const totalMessages = normalized.messages.length;
+        for (let start = 0; start < totalMessages; start += REBUILD_BATCH_MESSAGES) {
+          if (start > 0) {
+            await yieldToNextTick();
+            if (manager.getActiveSessionId() !== normalized.id) {
+              throw new Error(`Session ${normalized.id} changed during sliced rebuild`);
+            }
+          }
+          const batch = normalized.messages.slice(start, start + REBUILD_BATCH_MESSAGES);
+          for (const message of batch) {
+            manager.addMessage(message);
+          }
+          await manager.save();
+          resident.committedMessages = normalized.messages.slice(0, Math.min(start + REBUILD_BATCH_MESSAGES, totalMessages));
         }
       } else {
-        for (const message of normalized.messages.slice(committedMessages.length)) {
-          manager.addMessage(message);
+        const tailLength = normalized.messages.length - committed.length;
+        if (tailLength > REBUILD_BATCH_MESSAGES) {
+          for (let start = committed.length; start < normalized.messages.length; start += REBUILD_BATCH_MESSAGES) {
+            if (start > committed.length) {
+              await yieldToNextTick();
+              if (manager.getActiveSessionId() !== normalized.id) {
+                throw new Error(`Session ${normalized.id} changed during sliced append`);
+              }
+            }
+            const batch = normalized.messages.slice(start, start + REBUILD_BATCH_MESSAGES);
+            for (const message of batch) {
+              manager.addMessage(message);
+            }
+            await manager.save();
+            resident.committedMessages = normalized.messages.slice(0, Math.min(start + REBUILD_BATCH_MESSAGES, normalized.messages.length));
+          }
+        } else {
+          for (const message of normalized.messages.slice(committed.length)) {
+            manager.addMessage(message);
+          }
+          resident.committedMessages = normalized.messages.slice();
         }
       }
       const activeSession = manager.getActiveSession();
@@ -48283,12 +48642,20 @@ ${extensionSection.join("\n\n---\n\n")}
         metadata.executionState = normalized.executionState ? restoreExecutionState(normalized.executionState) : void 0;
       }
       await manager.save();
-    } finally {
-      manager.dispose();
+      if (manager.getActiveSessionId() !== normalized.id) {
+        dropResidentManager(projectRoot2, normalized.id);
+      }
+    } catch (err) {
+      dropResidentManager(projectRoot2, normalized.id);
+      throw err;
     }
     return normalized;
   }
   async function deleteSession(projectRoot2, sessionId) {
+    await serializeSave(sessionId, () => deleteSessionLocked(projectRoot2, sessionId));
+  }
+  async function deleteSessionLocked(projectRoot2, sessionId) {
+    dropResidentManager(projectRoot2, sessionId);
     const manager = createManager(projectRoot2);
     try {
       await manager.deleteSession(sessionId);
@@ -48297,35 +48664,37 @@ ${extensionSection.join("\n\n---\n\n")}
     }
   }
   async function loadSession(projectRoot2, sessionId) {
-    const manager = createManager(projectRoot2);
-    try {
-      const loaded = await manager.loadSession(sessionId, { warnIfMissing: false });
-      if (!loaded) {
-        return null;
-      }
-      const active = manager.getActiveSession();
-      if (!active) {
-        return null;
-      }
-      const metadata = active.metadata;
-      const messages = manager.getMessages();
-      const title = metadata.name && metadata.name.length > 0 ? metadata.name : deriveSessionTitle(messages);
-      return {
-        id: active.id,
-        title,
-        createdAt: toIsoString(metadata.createdAt),
-        updatedAt: toIsoString(metadata.updatedAt),
-        parentSessionId: typeof metadata.parentSessionId === "string" ? metadata.parentSessionId : void 0,
-        provider: typeof metadata.provider === "string" ? metadata.provider : "openai",
-        modelId: typeof metadata.modelId === "string" ? metadata.modelId : "unknown",
-        messageCount: messages.length,
-        messages,
-        todoState: normalizeTodoState(metadata.todoState),
-        executionState: metadata.executionState ? restoreExecutionState(metadata.executionState) : void 0
-      };
-    } finally {
-      manager.dispose();
+    const resident = await loadResidentManager(projectRoot2, sessionId, "", { createIfMissing: false });
+    if (!resident) {
+      return null;
     }
+    const manager = resident.manager;
+    if (manager.getActiveSessionId() !== sessionId) {
+      dropResidentManager(projectRoot2, sessionId);
+      return null;
+    }
+    const active = manager.getActiveSession();
+    if (!active) {
+      dropResidentManager(projectRoot2, sessionId);
+      return null;
+    }
+    const metadata = active.metadata;
+    const messages = manager.getMessages();
+    resident.committedMessages = messages;
+    const title = metadata.name && metadata.name.length > 0 ? metadata.name : deriveSessionTitle(messages);
+    return {
+      id: active.id,
+      title,
+      createdAt: toIsoString(metadata.createdAt),
+      updatedAt: toIsoString(metadata.updatedAt),
+      parentSessionId: typeof metadata.parentSessionId === "string" ? metadata.parentSessionId : void 0,
+      provider: typeof metadata.provider === "string" ? metadata.provider : "openai",
+      modelId: typeof metadata.modelId === "string" ? metadata.modelId : "unknown",
+      messageCount: messages.length,
+      messages,
+      todoState: normalizeTodoState(metadata.todoState),
+      executionState: metadata.executionState ? restoreExecutionState(metadata.executionState) : void 0
+    };
   }
   async function listSessions(projectRoot2) {
     const manager = createManager(projectRoot2);
@@ -48375,592 +48744,125 @@ ${extensionSection.join("\n\n---\n\n")}
     return lines.join("\n");
   }
 
-  // src/runtime-chat-projection.ts
-  var MAX_ASSISTANT_TEXT = 12e3;
-  var MAX_SUMMARY = 512;
-  var MAX_TOOL_FIELD = 4e3;
-  var MAX_TIMELINE_ITEMS = 500;
-  var MAX_TURNS = 50;
-  var MAX_TRACKED_TOOL_ORIGINS = 256;
-  var UNCLOSED_TOOL_NOTE = "Tool did not report a result before the turn ended.";
-  function isRecord11(value) {
-    return !!value && typeof value === "object" && !Array.isArray(value);
-  }
-  function truncate2(value, limit) {
-    if (value.length <= limit) return { value, truncated: false };
-    return { value: value.slice(0, limit), truncated: true };
-  }
-  function summary(value) {
-    return truncate2(value.replace(/\s+/g, " ").trim(), MAX_SUMMARY).value;
-  }
-  function jsonText(value) {
-    let encoded = "";
-    try {
-      encoded = JSON.stringify(value ?? {}) ?? "";
-    } catch {
-      encoded = "";
+  // src/session-sync-frame.ts
+  var emptyIncrementalSyncState = () => ({
+    sessionId: "",
+    sentMessages: []
+  });
+  function planSessionSyncFrame(history, sessionId, previouslySent) {
+    if (previouslySent.sessionId !== sessionId) {
+      return { kind: "full", reason: "session-changed" };
     }
-    return truncate2(encoded, MAX_TOOL_FIELD);
-  }
-  function timestampOf(message, fallback) {
-    const timestamp = message?.timestamp;
-    return typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : fallback;
-  }
-  function messageText(message) {
-    const content = message?.content;
-    if (typeof content === "string") return content;
-    if (!Array.isArray(content)) return "";
-    return content.filter((block) => isRecord11(block) && block.type === "text").map((block) => typeof block.text === "string" ? block.text : "").join("");
-  }
-  function displayText(message) {
-    const display = message?.displayContent;
-    return typeof display === "string" && display.length > 0 ? display : messageText(message);
-  }
-  function clientTurnIdOf(message) {
-    const id = message?.clientTurnId;
-    return typeof id === "string" ? id : "";
-  }
-  function toolResultText(message) {
-    return messageText(message);
-  }
-  function baseTimelineItem(params) {
-    return {
-      schemaVersion: 1,
-      sessionId: params.sessionId,
-      clientTurnId: params.clientTurnId,
-      itemId: params.itemId,
-      kind: params.kind,
-      status: params.status,
-      startedAt: params.timestamp,
-      updatedAt: params.timestamp,
-      completedAt: params.status === "running" ? 0 : params.timestamp,
-      text: "",
-      summary: "",
-      toolCallId: "",
-      toolName: "",
-      argsJson: "",
-      resultText: "",
-      detailsJson: "",
-      isError: params.status === "failed",
-      isTruncated: false
-    };
-  }
-  function normalizedTurnId(sessionId, timestamp, messageIndex, value) {
-    return value || `${sessionId}:turn:${timestamp}:${messageIndex}`;
-  }
-  function turnSlice(messages) {
-    const userIndices = [];
-    messages.forEach((message, index) => {
-      if (String(message?.role || "") === "user") userIndices.push(index);
-    });
-    const offset2 = userIndices.length > MAX_TURNS ? userIndices[userIndices.length - MAX_TURNS] : 0;
-    return { messages: messages.slice(offset2), offset: offset2 };
-  }
-  function buildRuntimeTimelineItems(sessionId, messages, createdAt, liveClientTurnId) {
-    const source = Array.isArray(messages) ? messages : [];
-    const { messages: recent, offset: offset2 } = turnSlice(source);
-    const baseTimestamp = Math.max(0, Date.parse(createdAt || "")) || 1;
-    const items = [];
-    const toolsByCallId = /* @__PURE__ */ new Map();
-    let activeClientTurnId = "";
-    let assistantIndex = -1;
-    recent.forEach((message, localIndex) => {
-      const messageIndex = offset2 + localIndex;
-      const metadata = message;
-      const role = String(metadata?.role || "assistant");
-      const timestamp = timestampOf(message, baseTimestamp + messageIndex);
-      if (role === "user") {
-        activeClientTurnId = normalizedTurnId(sessionId, timestamp, messageIndex, clientTurnIdOf(message));
-        assistantIndex = -1;
-        const textValue = truncate2(displayText(message), MAX_ASSISTANT_TEXT);
-        const item = baseTimelineItem({
-          sessionId,
-          clientTurnId: activeClientTurnId,
-          itemId: `${activeClientTurnId}:user`,
-          kind: "user",
-          status: "succeeded",
-          timestamp
-        });
-        item.text = textValue.value;
-        item.summary = summary(textValue.value);
-        item.isTruncated = textValue.truncated;
-        items.push(item);
-        return;
-      }
-      if (!activeClientTurnId) {
-        activeClientTurnId = normalizedTurnId(sessionId, timestamp, messageIndex, "");
-      }
-      if (role === "assistant") {
-        assistantIndex += 1;
-        const textValue = truncate2(messageText(message), MAX_ASSISTANT_TEXT);
-        const stopReason = typeof metadata.stopReason === "string" ? metadata.stopReason : "";
-        const errorMessage = typeof metadata.errorMessage === "string" ? metadata.errorMessage : "";
-        const status = stopReason === "aborted" ? "aborted" : stopReason === "error" || errorMessage ? "failed" : "succeeded";
-        if (textValue.value || errorMessage) {
-          const item = baseTimelineItem({
-            sessionId,
-            clientTurnId: activeClientTurnId,
-            itemId: `${activeClientTurnId}:assistant:${assistantIndex}`,
-            kind: "assistant",
-            status,
-            timestamp
-          });
-          item.text = textValue.value || errorMessage;
-          item.summary = summary(item.text);
-          item.isError = status === "failed";
-          item.isTruncated = textValue.truncated;
-          items.push(item);
-        }
-        const content = Array.isArray(metadata.content) ? metadata.content : [];
-        for (const block of content) {
-          if (!isRecord11(block) || block.type !== "toolCall") continue;
-          const callId = String(block.id || "");
-          const toolName = String(block.name || "tool");
-          const existing = callId ? toolsByCallId.get(callId) : void 0;
-          if (existing) {
-            const encodedArgs2 = jsonText(block.arguments);
-            existing.argsJson = encodedArgs2.value;
-            existing.isTruncated = existing.isTruncated || encodedArgs2.truncated;
-            if (!existing.toolName || existing.toolName === "tool") existing.toolName = toolName;
-            continue;
-          }
-          const stableCallId = callId || `${messageIndex}:${toolName}`;
-          const encodedArgs = jsonText(block.arguments);
-          const item = baseTimelineItem({
-            sessionId,
-            clientTurnId: activeClientTurnId,
-            itemId: `${activeClientTurnId}:tool:${stableCallId}`,
-            kind: "tool",
-            status: "running",
-            timestamp
-          });
-          item.toolCallId = callId;
-          item.toolName = toolName;
-          item.summary = toolName;
-          item.argsJson = encodedArgs.value;
-          item.isTruncated = encodedArgs.truncated;
-          items.push(item);
-          if (callId) toolsByCallId.set(callId, item);
-        }
-        return;
-      }
-      if (role === "toolResult") {
-        const callId = typeof metadata.toolCallId === "string" ? metadata.toolCallId : "";
-        const toolName = typeof metadata.toolName === "string" ? metadata.toolName : "tool";
-        let item = callId ? toolsByCallId.get(callId) : void 0;
-        if (!item) {
-          const stableCallId = callId || `${messageIndex}:${toolName}`;
-          item = baseTimelineItem({
-            sessionId,
-            clientTurnId: activeClientTurnId,
-            itemId: `${activeClientTurnId}:tool:${stableCallId}`,
-            kind: "tool",
-            status: "running",
-            timestamp
-          });
-          item.toolCallId = callId;
-          item.toolName = toolName;
-          items.push(item);
-          if (callId) toolsByCallId.set(callId, item);
-        }
-        const result = truncate2(toolResultText(message), MAX_TOOL_FIELD);
-        const details = jsonText(metadata.details);
-        item.status = metadata.isError === true ? "failed" : "succeeded";
-        item.updatedAt = timestamp;
-        item.completedAt = timestamp;
-        item.resultText = result.value;
-        item.detailsJson = details.value;
-        item.summary = summary(result.value) || toolName;
-        item.isError = metadata.isError === true;
-        item.isTruncated = item.isTruncated || result.truncated || details.truncated;
-      }
-    });
-    for (const item of items) {
-      if (item.kind !== "tool" || item.status !== "running") continue;
-      if (liveClientTurnId && item.clientTurnId === liveClientTurnId) continue;
-      item.status = "aborted";
-      item.completedAt = item.updatedAt;
-      if (!item.resultText) item.resultText = UNCLOSED_TOOL_NOTE;
+    const sent = previouslySent.sentMessages;
+    if (sent.length === 0) {
+      return { kind: "full", reason: "no-base" };
     }
-    return items.length > MAX_TIMELINE_ITEMS ? items.slice(items.length - MAX_TIMELINE_ITEMS) : items;
-  }
-  function createRuntimeUserMessage(content, displayContent, clientTurnId, timestamp = Date.now(), imageBlocks) {
-    const contentBlocks = imageBlocks && imageBlocks.length > 0 ? [
-      { type: "text", text: content },
-      ...imageBlocks.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType }))
-    ] : content;
-    return {
-      role: "user",
-      content: contentBlocks,
-      displayContent,
-      clientTurnId,
-      timestamp
-    };
-  }
-  function classifyRuntimeError(message) {
-    if (/expecting chunk trailer|premature (?:eof|end)|unexpected end|response ended prematurely/i.test(message)) {
-      return { code: "STREAM_TRUNCATED", category: "transport", retryable: true };
+    if (sent.length > history.length) {
+      return { kind: "full", reason: "history-shrank" };
     }
-    if (/abort(?:ed)?/i.test(message)) {
-      return { code: "ABORTED", category: "agent", retryable: false };
+    for (let i2 = 0; i2 < sent.length; i2 += 1) {
+      if (sent[i2] !== history[i2]) {
+        return { kind: "full", reason: "history-edited" };
+      }
     }
-    return { code: "AGENT_ERROR", category: "agent", retryable: false };
+    const suffix = history.slice(sent.length);
+    if (suffix.length === 0) {
+      return { kind: "incremental", baseMessageCount: sent.length, suffix };
+    }
+    return { kind: "incremental", baseMessageCount: sent.length, suffix };
   }
-  var UnityRuntimeChatProjection = class {
-    constructor(bridge2, getSessionId) {
+
+  // src/text-delta-sender.ts
+  var TEXT_DELTA_MERGE_WINDOW_MS = 50;
+  function createState() {
+    return { currentText: "", sentLength: 0, timer: void 0 };
+  }
+  var UnityTextDeltaSender = class {
+    constructor(bridge2, mergeWindowMs = TEXT_DELTA_MERGE_WINDOW_MS) {
       this.bridge = bridge2;
-      this.getSessionId = getSessionId;
+      this.mergeWindowMs = mergeWindowMs;
     }
     bridge;
-    getSessionId;
-    active = null;
+    mergeWindowMs;
+    state = createState();
+    /** A new assistant message started: forget the previous stream state. */
+    beginAssistant() {
+      this.clearTimer();
+      this.state = createState();
+    }
     /**
-     * Tool call ids started since boot, mapped to the turn that started them.
-     * Survives session switches so a late tool result can be attributed to its
-     * original turn instead of polluting the next turn of a different session.
+     * The streamed text changed. Ships the appended suffix, coalesced.
+     * Handles the three shapes the projection can produce: pure append,
+     * shrink/replace (sends a full frame), and no-change (no-op).
      */
-    toolCallOrigins = /* @__PURE__ */ new Map();
-    /**
-     * Call ids that already received a terminal card this boot. A late
-     * tool_execution_start for one of them (out-of-order forwarding) must not
-     * reopen the card as running.
-     */
-    closedToolCallIds = /* @__PURE__ */ new Set();
-    get activeClientTurnId() {
-      return this.active?.clientTurnId || "";
-    }
-    get hadToolActivity() {
-      return this.active?.hadToolActivity === true;
-    }
-    beginTurn(displayContent, requestedClientTurnId) {
-      const reserved = this.reserveTurn(displayContent, requestedClientTurnId);
-      reserved.publish();
-      return reserved.clientTurnId;
-    }
-    /** Allocate identity without calling the host; admission owns publication. */
-    reserveTurn(displayContent, requestedClientTurnId) {
-      const startedAt = Date.now();
-      const sessionId = this.getSessionId();
-      const clientTurnId = String(requestedClientTurnId || "").trim() || `turn_${startedAt.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-      this.active = {
-        sessionId,
-        clientTurnId,
-        displayContent,
-        startedAt,
-        assistantIndex: -1,
-        assistantItemId: "",
-        hadToolActivity: false,
-        terminalSent: false,
-        emittedErrorKeys: /* @__PURE__ */ new Set(),
-        toolSequence: 0,
-        toolsByCallId: /* @__PURE__ */ new Map(),
-        toolsByName: /* @__PURE__ */ new Map()
-      };
-      const value = truncate2(displayContent, MAX_ASSISTANT_TEXT);
-      const item = baseTimelineItem({
-        sessionId,
-        clientTurnId,
-        itemId: `${clientTurnId}:user`,
-        kind: "user",
-        status: "succeeded",
-        timestamp: startedAt
-      });
-      item.text = value.value;
-      item.summary = summary(value.value);
-      item.isTruncated = value.truncated;
-      return { clientTurnId, publish: () => this.emitTimeline(item) };
-    }
-    beginAssistant(timestamp = Date.now()) {
-      const active = this.active;
-      if (!active) return;
-      active.assistantIndex += 1;
-      active.assistantItemId = `${active.clientTurnId}:assistant:${active.assistantIndex}`;
-      void timestamp;
-    }
-    updateAssistant(text, timestamp = Date.now()) {
-      const active = this.active;
-      if (!active) return;
-      if (!active.assistantItemId) this.beginAssistant(timestamp);
-      const value = truncate2(text, MAX_ASSISTANT_TEXT);
-      const item = baseTimelineItem({
-        sessionId: active.sessionId,
-        clientTurnId: active.clientTurnId,
-        itemId: active.assistantItemId,
-        kind: "assistant",
-        status: "running",
-        timestamp: active.startedAt
-      });
-      item.updatedAt = timestamp;
-      item.text = value.value;
-      item.summary = summary(value.value);
-      item.isTruncated = value.truncated;
-      this.emitTimeline(item);
-    }
-    endAssistant(message, timestamp = Date.now()) {
-      const active = this.active;
-      if (!active || !active.assistantItemId) return;
-      const metadata = message;
-      const text = truncate2(messageText(message), MAX_ASSISTANT_TEXT);
-      const stopReason = typeof metadata.stopReason === "string" ? metadata.stopReason : "";
-      const errorText = typeof metadata.errorMessage === "string" ? metadata.errorMessage : "";
-      const status = stopReason === "aborted" ? "aborted" : stopReason === "error" || errorText ? "failed" : "succeeded";
-      if (!text.value && !errorText) {
-        active.assistantItemId = "";
+    updateAssistant(text) {
+      const state = this.state;
+      if (text === state.currentText) return;
+      if (!text.startsWith(state.currentText) || state.sentLength > text.length) {
+        state.currentText = text;
+        state.sentLength = text.length;
+        this.clearTimer();
+        this.bridge.sendToUnity("message_update", { type: "text_full", text });
         return;
       }
-      const item = baseTimelineItem({
-        sessionId: active.sessionId,
-        clientTurnId: active.clientTurnId,
-        itemId: active.assistantItemId,
-        kind: "assistant",
-        status,
-        timestamp: active.startedAt
-      });
-      item.updatedAt = timestamp;
-      item.completedAt = timestamp;
-      item.text = text.value || errorText;
-      item.summary = summary(item.text);
-      item.isError = status === "failed";
-      item.isTruncated = text.truncated;
-      this.emitTimeline(item);
-      active.assistantItemId = "";
+      state.currentText = text;
+      this.scheduleFlush();
     }
-    startTool(toolCallId, toolName, args, timestamp = Date.now()) {
-      const active = this.active;
-      if (!active) return;
-      active.hadToolActivity = true;
-      if (toolCallId && this.closedToolCallIds.has(toolCallId)) {
+    /** The assistant message completed: flush any pending suffix, then send a
+     *  final full frame so the consumer's state equals the message text. */
+    endAssistant(text) {
+      this.clearTimer();
+      const state = this.state;
+      if (typeof text === "string" && text.length > 0) {
+        state.currentText = text;
+        state.sentLength = text.length;
+        this.bridge.sendToUnity("message_update", { type: "text_full", text });
         return;
       }
-      const encodedArgs = jsonText(args);
-      active.toolSequence += 1;
-      const itemId = toolCallId ? `${active.clientTurnId}:tool:${toolCallId}` : `${active.clientTurnId}:tool:${toolName || "tool"}:${active.toolSequence}`;
-      const tracked = {
-        itemId,
-        startedAt: timestamp,
-        toolCallId,
-        toolName,
-        argsJson: encodedArgs.value,
-        argsTruncated: encodedArgs.truncated
-      };
-      if (toolCallId) {
-        active.toolsByCallId.set(toolCallId, tracked);
-        this.rememberToolCallOrigin(toolCallId, active, tracked);
-      }
-      const nameKey = toolName || "tool";
-      const queue = active.toolsByName.get(nameKey);
-      if (queue) queue.push(tracked);
-      else active.toolsByName.set(nameKey, [tracked]);
-      const item = baseTimelineItem({
-        sessionId: active.sessionId,
-        clientTurnId: active.clientTurnId,
-        itemId,
-        kind: "tool",
-        status: "running",
-        timestamp
-      });
-      item.toolCallId = toolCallId;
-      item.toolName = toolName;
-      item.summary = toolName;
-      item.argsJson = encodedArgs.value;
-      item.isTruncated = encodedArgs.truncated;
-      this.emitTimeline(item);
-    }
-    endTool(params) {
-      const timestamp = params.timestamp ?? Date.now();
-      const active = this.active;
-      const origin = params.toolCallId ? this.toolCallOrigins.get(params.toolCallId) : void 0;
-      if (origin && (!active || active.clientTurnId !== origin.clientTurnId)) {
-        this.toolCallOrigins.delete(params.toolCallId);
-        this.emitToolTerminal(params, {
-          sessionId: origin.sessionId,
-          clientTurnId: origin.clientTurnId,
-          startedAt: origin.item.startedAt,
-          tracked: origin.item,
-          fallbackItemId: origin.item.itemId
-        }, timestamp);
-        return;
-      }
-      if (!active) return;
-      active.hadToolActivity = true;
-      const toolNameKey = params.toolName || "tool";
-      const tracked = (params.toolCallId ? active.toolsByCallId.get(params.toolCallId) : void 0) || (params.toolCallId ? active.toolsByName.get(toolNameKey)?.find((candidate) => !candidate.toolCallId) : active.toolsByName.get(toolNameKey)?.[0]);
-      const fallbackItemId = params.toolCallId ? `${active.clientTurnId}:tool:${params.toolCallId}` : `${active.clientTurnId}:tool:${toolNameKey}:unmatched`;
-      this.emitToolTerminal(params, {
-        sessionId: active.sessionId,
-        clientTurnId: active.clientTurnId,
-        startedAt: tracked?.startedAt ?? timestamp,
-        tracked,
-        fallbackItemId
-      }, timestamp);
-      if (params.toolCallId && origin) this.toolCallOrigins.delete(params.toolCallId);
-      if (params.toolCallId) this.rememberClosedToolCallId(params.toolCallId);
-      if (tracked) {
-        if (tracked.toolCallId) active.toolsByCallId.delete(tracked.toolCallId);
-        const queueKey = tracked.toolName || "tool";
-        const queue = active.toolsByName.get(queueKey);
-        if (queue) {
-          const at2 = queue.indexOf(tracked);
-          if (at2 >= 0) queue.splice(at2, 1);
-          if (queue.length === 0) active.toolsByName.delete(queueKey);
-        }
+      if (state.sentLength < state.currentText.length) {
+        state.sentLength = state.currentText.length;
+        this.bridge.sendToUnity("message_update", { type: "text_full", text: state.currentText });
       }
     }
-    rememberClosedToolCallId(toolCallId) {
-      if (this.closedToolCallIds.size >= MAX_TRACKED_TOOL_ORIGINS) {
-        const oldest = this.closedToolCallIds.values().next().value;
-        if (oldest !== void 0) this.closedToolCallIds.delete(oldest);
-      }
-      this.closedToolCallIds.add(toolCallId);
+    /** Drop all state (turn aborted, session switched). */
+    reset() {
+      this.clearTimer();
+      this.state = createState();
     }
-    rememberToolCallOrigin(toolCallId, active, item) {
-      if (this.toolCallOrigins.size >= MAX_TRACKED_TOOL_ORIGINS) {
-        const oldest = this.toolCallOrigins.keys().next().value;
-        if (oldest !== void 0) this.toolCallOrigins.delete(oldest);
-      }
-      this.toolCallOrigins.set(toolCallId, {
-        sessionId: active.sessionId,
-        clientTurnId: active.clientTurnId,
-        item
-      });
+    scheduleFlush() {
+      if (this.state.timer !== void 0) return;
+      this.state.timer = setTimeout(() => {
+        this.state.timer = void 0;
+        this.flush();
+      }, this.mergeWindowMs);
     }
-    emitToolTerminal(params, identity, timestamp) {
-      const args = identity.tracked ? { value: identity.tracked.argsJson, truncated: identity.tracked.argsTruncated } : jsonText(params.args);
-      const resultText = truncate2(params.resultText, MAX_TOOL_FIELD);
-      const details = jsonText(params.result?.details);
-      const item = baseTimelineItem({
-        sessionId: identity.sessionId,
-        clientTurnId: identity.clientTurnId,
-        itemId: identity.tracked?.itemId || identity.fallbackItemId,
-        kind: "tool",
-        status: params.isError ? "failed" : "succeeded",
-        timestamp: identity.startedAt
-      });
-      item.updatedAt = timestamp;
-      item.completedAt = timestamp;
-      item.toolCallId = params.toolCallId || identity.tracked?.toolCallId || "";
-      item.toolName = params.toolName || identity.tracked?.toolName || "tool";
-      item.summary = summary(resultText.value) || item.toolName;
-      item.argsJson = args.value;
-      item.resultText = resultText.value;
-      item.detailsJson = details.value;
-      item.isError = params.isError;
-      item.isTruncated = args.truncated || resultText.truncated || details.truncated;
-      const capturePath = /^absolutePath:\s*(.+?)\s*$/m.exec(params.resultText || "")?.[1];
-      if (params.toolName === "unity_screenshot" && capturePath) {
-        item.imagePath = capturePath;
-      }
-      this.emitTimeline(item);
+    flush() {
+      const state = this.state;
+      const pending = state.currentText.slice(state.sentLength);
+      if (pending.length === 0) return;
+      state.sentLength = state.currentText.length;
+      this.bridge.sendToUnity("message_update", { type: "text_delta", delta: pending });
     }
-    emitError(message, overrides = {}) {
-      const active = overrides.nonTerminal ? null : this.active;
-      const classified = classifyRuntimeError(message);
-      const payload = {
-        ...classified,
-        message,
-        sessionId: active?.sessionId || this.getSessionId(),
-        clientTurnId: active?.clientTurnId || "",
-        hadToolActivity: active?.hadToolActivity === true,
-        ...overrides
-      };
-      if (payload.nonTerminal) {
-        this.bridge.sendToUnity("runtime_error", payload);
-        return payload;
-      }
-      const errorKey = `${payload.code}:${payload.message}`;
-      if (!active || !active.emittedErrorKeys.has(errorKey)) {
-        active?.emittedErrorKeys.add(errorKey);
-        this.bridge.sendToUnity("runtime_error", payload);
-        const timestamp = Date.now();
-        const item = baseTimelineItem({
-          sessionId: payload.sessionId,
-          clientTurnId: payload.clientTurnId,
-          itemId: `${payload.clientTurnId || payload.sessionId}:error:${payload.code}:${timestamp}`,
-          kind: "error",
-          status: payload.code === "ABORTED" ? "aborted" : "failed",
-          timestamp
-        });
-        const value = truncate2(message, MAX_ASSISTANT_TEXT);
-        item.text = value.value;
-        item.summary = summary(value.value);
-        item.isError = payload.code !== "ABORTED";
-        item.isTruncated = value.truncated;
-        this.emitTimeline(item);
-      }
-      return payload;
-    }
-    finishTurn(outcome, stopReason, beforeNotify) {
-      const active = this.active;
-      if (active?.terminalSent) return;
-      if (!active) return;
-      const payload = {
-        sessionId: active.sessionId,
-        clientTurnId: active.clientTurnId,
-        outcome,
-        stopReason
-      };
-      active.terminalSent = true;
-      try {
-        this.flushUnclosedTools(active);
-      } finally {
-        if (this.active === active) this.active = null;
-        beforeNotify?.();
-        this.bridge.sendToUnity("turn_finished", payload);
+    clearTimer() {
+      if (this.state.timer !== void 0) {
+        clearTimeout(this.state.timer);
+        this.state.timer = void 0;
       }
     }
-    resetForSessionSwitch() {
-      const active = this.active;
-      if (active) {
-        if (!active.terminalSent) {
-          active.terminalSent = true;
-          this.flushUnclosedTools(active);
-        }
-        active.toolsByCallId.clear();
-        active.toolsByName.clear();
-      }
-      this.active = null;
-    }
-    flushUnclosedTools(active) {
-      const timestamp = Date.now();
-      const seen = /* @__PURE__ */ new Set();
-      const pending = [
-        ...active.toolsByCallId.values(),
-        ...[...active.toolsByName.values()].flat()
-      ];
-      for (const tracked of pending) {
-        if (seen.has(tracked.itemId)) continue;
-        seen.add(tracked.itemId);
-        const item = baseTimelineItem({
-          sessionId: active.sessionId,
-          clientTurnId: active.clientTurnId,
-          itemId: tracked.itemId,
-          kind: "tool",
-          status: "aborted",
-          timestamp: tracked.startedAt
-        });
-        item.updatedAt = timestamp;
-        item.completedAt = timestamp;
-        item.toolCallId = tracked.toolCallId;
-        item.toolName = tracked.toolName || "tool";
-        item.summary = item.toolName;
-        item.argsJson = tracked.argsJson;
-        item.isTruncated = tracked.argsTruncated;
-        item.resultText = UNCLOSED_TOOL_NOTE;
-        this.emitTimeline(item);
-      }
-    }
-    emitTimeline(item) {
-      this.bridge.sendToUnity("timeline_item", item);
+    /** Test seam: expose the pending-flush timer depth. */
+    get hasPendingFlush() {
+      return this.state.currentText.length > this.state.sentLength || this.state.timer !== void 0;
     }
   };
 
   // src/session-runtime.ts
+  var PERSIST_MIN_INTERVAL_MS = 2e3;
   function createSessionRuntime(deps) {
     let sessionGeneration = 0;
-    async function saveCurrentRecord(record) {
+    async function saveCurrentRecord(record2) {
       const generation = sessionGeneration;
-      const saved = await saveSession(deps.projectRoot, record);
-      if (generation !== sessionGeneration || deps.getCurrentSession().id !== record.id) return;
+      const saved = await saveSession(deps.projectRoot, record2);
+      if (generation !== sessionGeneration || deps.getCurrentSession().id !== record2.id) return;
       deps.setCurrentSession(saved);
       syncSessionInfo();
     }
@@ -49007,8 +48909,16 @@ ${extensionSection.join("\n\n---\n\n")}
       };
       await saveCurrentRecord(nextRecord);
     }
-    async function persistCurrentSessionForRecoveryWithPendingUserMessage2(content, displayContent = content, clientTurnId = "", imageBlocks) {
-      const pendingMessage = createRuntimeUserMessage(content, displayContent, clientTurnId, Date.now(), imageBlocks);
+    let lastMidTurnPersistAt = 0;
+    function tryPersistCurrentSessionMidTurn() {
+      const now = Date.now();
+      if (now - lastMidTurnPersistAt < PERSIST_MIN_INTERVAL_MS) return;
+      lastMidTurnPersistAt = now;
+      void persistCurrentSession2().catch((err) => {
+        deps.logPersistenceError?.(err instanceof Error ? err.message : String(err));
+      });
+    }
+    async function persistCurrentSessionForRecoveryWithPendingUserMessage2(pendingMessage) {
       const nextRecord = {
         ...deps.getCurrentSession(),
         provider: deps.getProvider(),
@@ -49036,25 +48946,25 @@ ${extensionSection.join("\n\n---\n\n")}
       syncSessionInfo();
       deps.emitSessionSync();
     }
-    function restoreSessionRecord2(record) {
+    function restoreSessionRecord2(record2) {
       sessionGeneration++;
       deps.resetAgentForSessionSwitch();
-      deps.setCurrentSession(record);
-      deps.agent.replaceMessages(record.messages || []);
-      deps.restoreTodoState?.(record.todoState || [], record.executionState);
+      deps.setCurrentSession(record2);
+      deps.agent.replaceMessages(record2.messages || []);
+      deps.restoreTodoState?.(record2.todoState || [], record2.executionState);
       deps.setAgentModel();
       deps.rebuildAgentSurface();
       syncSessionInfo();
       deps.emitSessionSync();
     }
-    async function forkFromRecord2(record, persist = persistCurrentSession2) {
+    async function forkFromRecord2(record2, persist = persistCurrentSession2) {
       const forked = createSessionRecord({
-        parentSessionId: record.id,
-        provider: record.provider || deps.getProvider(),
-        modelId: record.modelId || deps.getModelId(),
-        messages: (record.messages || []).slice(),
-        todoState: (record.todoState || []).slice(),
-        executionState: record.executionState
+        parentSessionId: record2.id,
+        provider: record2.provider || deps.getProvider(),
+        modelId: record2.modelId || deps.getModelId(),
+        messages: (record2.messages || []).slice(),
+        todoState: (record2.todoState || []).slice(),
+        executionState: record2.executionState
       });
       restoreSessionRecord2(forked);
       await persist();
@@ -49064,6 +48974,7 @@ ${extensionSection.join("\n\n---\n\n")}
       getSessionEpoch: () => sessionGeneration,
       syncSessionInfo,
       persistCurrentSession: persistCurrentSession2,
+      tryPersistCurrentSessionMidTurn,
       persistCurrentSessionForRecovery: persistCurrentSessionForRecovery2,
       persistCurrentSessionForRecoveryWithPendingUserMessage: persistCurrentSessionForRecoveryWithPendingUserMessage2,
       startFreshSession: startFreshSession2,
@@ -49073,9 +48984,9 @@ ${extensionSection.join("\n\n---\n\n")}
   }
 
   // src/session-controller-adapter.ts
-  function withMessages(record, messages) {
+  function withMessages(record2, messages) {
     return {
-      ...record,
+      ...record2,
       messages,
       messageCount: messages.length
     };
@@ -49517,13 +49428,13 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         hostDisplayName: displayName,
         capabilities: descriptors.map(toRuntimeHostBridgePayload)
       });
-      const record = {
+      const record2 = {
         namespace,
         displayName,
         capabilities: descriptors,
         handlers
       };
-      hosts.set(namespace, record);
+      hosts.set(namespace, record2);
       for (const descriptor of descriptors) {
         capabilityIndex.set(descriptor.name, {
           descriptor,
@@ -49995,11 +49906,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   function assistantEventField(event, field) {
     return event && typeof event === "object" && field in event ? String(event[field] ?? "") : "";
   }
-  function isRecord12(value) {
+  function isRecord11(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function routeMetaFromToolResult(toolName, result) {
-    const details = isRecord12(result) && isRecord12(result.details) ? result.details : void 0;
+    const details = isRecord11(result) && isRecord11(result.details) ? result.details : void 0;
     if (!details) return null;
     if (toolName === "web_search") {
       return {
@@ -50014,7 +49925,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         attempts: Array.isArray(details.attempts) ? details.attempts.length : void 0
       };
     }
-    if (toolName === "read_file" && isRecord12(details.understanding)) {
+    if (toolName === "read_file" && isRecord11(details.understanding)) {
       const understanding = details.understanding;
       return {
         toolName,
@@ -50071,6 +49982,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
           case "message_start":
             if (messageRole(event.message) === "assistant") {
               host.runtimeChat.beginAssistant();
+              host.textDeltaSender?.beginAssistant();
             }
             bridge2.sendToUnity("state_event", { name: "message_start", detail: `role=${messageRole(event.message)}` });
             break;
@@ -50095,23 +50007,32 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               detail: `type=${event.assistantMessageEvent?.type ?? "text"} chars=${text.length}`
             });
             if (text) {
-              bridge2.sendToUnity("message_update", { type: "text_full", text });
+              if (host.textDeltaSender) {
+                host.textDeltaSender.updateAssistant(text);
+              } else {
+                bridge2.sendToUnity("message_update", { type: "text_full", text });
+              }
               host.runtimeChat.updateAssistant(text);
             }
             break;
           }
-          case "message_end":
-            if (messageRole(event.message) === "assistant") {
+          case "message_end": {
+            const assistantRole = messageRole(event.message) === "assistant";
+            if (assistantRole) {
+              host.textDeltaSender?.endAssistant(textContentFromMessage(event.message));
+            }
+            if (assistantRole) {
               bridge2.sendToUnity("message_metrics", {
                 role: "assistant",
                 usage: host.buildUsagePayload(agent2.state.messages || [], event.message)
               });
             }
-            if (messageRole(event.message) === "assistant") {
+            if (assistantRole) {
               host.runtimeChat.endAssistant(event.message);
             }
             bridge2.sendToUnity("state_event", { name: "message_end", detail: `role=${messageRole(event.message)}` });
             break;
+          }
           case "tool_execution_start":
             host.verboseLog(`[tool_start payload] ${JSON.stringify({
               name: event.toolName,
@@ -50181,7 +50102,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
             bridge2.sendToUnity("status_snapshot", event.snapshot);
             break;
           case "turn_continues":
-            host.persistCurrentSessionSafely();
+            (host.tryPersistCurrentSessionMidTurn ?? host.persistCurrentSessionSafely)();
             host.refreshTodoLoopState();
             bridge2.sendToUnity("state_event", {
               name: "turn_continues",
@@ -50275,11 +50196,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   }
 
   // src/session-message-utils.ts
-  function isRecord13(value) {
+  function isRecord12(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function hasRealUsage(usage) {
-    if (!isRecord13(usage)) return false;
+    if (!isRecord12(usage)) return false;
     return Number(usage.input || 0) > 0 || Number(usage.output || 0) > 0 || Number(usage.cacheRead || 0) > 0 || Number(usage.cacheWrite || 0) > 0 || Number(usage.totalTokens || 0) > 0;
   }
   function estimateTokensFromText(text) {
@@ -50289,12 +50210,12 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   }
   function collectMessageText(message) {
     if (!message) return "";
-    if (!isRecord13(message)) return "";
+    if (!isRecord12(message)) return "";
     const content = message.content;
     if (typeof content === "string") return content;
     if (!Array.isArray(content)) return "";
     return content.map((block) => {
-      if (!isRecord13(block)) return "";
+      if (!isRecord12(block)) return "";
       if (block.type === "text") return typeof block.text === "string" ? block.text : "";
       if (block.type === "thinking") return typeof block.thinking === "string" ? block.thinking : "";
       if (block.type === "toolCall") {
@@ -50306,9 +50227,9 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }).join("");
   }
   function buildUsagePayload(messages, message, fallbackIndex) {
-    const messageRecord = isRecord13(message) ? message : {};
+    const messageRecord = isRecord12(message) ? message : {};
     const usage = messageRecord.usage;
-    if (hasRealUsage(usage) && isRecord13(usage)) {
+    if (hasRealUsage(usage) && isRecord12(usage)) {
       return {
         input: Number(usage.input || 0),
         output: Number(usage.output || 0),
@@ -50344,14 +50265,14 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   function extractToolText(result) {
     if (!result) return "";
     if (typeof result === "string") return result;
-    if (isRecord13(result) && Array.isArray(result.content)) {
-      return result.content.filter((item) => isRecord13(item) && item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
+    if (isRecord12(result) && Array.isArray(result.content)) {
+      return result.content.filter((item) => isRecord12(item) && item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
     }
     return "";
   }
   function extractEffectiveArgs(toolName, args, details) {
-    const argRecord = isRecord13(args) ? args : {};
-    const detailRecord = isRecord13(details) ? details : {};
+    const argRecord = isRecord12(args) ? args : {};
+    const detailRecord = isRecord12(details) ? details : {};
     if (toolName === "find_files") {
       return {
         rawPattern: detailRecord.rawPattern ?? argRecord.pattern ?? argRecord.query ?? argRecord.name ?? argRecord.file_name ?? "",
@@ -50372,67 +50293,682 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }
     return argRecord;
   }
-  function buildSessionSyncMessages(stateMessages) {
+  var sessionSyncMessageCache = /* @__PURE__ */ new WeakMap();
+  function buildSessionSyncMessagesCached(stateMessages) {
     const argsByCallId = /* @__PURE__ */ new Map();
-    return stateMessages.map((message, index) => {
-      const messageRecord = isRecord13(message) ? message : {};
+    for (const message of stateMessages) {
+      const messageRecord = isRecord12(message) ? message : {};
       if (messageRecord.role === "assistant" && Array.isArray(messageRecord.content)) {
         for (const block of messageRecord.content) {
-          if (isRecord13(block) && block.type === "toolCall" && typeof block.id === "string")
+          if (isRecord12(block) && block.type === "toolCall" && typeof block.id === "string")
             argsByCallId.set(block.id, block.arguments);
         }
       }
-      const isToolResult = messageRecord.role === "toolResult";
-      const args = argsByCallId.get(String(messageRecord.toolCallId || ""));
-      const serializedContent = typeof messageRecord.content === "string" ? [{ type: "text", text: messageRecord.content }] : Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord13(block)).map((block) => block.type === "toolCall" ? {
-        type: "toolCall",
-        text: typeof block.text === "string" ? block.text : "",
-        // Editor history uses these to render calls that never
-        // received a toolResult (interrupted runs).
-        toolCallId: typeof block.id === "string" ? block.id : "",
-        toolName: typeof block.name === "string" ? block.name : "",
-        argsJson: JSON.stringify(block.arguments ?? {})
-      } : {
-        type: String(block.type || "text"),
-        text: typeof block.text === "string" ? block.text : ""
-      }) : [];
-      return {
-        role: String(messageRecord.role || "assistant"),
-        timestamp: typeof messageRecord.timestamp === "number" ? messageRecord.timestamp : 0,
-        displayContent: typeof messageRecord.displayContent === "string" ? messageRecord.displayContent : "",
-        clientTurnId: typeof messageRecord.clientTurnId === "string" ? messageRecord.clientTurnId : "",
-        toolCallId: typeof messageRecord.toolCallId === "string" ? messageRecord.toolCallId : "",
-        toolName: typeof messageRecord.toolName === "string" ? messageRecord.toolName : "",
-        isError: messageRecord.isError === true,
-        argsJson: isToolResult ? JSON.stringify(args ?? {}) : "",
-        effectiveArgsJson: isToolResult ? JSON.stringify(extractEffectiveArgs(String(messageRecord.toolName || ""), args, messageRecord.details)) : "",
-        detailsJson: isToolResult ? JSON.stringify(messageRecord.details ?? {}) : "",
-        content: serializedContent,
-        errorMessage: typeof messageRecord.errorMessage === "string" ? messageRecord.errorMessage : "",
-        stopReason: typeof messageRecord.stopReason === "string" ? messageRecord.stopReason : "",
-        usage: buildUsagePayload(stateMessages, message, index)
-      };
-    });
+    }
+    const output = new Array(stateMessages.length);
+    for (let index = 0; index < stateMessages.length; index += 1) {
+      const message = stateMessages[index];
+      const cacheKey = isRecord12(message) ? message : void 0;
+      const cached = cacheKey !== void 0 ? sessionSyncMessageCache.get(cacheKey) : void 0;
+      if (cached !== void 0) {
+        output[index] = cached;
+        continue;
+      }
+      const built = buildSessionSyncMessageRecord(message, index, argsByCallId, stateMessages);
+      if (cacheKey !== void 0 && isContextIndependentSyncRecord(built)) {
+        sessionSyncMessageCache.set(cacheKey, built);
+      }
+      output[index] = built;
+    }
+    return output;
+  }
+  function isContextIndependentSyncRecord(record2) {
+    const usage = record2.usage;
+    return !(usage && usage.estimated === true);
+  }
+  function buildSessionSyncMessageRecord(message, index, argsByCallId, stateMessages) {
+    const messageRecord = isRecord12(message) ? message : {};
+    const isToolResult = messageRecord.role === "toolResult";
+    const args = argsByCallId.get(String(messageRecord.toolCallId || ""));
+    const serializedContent = typeof messageRecord.content === "string" ? [{ type: "text", text: messageRecord.content }] : Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord12(block)).map((block) => block.type === "toolCall" ? {
+      type: "toolCall",
+      text: typeof block.text === "string" ? block.text : "",
+      // Editor history uses these to render calls that never
+      // received a toolResult (interrupted runs).
+      toolCallId: typeof block.id === "string" ? block.id : "",
+      toolName: typeof block.name === "string" ? block.name : "",
+      argsJson: JSON.stringify(block.arguments ?? {})
+    } : {
+      type: String(block.type || "text"),
+      text: typeof block.text === "string" ? block.text : ""
+    }) : [];
+    return {
+      role: String(messageRecord.role || "assistant"),
+      timestamp: typeof messageRecord.timestamp === "number" ? messageRecord.timestamp : 0,
+      displayContent: typeof messageRecord.displayContent === "string" ? messageRecord.displayContent : "",
+      clientTurnId: typeof messageRecord.clientTurnId === "string" ? messageRecord.clientTurnId : "",
+      toolCallId: typeof messageRecord.toolCallId === "string" ? messageRecord.toolCallId : "",
+      toolName: typeof messageRecord.toolName === "string" ? messageRecord.toolName : "",
+      isError: messageRecord.isError === true,
+      argsJson: isToolResult ? JSON.stringify(args ?? {}) : "",
+      effectiveArgsJson: isToolResult ? JSON.stringify(extractEffectiveArgs(String(messageRecord.toolName || ""), args, messageRecord.details)) : "",
+      detailsJson: isToolResult ? JSON.stringify(messageRecord.details ?? {}) : "",
+      content: serializedContent,
+      errorMessage: typeof messageRecord.errorMessage === "string" ? messageRecord.errorMessage : "",
+      stopReason: typeof messageRecord.stopReason === "string" ? messageRecord.stopReason : "",
+      usage: buildUsagePayload(stateMessages, message, index)
+    };
   }
   function truncateMessagesAroundTurn(messages, clientTurnId, keep) {
     const needle = String(clientTurnId || "").trim();
     if (!needle) return null;
     const turnStart = messages.findIndex((message) => {
-      const record = isRecord13(message) ? message : {};
-      return record.role === "user" && record.clientTurnId === needle;
+      const record2 = isRecord12(message) ? message : {};
+      return record2.role === "user" && record2.clientTurnId === needle;
     });
     if (turnStart === -1) return null;
     if (keep === "before") return messages.slice(0, turnStart);
     let turnEnd = messages.length;
     for (let index = turnStart + 1; index < messages.length; index += 1) {
-      const record = isRecord13(messages[index]) ? messages[index] : {};
-      if (record.role === "user") {
+      const record2 = isRecord12(messages[index]) ? messages[index] : {};
+      if (record2.role === "user") {
         turnEnd = index;
         break;
       }
     }
     return messages.slice(0, turnEnd);
   }
+
+  // src/runtime-chat-projection.ts
+  var MAX_ASSISTANT_TEXT = 12e3;
+  var MAX_SUMMARY = 512;
+  var MAX_TOOL_FIELD = 4e3;
+  var MAX_TIMELINE_ITEMS = 500;
+  var MAX_TURNS = 50;
+  var MAX_TRACKED_TOOL_ORIGINS = 256;
+  var UNCLOSED_TOOL_NOTE = "Tool did not report a result before the turn ended.";
+  function isRecord13(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  }
+  function truncate2(value, limit) {
+    if (value.length <= limit) return { value, truncated: false };
+    return { value: value.slice(0, limit), truncated: true };
+  }
+  function summary(value) {
+    return truncate2(value.replace(/\s+/g, " ").trim(), MAX_SUMMARY).value;
+  }
+  function jsonText(value) {
+    let encoded = "";
+    try {
+      encoded = JSON.stringify(value ?? {}) ?? "";
+    } catch {
+      encoded = "";
+    }
+    return truncate2(encoded, MAX_TOOL_FIELD);
+  }
+  function timestampOf(message, fallback) {
+    const timestamp = message?.timestamp;
+    return typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : fallback;
+  }
+  function messageText(message) {
+    const content = message?.content;
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content.filter((block) => isRecord13(block) && block.type === "text").map((block) => typeof block.text === "string" ? block.text : "").join("");
+  }
+  function displayText(message) {
+    const display = message?.displayContent;
+    return typeof display === "string" && display.length > 0 ? display : messageText(message);
+  }
+  function clientTurnIdOf(message) {
+    const id = message?.clientTurnId;
+    return typeof id === "string" ? id : "";
+  }
+  function toolResultText(message) {
+    return messageText(message);
+  }
+  function baseTimelineItem(params) {
+    return {
+      schemaVersion: 1,
+      sessionId: params.sessionId,
+      clientTurnId: params.clientTurnId,
+      itemId: params.itemId,
+      kind: params.kind,
+      status: params.status,
+      startedAt: params.timestamp,
+      updatedAt: params.timestamp,
+      completedAt: params.status === "running" ? 0 : params.timestamp,
+      text: "",
+      summary: "",
+      toolCallId: "",
+      toolName: "",
+      argsJson: "",
+      resultText: "",
+      detailsJson: "",
+      isError: params.status === "failed",
+      isTruncated: false
+    };
+  }
+  function normalizedTurnId(sessionId, timestamp, messageIndex, value) {
+    return value || `${sessionId}:turn:${timestamp}:${messageIndex}`;
+  }
+  function turnSlice(messages) {
+    const userIndices = [];
+    messages.forEach((message, index) => {
+      if (String(message?.role || "") === "user") userIndices.push(index);
+    });
+    const offset2 = userIndices.length > MAX_TURNS ? userIndices[userIndices.length - MAX_TURNS] : 0;
+    return { messages: messages.slice(offset2), offset: offset2 };
+  }
+  function buildRuntimeTimelineItems(sessionId, messages, createdAt, liveClientTurnId) {
+    const source = Array.isArray(messages) ? messages : [];
+    const { messages: recent, offset: offset2 } = turnSlice(source);
+    const baseTimestamp = Math.max(0, Date.parse(createdAt || "")) || 1;
+    const items = [];
+    const toolsByCallId = /* @__PURE__ */ new Map();
+    let activeClientTurnId = "";
+    let assistantIndex = -1;
+    recent.forEach((message, localIndex) => {
+      const messageIndex = offset2 + localIndex;
+      const metadata = message;
+      const role = String(metadata?.role || "assistant");
+      const timestamp = timestampOf(message, baseTimestamp + messageIndex);
+      if (role === "user") {
+        activeClientTurnId = normalizedTurnId(sessionId, timestamp, messageIndex, clientTurnIdOf(message));
+        assistantIndex = -1;
+        const textValue = truncate2(displayText(message), MAX_ASSISTANT_TEXT);
+        const item = baseTimelineItem({
+          sessionId,
+          clientTurnId: activeClientTurnId,
+          itemId: `${activeClientTurnId}:user`,
+          kind: "user",
+          status: "succeeded",
+          timestamp
+        });
+        item.text = textValue.value;
+        item.summary = summary(textValue.value);
+        item.isTruncated = textValue.truncated;
+        items.push(item);
+        return;
+      }
+      if (!activeClientTurnId) {
+        activeClientTurnId = normalizedTurnId(sessionId, timestamp, messageIndex, "");
+      }
+      if (role === "assistant") {
+        assistantIndex += 1;
+        const textValue = truncate2(messageText(message), MAX_ASSISTANT_TEXT);
+        const stopReason = typeof metadata.stopReason === "string" ? metadata.stopReason : "";
+        const errorMessage = typeof metadata.errorMessage === "string" ? metadata.errorMessage : "";
+        const status = stopReason === "aborted" ? "aborted" : stopReason === "error" || errorMessage ? "failed" : "succeeded";
+        if (textValue.value || errorMessage) {
+          const item = baseTimelineItem({
+            sessionId,
+            clientTurnId: activeClientTurnId,
+            itemId: `${activeClientTurnId}:assistant:${assistantIndex}`,
+            kind: "assistant",
+            status,
+            timestamp
+          });
+          item.text = textValue.value || errorMessage;
+          item.summary = summary(item.text);
+          item.isError = status === "failed";
+          item.isTruncated = textValue.truncated;
+          items.push(item);
+        }
+        const content = Array.isArray(metadata.content) ? metadata.content : [];
+        for (const block of content) {
+          if (!isRecord13(block) || block.type !== "toolCall") continue;
+          const callId = String(block.id || "");
+          const toolName = String(block.name || "tool");
+          const existing = callId ? toolsByCallId.get(callId) : void 0;
+          if (existing) {
+            const encodedArgs2 = jsonText(block.arguments);
+            existing.argsJson = encodedArgs2.value;
+            existing.isTruncated = existing.isTruncated || encodedArgs2.truncated;
+            if (!existing.toolName || existing.toolName === "tool") existing.toolName = toolName;
+            continue;
+          }
+          const stableCallId = callId || `${messageIndex}:${toolName}`;
+          const encodedArgs = jsonText(block.arguments);
+          const item = baseTimelineItem({
+            sessionId,
+            clientTurnId: activeClientTurnId,
+            itemId: `${activeClientTurnId}:tool:${stableCallId}`,
+            kind: "tool",
+            status: "running",
+            timestamp
+          });
+          item.toolCallId = callId;
+          item.toolName = toolName;
+          item.summary = toolName;
+          item.argsJson = encodedArgs.value;
+          item.isTruncated = encodedArgs.truncated;
+          items.push(item);
+          if (callId) toolsByCallId.set(callId, item);
+        }
+        return;
+      }
+      if (role === "toolResult") {
+        const callId = typeof metadata.toolCallId === "string" ? metadata.toolCallId : "";
+        const toolName = typeof metadata.toolName === "string" ? metadata.toolName : "tool";
+        let item = callId ? toolsByCallId.get(callId) : void 0;
+        if (!item) {
+          const stableCallId = callId || `${messageIndex}:${toolName}`;
+          item = baseTimelineItem({
+            sessionId,
+            clientTurnId: activeClientTurnId,
+            itemId: `${activeClientTurnId}:tool:${stableCallId}`,
+            kind: "tool",
+            status: "running",
+            timestamp
+          });
+          item.toolCallId = callId;
+          item.toolName = toolName;
+          items.push(item);
+          if (callId) toolsByCallId.set(callId, item);
+        }
+        const result = truncate2(toolResultText(message), MAX_TOOL_FIELD);
+        const details = jsonText(metadata.details);
+        item.status = metadata.isError === true ? "failed" : "succeeded";
+        item.updatedAt = timestamp;
+        item.completedAt = timestamp;
+        item.resultText = result.value;
+        item.detailsJson = details.value;
+        item.summary = summary(result.value) || toolName;
+        item.isError = metadata.isError === true;
+        item.isTruncated = item.isTruncated || result.truncated || details.truncated;
+      }
+    });
+    for (const item of items) {
+      if (item.kind !== "tool" || item.status !== "running") continue;
+      if (liveClientTurnId && item.clientTurnId === liveClientTurnId) continue;
+      item.status = "aborted";
+      item.completedAt = item.updatedAt;
+      if (!item.resultText) item.resultText = UNCLOSED_TOOL_NOTE;
+    }
+    return items.length > MAX_TIMELINE_ITEMS ? items.slice(items.length - MAX_TIMELINE_ITEMS) : items;
+  }
+  function createRuntimeUserMessage(content, displayContent, clientTurnId, timestamp = Date.now(), imageBlocks) {
+    const contentBlocks = imageBlocks && imageBlocks.length > 0 ? [
+      { type: "text", text: content },
+      ...imageBlocks.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType }))
+    ] : content;
+    return {
+      role: "user",
+      content: contentBlocks,
+      displayContent,
+      clientTurnId,
+      timestamp
+    };
+  }
+  function classifyRuntimeError(message) {
+    if (/expecting chunk trailer|premature (?:eof|end)|unexpected end|response ended prematurely/i.test(message)) {
+      return { code: "STREAM_TRUNCATED", category: "transport", retryable: true };
+    }
+    if (/abort(?:ed)?/i.test(message)) {
+      return { code: "ABORTED", category: "agent", retryable: false };
+    }
+    return { code: "AGENT_ERROR", category: "agent", retryable: false };
+  }
+  var UnityRuntimeChatProjection = class {
+    constructor(bridge2, getSessionId) {
+      this.bridge = bridge2;
+      this.getSessionId = getSessionId;
+    }
+    bridge;
+    getSessionId;
+    active = null;
+    /**
+     * Tool call ids started since boot, mapped to the turn that started them.
+     * Survives session switches so a late tool result can be attributed to its
+     * original turn instead of polluting the next turn of a different session.
+     */
+    toolCallOrigins = /* @__PURE__ */ new Map();
+    /**
+     * Call ids that already received a terminal card this boot. A late
+     * tool_execution_start for one of them (out-of-order forwarding) must not
+     * reopen the card as running.
+     */
+    closedToolCallIds = /* @__PURE__ */ new Set();
+    get activeClientTurnId() {
+      return this.active?.clientTurnId || "";
+    }
+    get hadToolActivity() {
+      return this.active?.hadToolActivity === true;
+    }
+    beginTurn(displayContent, requestedClientTurnId) {
+      const reserved = this.reserveTurn(displayContent, requestedClientTurnId);
+      reserved.publish();
+      return reserved.clientTurnId;
+    }
+    /** Allocate identity without calling the host; admission owns publication. */
+    reserveTurn(displayContent, requestedClientTurnId) {
+      const startedAt = Date.now();
+      const sessionId = this.getSessionId();
+      const clientTurnId = String(requestedClientTurnId || "").trim() || `turn_${startedAt.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      this.active = {
+        sessionId,
+        clientTurnId,
+        displayContent,
+        startedAt,
+        assistantIndex: -1,
+        assistantItemId: "",
+        assistantLastUpdate: null,
+        hadToolActivity: false,
+        terminalSent: false,
+        emittedErrorKeys: /* @__PURE__ */ new Set(),
+        toolSequence: 0,
+        toolsByCallId: /* @__PURE__ */ new Map(),
+        toolsByName: /* @__PURE__ */ new Map()
+      };
+      const value = truncate2(displayContent, MAX_ASSISTANT_TEXT);
+      const item = baseTimelineItem({
+        sessionId,
+        clientTurnId,
+        itemId: `${clientTurnId}:user`,
+        kind: "user",
+        status: "succeeded",
+        timestamp: startedAt
+      });
+      item.text = value.value;
+      item.summary = summary(value.value);
+      item.isTruncated = value.truncated;
+      return { clientTurnId, publish: () => this.emitTimeline(item) };
+    }
+    beginAssistant(timestamp = Date.now()) {
+      const active = this.active;
+      if (!active) return;
+      active.assistantIndex += 1;
+      active.assistantItemId = `${active.clientTurnId}:assistant:${active.assistantIndex}`;
+      active.assistantLastUpdate = null;
+      void timestamp;
+    }
+    updateAssistant(text, timestamp = Date.now()) {
+      const active = this.active;
+      if (!active) return;
+      if (!active.assistantItemId) this.beginAssistant(timestamp);
+      const previous = active.assistantLastUpdate;
+      const isTruncated = text.length > MAX_ASSISTANT_TEXT;
+      if (previous && previous.isTruncated === isTruncated && (isTruncated ? text.startsWith(previous.text) : text === previous.text)) return;
+      const value = truncate2(text, MAX_ASSISTANT_TEXT);
+      const item = baseTimelineItem({
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        itemId: active.assistantItemId,
+        kind: "assistant",
+        status: "running",
+        timestamp: active.startedAt
+      });
+      item.updatedAt = timestamp;
+      item.text = value.value;
+      item.summary = summary(value.value);
+      item.isTruncated = value.truncated;
+      active.assistantLastUpdate = item;
+      try {
+        this.emitTimeline(item);
+      } catch (error) {
+        if (this.active === active && active.assistantItemId === item.itemId && active.assistantLastUpdate === item)
+          active.assistantLastUpdate = previous;
+        throw error;
+      }
+    }
+    endAssistant(message, timestamp = Date.now()) {
+      const active = this.active;
+      if (!active || !active.assistantItemId) return;
+      const metadata = message;
+      const text = truncate2(messageText(message), MAX_ASSISTANT_TEXT);
+      const stopReason = typeof metadata.stopReason === "string" ? metadata.stopReason : "";
+      const errorText = typeof metadata.errorMessage === "string" ? metadata.errorMessage : "";
+      const status = stopReason === "aborted" ? "aborted" : stopReason === "error" || errorText ? "failed" : "succeeded";
+      if (!text.value && !errorText) {
+        active.assistantItemId = "";
+        return;
+      }
+      const item = baseTimelineItem({
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        itemId: active.assistantItemId,
+        kind: "assistant",
+        status,
+        timestamp: active.startedAt
+      });
+      item.updatedAt = timestamp;
+      item.completedAt = timestamp;
+      item.text = text.value || errorText;
+      item.summary = summary(item.text);
+      item.isError = status === "failed";
+      item.isTruncated = text.truncated;
+      this.emitTimeline(item);
+      active.assistantItemId = "";
+    }
+    startTool(toolCallId, toolName, args, timestamp = Date.now()) {
+      const active = this.active;
+      if (!active) return;
+      active.hadToolActivity = true;
+      if (toolCallId && this.closedToolCallIds.has(toolCallId)) {
+        return;
+      }
+      const encodedArgs = jsonText(args);
+      active.toolSequence += 1;
+      const itemId = toolCallId ? `${active.clientTurnId}:tool:${toolCallId}` : `${active.clientTurnId}:tool:${toolName || "tool"}:${active.toolSequence}`;
+      const tracked = {
+        itemId,
+        startedAt: timestamp,
+        toolCallId,
+        toolName,
+        argsJson: encodedArgs.value,
+        argsTruncated: encodedArgs.truncated
+      };
+      if (toolCallId) {
+        active.toolsByCallId.set(toolCallId, tracked);
+        this.rememberToolCallOrigin(toolCallId, active, tracked);
+      }
+      const nameKey = toolName || "tool";
+      const queue = active.toolsByName.get(nameKey);
+      if (queue) queue.push(tracked);
+      else active.toolsByName.set(nameKey, [tracked]);
+      const item = baseTimelineItem({
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        itemId,
+        kind: "tool",
+        status: "running",
+        timestamp
+      });
+      item.toolCallId = toolCallId;
+      item.toolName = toolName;
+      item.summary = toolName;
+      item.argsJson = encodedArgs.value;
+      item.isTruncated = encodedArgs.truncated;
+      this.emitTimeline(item);
+    }
+    endTool(params) {
+      const timestamp = params.timestamp ?? Date.now();
+      const active = this.active;
+      const origin = params.toolCallId ? this.toolCallOrigins.get(params.toolCallId) : void 0;
+      if (origin && (!active || active.clientTurnId !== origin.clientTurnId)) {
+        this.toolCallOrigins.delete(params.toolCallId);
+        this.emitToolTerminal(params, {
+          sessionId: origin.sessionId,
+          clientTurnId: origin.clientTurnId,
+          startedAt: origin.item.startedAt,
+          tracked: origin.item,
+          fallbackItemId: origin.item.itemId
+        }, timestamp);
+        return;
+      }
+      if (!active) return;
+      active.hadToolActivity = true;
+      const toolNameKey = params.toolName || "tool";
+      const tracked = (params.toolCallId ? active.toolsByCallId.get(params.toolCallId) : void 0) || (params.toolCallId ? active.toolsByName.get(toolNameKey)?.find((candidate) => !candidate.toolCallId) : active.toolsByName.get(toolNameKey)?.[0]);
+      const fallbackItemId = params.toolCallId ? `${active.clientTurnId}:tool:${params.toolCallId}` : `${active.clientTurnId}:tool:${toolNameKey}:unmatched`;
+      this.emitToolTerminal(params, {
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        startedAt: tracked?.startedAt ?? timestamp,
+        tracked,
+        fallbackItemId
+      }, timestamp);
+      if (params.toolCallId && origin) this.toolCallOrigins.delete(params.toolCallId);
+      if (params.toolCallId) this.rememberClosedToolCallId(params.toolCallId);
+      if (tracked) {
+        if (tracked.toolCallId) active.toolsByCallId.delete(tracked.toolCallId);
+        const queueKey = tracked.toolName || "tool";
+        const queue = active.toolsByName.get(queueKey);
+        if (queue) {
+          const at2 = queue.indexOf(tracked);
+          if (at2 >= 0) queue.splice(at2, 1);
+          if (queue.length === 0) active.toolsByName.delete(queueKey);
+        }
+      }
+    }
+    rememberClosedToolCallId(toolCallId) {
+      if (this.closedToolCallIds.size >= MAX_TRACKED_TOOL_ORIGINS) {
+        const oldest = this.closedToolCallIds.values().next().value;
+        if (oldest !== void 0) this.closedToolCallIds.delete(oldest);
+      }
+      this.closedToolCallIds.add(toolCallId);
+    }
+    rememberToolCallOrigin(toolCallId, active, item) {
+      if (this.toolCallOrigins.size >= MAX_TRACKED_TOOL_ORIGINS) {
+        const oldest = this.toolCallOrigins.keys().next().value;
+        if (oldest !== void 0) this.toolCallOrigins.delete(oldest);
+      }
+      this.toolCallOrigins.set(toolCallId, {
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        item
+      });
+    }
+    emitToolTerminal(params, identity, timestamp) {
+      const args = identity.tracked ? { value: identity.tracked.argsJson, truncated: identity.tracked.argsTruncated } : jsonText(params.args);
+      const resultText = truncate2(params.resultText, MAX_TOOL_FIELD);
+      const details = jsonText(params.result?.details);
+      const item = baseTimelineItem({
+        sessionId: identity.sessionId,
+        clientTurnId: identity.clientTurnId,
+        itemId: identity.tracked?.itemId || identity.fallbackItemId,
+        kind: "tool",
+        status: params.isError ? "failed" : "succeeded",
+        timestamp: identity.startedAt
+      });
+      item.updatedAt = timestamp;
+      item.completedAt = timestamp;
+      item.toolCallId = params.toolCallId || identity.tracked?.toolCallId || "";
+      item.toolName = params.toolName || identity.tracked?.toolName || "tool";
+      item.summary = summary(resultText.value) || item.toolName;
+      item.argsJson = args.value;
+      item.resultText = resultText.value;
+      item.detailsJson = details.value;
+      item.isError = params.isError;
+      item.isTruncated = args.truncated || resultText.truncated || details.truncated;
+      const capturePath = /^absolutePath:\s*(.+?)\s*$/m.exec(params.resultText || "")?.[1];
+      if (params.toolName === "unity_screenshot" && capturePath) {
+        item.imagePath = capturePath;
+      }
+      this.emitTimeline(item);
+    }
+    emitError(message, overrides = {}) {
+      const active = overrides.nonTerminal ? null : this.active;
+      const classified = classifyRuntimeError(message);
+      const payload = {
+        ...classified,
+        message,
+        sessionId: active?.sessionId || this.getSessionId(),
+        clientTurnId: active?.clientTurnId || "",
+        hadToolActivity: active?.hadToolActivity === true,
+        ...overrides
+      };
+      if (payload.nonTerminal) {
+        this.bridge.sendToUnity("runtime_error", payload);
+        return payload;
+      }
+      const errorKey = `${payload.code}:${payload.message}`;
+      if (!active || !active.emittedErrorKeys.has(errorKey)) {
+        active?.emittedErrorKeys.add(errorKey);
+        this.bridge.sendToUnity("runtime_error", payload);
+        const timestamp = Date.now();
+        const item = baseTimelineItem({
+          sessionId: payload.sessionId,
+          clientTurnId: payload.clientTurnId,
+          itemId: `${payload.clientTurnId || payload.sessionId}:error:${payload.code}:${timestamp}`,
+          kind: "error",
+          status: payload.code === "ABORTED" ? "aborted" : "failed",
+          timestamp
+        });
+        const value = truncate2(message, MAX_ASSISTANT_TEXT);
+        item.text = value.value;
+        item.summary = summary(value.value);
+        item.isError = payload.code !== "ABORTED";
+        item.isTruncated = value.truncated;
+        this.emitTimeline(item);
+      }
+      return payload;
+    }
+    finishTurn(outcome, stopReason, beforeNotify) {
+      const active = this.active;
+      if (active?.terminalSent) return;
+      if (!active) return;
+      const payload = {
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        outcome,
+        stopReason
+      };
+      active.terminalSent = true;
+      try {
+        this.flushUnclosedTools(active);
+      } finally {
+        if (this.active === active) this.active = null;
+        beforeNotify?.();
+        this.bridge.sendToUnity("turn_finished", payload);
+      }
+    }
+    resetForSessionSwitch() {
+      const active = this.active;
+      if (active) {
+        if (!active.terminalSent) {
+          active.terminalSent = true;
+          this.flushUnclosedTools(active);
+        }
+        active.toolsByCallId.clear();
+        active.toolsByName.clear();
+      }
+      this.active = null;
+    }
+    flushUnclosedTools(active) {
+      const timestamp = Date.now();
+      const seen = /* @__PURE__ */ new Set();
+      const pending = [
+        ...active.toolsByCallId.values(),
+        ...[...active.toolsByName.values()].flat()
+      ];
+      for (const tracked of pending) {
+        if (seen.has(tracked.itemId)) continue;
+        seen.add(tracked.itemId);
+        const item = baseTimelineItem({
+          sessionId: active.sessionId,
+          clientTurnId: active.clientTurnId,
+          itemId: tracked.itemId,
+          kind: "tool",
+          status: "aborted",
+          timestamp: tracked.startedAt
+        });
+        item.updatedAt = timestamp;
+        item.completedAt = timestamp;
+        item.toolCallId = tracked.toolCallId;
+        item.toolName = tracked.toolName || "tool";
+        item.summary = item.toolName;
+        item.argsJson = tracked.argsJson;
+        item.isTruncated = tracked.argsTruncated;
+        item.resultText = UNCLOSED_TOOL_NOTE;
+        this.emitTimeline(item);
+      }
+    }
+    emitTimeline(item) {
+      this.bridge.sendToUnity("timeline_item", item);
+    }
+  };
 
   // src/session-persistence.ts
   var SessionPersistenceUnavailableError = class extends Error {
@@ -50643,10 +51179,12 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 await host.finalizeRuntimeChatTurn("completed", "stop", void 0, turn);
                 break;
               }
-              await turn.run(() => host.persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId, images));
+              const pendingMessage = createRuntimeUserMessage(content, displayContent, clientTurnId, Date.now(), images);
+              await turn.run(() => host.persistCurrentSessionForRecoveryWithPendingUserMessage(pendingMessage));
               host.emitSessionSync();
               host.sessionTrace.noteDispatchStart({ mode: "unity" });
-              turn.dispatch(() => host.promptAgentWithRecovery(finalContent, displayContent, clientTurnId, images)).catch(async (err) => {
+              const promptInput = finalContent === content ? pendingMessage : createRuntimeUserMessage(finalContent, displayContent, clientTurnId, pendingMessage.timestamp, images);
+              turn.dispatch(() => host.promptAgentWithRecovery(promptInput, displayContent)).catch(async (err) => {
                 if (!turn.isCurrent) return;
                 const msg = err instanceof Error ? err.message : String(err);
                 host.bridge.log("error", `[pie/index] agent.prompt rejected: ${msg}`);
@@ -50781,6 +51319,9 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
             case "list_skills":
               host.emitSkillsList();
               break;
+            case "resync_session":
+              host.emitSessionSync(void 0, { full: true });
+              break;
             case "reload_skills":
               host.rebuildAgentSurface();
               host.emitSkillsList();
@@ -50819,9 +51360,9 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 });
                 break;
               }
-              const record = host.getCurrentSession();
+              const record2 = host.getCurrentSession();
               const truncated = truncateMessagesAroundTurn(
-                record.messages || [],
+                record2.messages || [],
                 clientTurnId,
                 isFork ? "turn" : "before"
               );
@@ -50829,11 +51370,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 host.bridge.sendToUnity("error", { message: `Turn not found in this session: ${clientTurnId}` });
                 break;
               }
-              const next = { ...record, messages: truncated };
+              const next = { ...record2, messages: truncated };
               if (isFork) {
                 await host.forkFromRecord(next);
                 host.bridge.sendToUnity("session_forked", {
-                  parentSessionId: record.id,
+                  parentSessionId: record2.id,
                   clientTurnId,
                   forkedAtTurn: true
                 });
@@ -50842,7 +51383,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 await host.persistCurrentSession();
                 await host.persistCurrentSessionForRecovery();
                 host.bridge.sendToUnity("session_rewound", {
-                  sessionId: record.id,
+                  sessionId: record2.id,
                   clientTurnId,
                   messageCount: truncated.length
                 });
@@ -50887,6 +51428,28 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   // src/runtime-chat-turn.ts
   var RetiredChatTurn = class extends Error {
   };
+  async function runUnderRetirement(operation, retired, retiredSettled) {
+    return new Promise((resolve2, reject) => {
+      let settled = false;
+      let retirement;
+      const settle = (failed, value) => {
+        if (settled) return;
+        settled = true;
+        retirement = void 0;
+        if (failed) reject(value);
+        else resolve2(value);
+      };
+      Promise.resolve(operation()).then(
+        (value) => settle(false, value),
+        (error) => settle(true, error)
+      );
+      retirement = () => settle(true, new RetiredChatTurn());
+      if (retiredSettled()) retirement();
+      else void retired.then(() => {
+        retirement?.();
+      });
+    });
+  }
   var UnityRuntimeChatTurns = class {
     constructor(host) {
       this.host = host;
@@ -50905,9 +51468,14 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       const owner = this;
       const reserved = this.host.projection.reserveTurn(displayContent, clientTurnId);
       let phase = "pending";
+      let retiredSettled = false;
       let release;
       const retired = new Promise((resolve2) => {
-        release = resolve2;
+        release = () => {
+          if (retiredSettled) return;
+          retiredSettled = true;
+          resolve2();
+        };
       });
       const check = () => {
         if (!lease.isCurrent) throw new RetiredChatTurn();
@@ -50926,17 +51494,13 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
           return true;
         },
         retire() {
+          if (phase === "retired") return;
           phase = "retired";
           release();
         },
         async run(operation) {
           check();
-          const result = await Promise.race([
-            operation(),
-            retired.then(() => {
-              throw new RetiredChatTurn();
-            })
-          ]);
+          const result = await runUnderRetirement(operation, retired, () => retiredSettled);
           check();
           return result;
         },
@@ -51134,12 +51698,12 @@ ${availableSessions.join("\n")}` : "\n\nNo Pie chat sessions have been saved yet
   }
   function createUnityLocalCommandHandler(host) {
     return async function handleLocalCommand2(content, turn) {
-      const wait = (operation) => turn ? turn.run(operation) : Promise.resolve(operation());
+      const wait2 = (operation) => turn ? turn.run(operation) : Promise.resolve(operation());
       const trimmed = content.trim();
       if (!trimmed.startsWith("/")) return false;
       const [command, ...rest] = trimmed.split(/\s+/);
       if (command === "/new") {
-        await wait(() => host.persistCurrentSession());
+        await wait2(() => host.persistCurrentSession());
         host.startFreshSession();
         host.emitLocalAssistantMessage(`Started new session: ${host.getCurrentSession().id}`);
         await host.persistCurrentSessionForRecovery();
@@ -51150,14 +51714,14 @@ ${availableSessions.join("\n")}` : "\n\nNo Pie chat sessions have been saved yet
         const args = rest.filter((arg) => arg !== "--silent");
         const sessionId = args[0];
         if (!sessionId) {
-          const sessions = await wait(() => listSessions(host.projectRoot));
+          const sessions = await wait2(() => listSessions(host.projectRoot));
           const text = sessions.length === 0 ? "No saved sessions." : sessions.map((session) => `${session.id} | ${session.title} | ${session.modelId} | ${session.updatedAt}`).join("\n");
           host.emitLocalAssistantMessage(text);
           return true;
         }
-        const loaded = await wait(() => loadSession(host.projectRoot, sessionId));
+        const loaded = await wait2(() => loadSession(host.projectRoot, sessionId));
         if (!loaded) {
-          const explanation = await wait(() => tryExplainExternalSessionId(host, sessionId));
+          const explanation = await wait2(() => tryExplainExternalSessionId(host, sessionId));
           host.emitLocalAssistantMessage(explanation || `Session not found: ${sessionId}`);
           return true;
         }
@@ -51170,7 +51734,7 @@ Messages: ${loaded.messageCount}`);
         return true;
       }
       if (command === "/tree") {
-        host.emitLocalAssistantMessage(await wait(() => formatSessionTree(host.projectRoot)));
+        host.emitLocalAssistantMessage(await wait2(() => formatSessionTree(host.projectRoot)));
         return true;
       }
       if (command === "/session-check") {
@@ -51182,8 +51746,8 @@ Messages: ${loaded.messageCount}`);
           messages: probeMessages,
           todoState: host.todoTool.getState()
         });
-        const saved = await wait(() => saveSession(host.projectRoot, probe));
-        const loaded = await wait(() => loadSession(host.projectRoot, saved.id));
+        const saved = await wait2(() => saveSession(host.projectRoot, probe));
+        const loaded = await wait2(() => loadSession(host.projectRoot, saved.id));
         const ok = !!loaded && loaded.id === saved.id && loaded.provider === saved.provider && loaded.modelId === saved.modelId && (loaded.messages?.length || 0) === saved.messages.length && (loaded.todoState?.length || 0) === saved.todoState.length;
         host.emitLocalAssistantMessage(
           ok ? `Session self-check passed.
@@ -51196,7 +51760,7 @@ Loaded: ${loaded ? loaded.id : "(missing)"}`
         return true;
       }
       if (command === "/self-check") {
-        host.emitLocalAssistantMessage(await wait(() => host.runUnitySelfCheck()));
+        host.emitLocalAssistantMessage(await wait2(() => host.runUnitySelfCheck()));
         return true;
       }
       if (command === "/debug-stream") {
@@ -51210,9 +51774,9 @@ Loaded: ${loaded ? loaded.id : "(missing)"}`
       if (command === "/fork") {
         const sessionId = rest[0];
         if (sessionId) {
-          const source2 = await wait(() => loadSession(host.projectRoot, sessionId));
+          const source2 = await wait2(() => loadSession(host.projectRoot, sessionId));
           if (!source2) {
-            const explanation = await wait(() => tryExplainExternalSessionId(host, sessionId));
+            const explanation = await wait2(() => tryExplainExternalSessionId(host, sessionId));
             host.emitLocalAssistantMessage(explanation || `Session not found: ${sessionId}`);
             return true;
           }
@@ -51221,8 +51785,8 @@ Loaded: ${loaded ? loaded.id : "(missing)"}`
           await persisted2;
           return true;
         }
-        await wait(() => host.persistCurrentSession());
-        const source = await wait(() => loadSession(host.projectRoot, host.getCurrentSession().id)) || host.getCurrentSession();
+        await wait2(() => host.persistCurrentSession());
+        const source = await wait2(() => loadSession(host.projectRoot, host.getCurrentSession().id)) || host.getCurrentSession();
         const persisted = host.forkFromRecord(source);
         host.emitLocalAssistantMessage(`Forked new session ${host.getCurrentSession().id} from ${source.id}`);
         await persisted;
@@ -51252,7 +51816,7 @@ ${configured.join("\n")}` : host.getModelSelectionWarning());
           host.emitLocalAssistantMessage(`Unknown model selection: ${rest[0]}`);
           return true;
         }
-        await wait(() => host.applyModelSelection(provider, modelId));
+        await wait2(() => host.applyModelSelection(provider, modelId));
         host.emitLocalAssistantMessage(host.hasConfiguredModelSelection() ? `Switched model to ${provider}/${modelId}` : host.getModelSelectionWarning());
         return true;
       }
@@ -51371,25 +51935,25 @@ ${initialAgentsFile}`);
       return Object.fromEntries(headers.map(([key, value]) => [key, value]));
     }
     if (typeof Headers !== "undefined" && headers instanceof Headers) {
-      const record = {};
+      const record2 = {};
       headers.forEach((value, key) => {
-        record[key] = value;
+        record2[key] = value;
       });
-      return record;
+      return record2;
     }
     return { ...headers };
   }
-  function createHeaders(record) {
+  function createHeaders(record2) {
     return {
       get(name) {
         const wanted = name.toLowerCase();
-        for (const [key, value] of Object.entries(record)) {
+        for (const [key, value] of Object.entries(record2)) {
           if (key.toLowerCase() === wanted) return value;
         }
         return null;
       },
       forEach(callback) {
-        for (const [key, value] of Object.entries(record)) callback(value, key);
+        for (const [key, value] of Object.entries(record2)) callback(value, key);
       }
     };
   }
@@ -51698,12 +52262,12 @@ ${initialAgentsFile}`);
   }
   function resolveUnityRuntimePolicy(bridge2, isEditor2) {
     const raw = typeof bridge2.getRuntimePolicy === "function" ? bridge2.getRuntimePolicy() : void 0;
-    const record = asPolicyRecord(raw);
-    const mode = record.mode === "plan" || record.mode === "subagent" ? record.mode : "normal";
-    const confirmationPolicy = record.confirmationPolicy === "confirm" || record.confirmationPolicy === "deny" ? record.confirmationPolicy : "allow";
+    const record2 = asPolicyRecord(raw);
+    const mode = record2.mode === "plan" || record2.mode === "subagent" ? record2.mode : "normal";
+    const confirmationPolicy = record2.confirmationPolicy === "confirm" || record2.confirmationPolicy === "deny" ? record2.confirmationPolicy : "allow";
     return {
       mode,
-      yoloMode: record.yoloMode !== false,
+      yoloMode: record2.yoloMode !== false,
       confirmationPolicy
     };
   }
@@ -51816,6 +52380,7 @@ ${initialAgentsFile}`);
   var httpClient = new UnityHttpClient();
   setHttpClient(httpClient);
   setWebSocketClient(new UnityWebSocketClient());
+  installUnitySha256();
   installBundledSkillFileSystem();
   var unityFetch = createUnityFetchAdapter(httpClient);
   var _initialSelection = getDefaultSelection(bridge, getEndpointProfiles(bridge));
@@ -51930,8 +52495,8 @@ ${initialAgentsFile}`);
     getProvider: () => _provider,
     getModelId: () => _modelId,
     getCurrentSession: () => _currentSession,
-    setCurrentSession: (record) => {
-      _currentSession = record;
+    setCurrentSession: (record2) => {
+      _currentSession = record2;
     },
     getTodoState: () => todoTool.getState(),
     getExecutionState: () => todoTool.getExecutionState(),
@@ -51939,15 +52504,17 @@ ${initialAgentsFile}`);
     resetAgentForSessionSwitch: () => cancelActivePromptForSessionSwitch(),
     rebuildAgentSurface,
     setAgentModel: () => agent.setModel(getActiveModel()),
-    emitSessionSync: () => emitSessionSync()
+    emitSessionSync: () => emitSessionSync(),
+    logPersistenceError: (message) => bridge.log("error", `[pie/index] Mid-turn session persist failed: ${message}`)
   });
+  var textDeltaSender = new UnityTextDeltaSender(bridge);
   var agentSessionController = createUnityAgentSessionController({
     onAttentionEvent: (event) => bridge.sendToUnity(event.type, event),
     agent,
     projectRoot,
     getCurrentSession: () => _currentSession,
-    setCurrentSession: (record) => {
-      _currentSession = record;
+    setCurrentSession: (record2) => {
+      _currentSession = record2;
     },
     saveCurrentSession: async () => {
       await persistCurrentSession();
@@ -51995,8 +52562,8 @@ ${initialAgentsFile}`);
   async function persistCurrentSessionForRecovery() {
     await serializeSessionPersistence(() => sessionRuntime.persistCurrentSessionForRecovery());
   }
-  async function persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId, imageBlocks) {
-    await serializeSessionPersistence(() => sessionRuntime.persistCurrentSessionForRecoveryWithPendingUserMessage(content, displayContent, clientTurnId, imageBlocks));
+  async function persistCurrentSessionForRecoveryWithPendingUserMessage(pendingMessage) {
+    await serializeSessionPersistence(() => sessionRuntime.persistCurrentSessionForRecoveryWithPendingUserMessage(pendingMessage));
   }
   function cancelActivePromptForSessionSwitch() {
     agent.abort();
@@ -52015,14 +52582,13 @@ ${initialAgentsFile}`);
     const message = error instanceof Error ? error.message : String(error || "");
     return /already processing a prompt/i.test(message) && !isAgentActivelyProcessing();
   }
-  async function promptAgentWithRecovery(input, displayContent, clientTurnId, imageBlocks) {
+  async function promptAgentWithRecovery(promptInput, displayContent) {
     let recoveredStaleLock = false;
-    const promptInput = displayContent !== void 0 || clientTurnId !== void 0 ? createRuntimeUserMessage(input, displayContent ?? input, clientTurnId ?? runtimeChat.activeClientTurnId, Date.now(), imageBlocks) : input;
     while (true) {
       try {
         await agentSessionController.prompt(promptInput, {
           source: "unity",
-          displayText: displayContent ?? input
+          displayText: displayContent
         });
         return;
       } catch (error) {
@@ -52040,18 +52606,20 @@ ${initialAgentsFile}`);
   function startFreshSession(parentSessionId) {
     persistenceSessionGeneration++;
     runtimeChatTurns.resetForSessionSwitch();
+    textDeltaSender.reset();
     sessionRuntime.startFreshSession(parentSessionId);
     agentSessionController.syncFromActiveSession();
     todoLoopState = null;
   }
-  function restoreSessionRecord(record) {
+  function restoreSessionRecord(record2) {
     persistenceSessionGeneration++;
     runtimeChatTurns.resetForSessionSwitch();
-    _provider = record.provider || "";
-    _modelId = record.modelId || "";
+    textDeltaSender.reset();
+    _provider = record2.provider || "";
+    _modelId = record2.modelId || "";
     const resolved = getActiveResolvedModel();
     agent.setModel(resolved?.model || createUnconfiguredModel());
-    sessionRuntime.restoreSessionRecord(record);
+    sessionRuntime.restoreSessionRecord(record2);
     agentSessionController.syncFromActiveSession();
     refreshTodoLoopState();
   }
@@ -52059,8 +52627,8 @@ ${initialAgentsFile}`);
     if (!message || typeof message !== "object") return message;
     return JSON.parse(JSON.stringify(message));
   }
-  function trimInterruptedTail(record, lastUserText) {
-    const messages = Array.isArray(record.messages) ? record.messages.map((message) => cloneMessage(message)) : [];
+  function trimInterruptedTail(record2, lastUserText) {
+    const messages = Array.isArray(record2.messages) ? record2.messages.map((message) => cloneMessage(message)) : [];
     const normalizedLastUser = String(lastUserText || "").trim();
     if (normalizedLastUser.length > 0) {
       if (messages.length > 0) {
@@ -52077,16 +52645,16 @@ ${initialAgentsFile}`);
       }
     }
     return {
-      ...record,
+      ...record2,
       messageCount: messages.length,
       messages
     };
   }
-  function forkFromRecord(record) {
+  function forkFromRecord(record2) {
     sessionPersistence.assertAvailable();
     persistenceSessionGeneration++;
     runtimeChatTurns.resetForSessionSwitch();
-    const persisted = sessionRuntime.forkFromRecord(record, persistCurrentSession);
+    const persisted = sessionRuntime.forkFromRecord(record2, persistCurrentSession);
     agentSessionController.syncFromActiveSession();
     refreshTodoLoopState();
     return persisted;
@@ -52108,25 +52676,47 @@ ${initialAgentsFile}`);
   function runDebugLocalStream2(commandText, promptText) {
     return runDebugLocalStream(debugStreamHost, commandText, promptText);
   }
-  function emitSessionSync(record) {
-    const sourceRecord = record || _currentSession;
+  var lastSessionSyncState = emptyIncrementalSyncState();
+  function emitSessionSync(record2, options) {
+    const sourceRecord = record2 || _currentSession;
     const stateMessages = Array.isArray(sourceRecord?.messages) ? sourceRecord.messages : agent.state.messages || [];
-    const messages = buildSessionSyncMessages(stateMessages);
+    const timelineItems = buildRuntimeTimelineItems(
+      sourceRecord.id,
+      stateMessages,
+      sourceRecord.createdAt,
+      sourceRecord.id === _currentSession?.id ? runtimeChat.activeClientTurnId : void 0
+    );
+    const todoState = Array.isArray(sourceRecord.todoState) ? sourceRecord.todoState : todoTool.getState();
+    const plan = options?.full ? { kind: "full", reason: "explicit-full" } : planSessionSyncFrame(stateMessages, sourceRecord.id, lastSessionSyncState);
+    if (plan.kind === "incremental") {
+      lastSessionSyncState = { sessionId: sourceRecord.id, sentMessages: stateMessages.slice() };
+      bridge.sendToUnity("session_sync", {
+        schemaVersion: 2,
+        id: sourceRecord.id,
+        title: sourceRecord.title,
+        createdAt: sourceRecord.createdAt,
+        updatedAt: sourceRecord.updatedAt,
+        messageCount: stateMessages.length,
+        baseMessageCount: plan.baseMessageCount,
+        messages: buildSessionSyncMessagesCached(plan.suffix),
+        timelineItems,
+        todoState
+      });
+      return;
+    }
+    lastSessionSyncState = { sessionId: sourceRecord.id, sentMessages: stateMessages.slice() };
+    const messages = buildSessionSyncMessagesCached(stateMessages);
     bridge.sendToUnity("session_sync", {
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: sourceRecord.id,
       title: sourceRecord.title,
       createdAt: sourceRecord.createdAt,
       updatedAt: sourceRecord.updatedAt,
       messageCount: messages.length,
       messages,
-      timelineItems: buildRuntimeTimelineItems(
-        sourceRecord.id,
-        stateMessages,
-        sourceRecord.createdAt,
-        sourceRecord.id === _currentSession?.id ? runtimeChat.activeClientTurnId : void 0
-      ),
-      todoState: Array.isArray(sourceRecord.todoState) ? sourceRecord.todoState : todoTool.getState()
+      timelineItems,
+      todoState,
+      ...options?.full ? { full: true } : {}
     });
   }
   function emitSkillsList() {
@@ -52221,6 +52811,8 @@ ${initialAgentsFile}`);
     extractToolText,
     emitSessionSync,
     persistCurrentSessionSafely,
+    tryPersistCurrentSessionMidTurn: sessionRuntime.tryPersistCurrentSessionMidTurn,
+    textDeltaSender,
     refreshTodoLoopState,
     runtimeChat,
     getRuntimeChatTurn: () => runtimeChatTurns.current,

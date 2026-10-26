@@ -805,6 +805,42 @@ namespace Pie
 			return id;
 		}
 
+		/// <summary>
+		/// Cooperative yield for sliced main-thread work: completes on a background
+		/// timer and is delivered through the same per-frame push channel as file
+		/// reads, so awaiting it in the PuerTS environment resumes the caller on a
+		/// later JsEnv.Tick instead of the current one. Used by product-layer
+		/// slicing (session rebuilds, long sync builds) to spread one long frame
+		/// over several. Delay <= 0 completes immediately.
+		/// </summary>
+		public static int StartDelay(int delayMs)
+		{
+			int id = Interlocked.Increment(ref _nextRequestId);
+			var state = new RequestState(id);
+			_requests[id] = state;
+			Task.Run(async () =>
+			{
+				try
+				{
+					if (delayMs > 0) await Task.Delay(delayMs, state.Cts.Token);
+					state.ResultJson = "null";
+				}
+				catch (OperationCanceledException)
+				{
+					state.Error = "Operation aborted";
+				}
+				catch (Exception ex)
+				{
+					state.Error = ex.Message;
+				}
+				finally
+				{
+					state.IsComplete = true;
+				}
+			});
+			return id;
+		}
+
         public static int StartGrep(string searchPath, string pattern, string globPattern, bool ignoreCase, bool literal, int contextLines, int limit, string outputMode, int offset)
         {
             var compiledGlob = ValidateOptionalGlobPattern(globPattern);

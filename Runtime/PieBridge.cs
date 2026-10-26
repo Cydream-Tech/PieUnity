@@ -19,6 +19,7 @@ using System;
 using System.IO;
 using UnityEngine;
 using Puerts;
+using static Pie.PieTickPerformanceMonitor;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -98,6 +99,7 @@ namespace Pie
 
                 _isInitialized = true;
                 Instance = this;
+                RegisterTickPerformanceRpc();
 
                 PieDiagnostics.Info($"PieBridge ready (V8, core.bytes {jsContent.Length} chars)");
                 return true;
@@ -111,6 +113,60 @@ namespace Pie
                 DestroyJsEnvironment();
                 return false;
             }
+        }
+
+        private void RegisterTickPerformanceRpc()
+        {
+            // Diagnostic surface for the Tick probes: same PieDevRpc channel the
+            // chat window and runner already use, so editor tooling, the CLI,
+            // and play-mode runners can all toggle/read probes on the live
+            // bridge that owns the numbers. Handlers capture this instance and
+            // unregister conditionally (owner check) so overlapping bridge
+            // lifetimes (editor window + runner) cannot strip each other's
+            // registrations: unregister only removes a handler if it is still
+            // ours — PieDevRpc has no owner-aware removal, so we compare
+            // through a per-bridge token consulted by the wrapper.
+            var owner = this;
+            PieDevRpc.Register("perf.set_enabled", argsJson =>
+            {
+                var payload = JsonUtility.FromJson<PerfTogglePayload>(argsJson ?? "{}") ?? new PerfTogglePayload();
+                if (PieBridge.Instance != owner) return "{\"enabled\":false,\"stale\":true}";
+                TickPerformance.SetEnabled(payload.enabled);
+                return "{\"enabled\":" + (TickPerformance.IsEnabled ? "true" : "false") + "}";
+            });
+            PieDevRpc.Register("perf.get_report", _ =>
+            {
+                if (PieBridge.Instance != owner) return "{\"ticks\":0,\"stale\":true}";
+                var report = TickPerformance.BuildReport();
+                return string.IsNullOrEmpty(report) ? "{\"ticks\":0}" : report;
+            });
+            PieDevRpc.Register("perf.frames.get_report", _ =>
+                PieBridge.Instance == owner ? TickPerformance.BuildFramesReport() : "{\"frames\":[],\"stale\":true}");
+            PieDevRpc.Register("perf.reset", _ =>
+            {
+                if (PieBridge.Instance != owner) return "{}";
+                TickPerformance.Reset();
+                return "{}";
+            });
+        }
+
+        private void UnregisterTickPerformanceRpc()
+        {
+            // Only the bridge that currently owns the global registrations
+            // removes them: a stale bridge disposing after a newer bridge
+            // initialized would otherwise strip the live registrations
+            // (PieDevRpc.Unregister is unconditional).
+            if (PieBridge.Instance != this) return;
+            PieDevRpc.Unregister("perf.set_enabled");
+            PieDevRpc.Unregister("perf.get_report");
+            PieDevRpc.Unregister("perf.reset");
+            PieDevRpc.Unregister("perf.frames.get_report");
+        }
+
+        [Serializable]
+        private class PerfTogglePayload
+        {
+            public bool enabled;
         }
 
         /// <summary>Send a message to the JS Agent. action = "send_message", jsonData = "{\"content\":\"...\"}"</summary>
@@ -189,6 +245,7 @@ namespace Pie
         {
             if (_isDisposed) return;
             _isDisposed = true;
+            TickPerformance.Dispose();
 
 #if UNITY_EDITOR
             EditorApplication.update -= Tick;
@@ -203,9 +260,17 @@ namespace Pie
 
             DestroyJsEnvironment();
 
+            UnregisterTickPerformanceRpc();
             if (Instance == this) Instance = null;
             PieDiagnostics.Info("[PieBridge] Disposed");
         }
+
+        /// <summary>
+        /// Default-off Tick aggregates and Runner native-frame evidence. Toggled
+        /// and read through PieDevRpc (perf.* registered by this bridge).
+        /// Disabled probes do not read timing, GC, frame or profiler counters.
+        /// </summary>
+        public PieTickPerformanceMonitor TickPerformance { get; } = new PieTickPerformanceMonitor();
 
         /// <summary>Drive JS microtasks and SSE delivery from a host update loop.</summary>
         public void Tick()
@@ -214,21 +279,56 @@ namespace Pie
 
             try
             {
+                TickPerformance.BeginTick();
                 // Pump Unity-backed async bridges before ticking JS so queued data
                 // is visible to the same frame's microtasks and event handlers.
-                PieHttpBridge.PumpActiveRequests();
-                PushSSEData();
-                PushFileData();
-                _jsScriptHostTick?.Invoke();
-                RefreshUnityScriptHostReady();
-                RefreshRuntimeHostBridgeReady();
-                RefreshRuntimeBridgeReady();
-                _jsEnv.Tick();
+                // Segment probes use timestamp Begin/End pairs instead of
+                // Action allocation per frame (method-group conversions are not
+                // cached on Unity's C# 9 compiler). EndSegment/EndTick run in
+                // finally so a throwing segment still closes its measurement —
+                // an expensive failing frame must not vanish from the report.
+                try
+                {
+                    TickPerformance.BeginSegment(SegmentPump);
+                    PieHttpBridge.PumpActiveRequests();
+                }
+                finally { TickPerformance.EndSegment(); }
+                try
+                {
+                    TickPerformance.BeginSegment(SegmentSse);
+                    PushSSEData();
+                }
+                finally { TickPerformance.EndSegment(); }
+                try
+                {
+                    TickPerformance.BeginSegment(SegmentFile);
+                    PushFileData();
+                }
+                finally { TickPerformance.EndSegment(); }
+                try
+                {
+                    TickPerformance.BeginSegment(SegmentHost);
+                    _jsScriptHostTick?.Invoke();
+                }
+                finally { TickPerformance.EndSegment(); }
+                try
+                {
+                    TickPerformance.BeginSegment(SegmentReady);
+                    RefreshBridgeReadiness();
+                }
+                finally { TickPerformance.EndSegment(); }
+                try
+                {
+                    TickPerformance.BeginSegment(SegmentJs);
+                    _jsEnv.Tick();
+                }
+                finally { TickPerformance.EndSegment(); }
             }
             catch (Exception ex)
             {
                 PieDiagnostics.Error($"[PieBridge.Tick] {ex.Message}");
             }
+            finally { TickPerformance.EndTick(); }
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -307,6 +407,7 @@ namespace Pie
 
         private void DestroyJsEnvironment()
         {
+            Pie.Unity.Capabilities.PieUnityScreenshotRuntime.ResetJobs();
             try
             {
                 _jsEnv?.Dispose();
@@ -803,7 +904,26 @@ namespace Pie
             }
         }
 
+        private void RefreshBridgeReadiness()
+        {
+            RefreshUnityScriptHostReady();
+            RefreshRuntimeHostBridgeReady();
+            RefreshRuntimeBridgeReady();
+        }
+
         private const int MAX_LINES_PER_FRAME = 3;
+
+        // SSE pump time budget: per-frame wall-clock cap for pushing SSE lines
+        // into JS. The line-count floor (MAX_LINES_PER_FRAME) guarantees
+        // forward progress on fast machines; the time cap keeps a single
+        // frame from overrunning when individual lines are huge (a chunked
+        // tool-call payload can be tens of KB) or the JS handlers are slow —
+        // the fixed line count had no answer for either.
+        // Expressed in Stopwatch ticks (NOT TimeSpan ticks: 1 Stopwatch tick
+        // is 1/Stopwatch.Frequency seconds, which only equals 100ns on hosts
+        // where Frequency happens to be 10MHz).
+        private static readonly long SsePushBudgetTicks = (long)(2.0 * System.Diagnostics.Stopwatch.Frequency / 1000.0);
+        private readonly System.Diagnostics.Stopwatch _ssePushWatch = new System.Diagnostics.Stopwatch();
 
         /// <summary>
         /// SSE/file push handlers are installed by the JS HTTP/file client, which
@@ -853,6 +973,12 @@ namespace Pie
 
         private void PushSSEData()
         {
+            // One aggregate budget for the whole frame across every active
+            // request — restarting per request would give N streams N fresh
+            // budgets in one frame. Restarted once per pump (per frame) so
+            // every request's pushes this frame accumulate against it.
+            _ssePushWatch.Restart();
+            var budgetExhausted = false;
             foreach (var reqId in PieHttpBridge.GetActiveRequestIds())
             {
                 EnsureSseDelegatesBound();
@@ -869,7 +995,7 @@ namespace Pie
                     // queued SSE lines so protocol markers such as [DONE] win.
                     var error = status >= 200 && status < 300
                         ? null
-                        : PieHttpBridge.GetError(reqId);
+                        : ClipErrorForJs(PieHttpBridge.GetError(reqId));
                     _jsSSEStatus(reqId, status, error);
                     return;
                 }
@@ -877,6 +1003,7 @@ namespace Pie
                 int pushed = 0;
                 while (pushed < MAX_LINES_PER_FRAME)
                 {
+                    if (budgetExhausted && pushed > 0) break;
                     if (!PieHttpBridge.TryPollLine(reqId, out var line))
                         break;
 
@@ -885,17 +1012,41 @@ namespace Pie
 
                     _jsSSEPush(reqId, line);
                     pushed++;
+
+                    // Budget check AFTER each push: the JS handler's own cost
+                    // counts toward the frame. Each request keeps a one-line
+                    // anti-starvation floor even after the aggregate budget is
+                    // spent (round-robin by queue order); past that, remaining
+                    // lines wait for the next frame.
+                    if (_ssePushWatch.ElapsedTicks >= SsePushBudgetTicks)
+                        budgetExhausted = true;
                 }
 
                 if (PieHttpBridge.TryGetTerminal(reqId, out var terminalError))
                 {
                     if (_jsSSETerminal != null)
-                        _jsSSETerminal(reqId, terminalError);
+                        _jsSSETerminal(reqId, ClipErrorForJs(terminalError));
                     else
                         _jsSSEPush(reqId, null);
                     PieHttpBridge.MarkTerminalPushed(reqId);
                 }
             }
+        }
+
+        /// <summary>
+        /// Error strings cross into JS as delegate arguments: marshaling a
+        /// runaway error body (bounded at 1 MiB upstream) costs tens of ms on
+        /// the main thread — measured as the entire 78–96ms per-turn spike.
+        /// JS only parses retry-after hints and renders a short message, so a
+        /// small window is plenty; the full text stays in state.Error for logs.
+        /// </summary>
+        private const int MaxErrorCharsToJs = 8 * 1024;
+
+        private static string ClipErrorForJs(string error)
+        {
+            if (string.IsNullOrEmpty(error) || error.Length <= MaxErrorCharsToJs)
+                return error;
+            return error.Substring(0, MaxErrorCharsToJs) + $"...[clipped {error.Length - MaxErrorCharsToJs} chars]";
         }
 
         private void PushFileData()

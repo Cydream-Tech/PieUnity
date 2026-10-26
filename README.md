@@ -253,6 +253,10 @@ The shipped runtime bridge is a tracked Unity `TextAsset` contract, not an ad-ho
 
 `unity_script_run` is a cooperative step-bounded runner: define `export async function run(ctx, args)`, await frame boundaries and host calls, and expect long synchronous loops to fail with `STEP_TIMEOUT` after a guard check rather than being arbitrarily preempted.
 
+Sequential awaited host/engine calls also automatically yield delivery of an already computed result through a one-frame gate after a task-local 4ms soft wall-time slice. Actions still dispatch synchronously once; applied edits may precede cancellation of delivery. Slice starts reset only on actual gate release/new task, not each call or gate creation. Native-frame dedup prevents same-frame resume. Explicit wait counts are unchanged, and automatic yields still consume total timeout/maxFrames; hard step checks win before yielding. The slice clock uses Unity `Time.realtimeSinceStartupAsDouble` (fallback `performance.now`/clamped `Date.now`), separate from deadline/ISO clocks. No new request option is exposed.
+
+This is not a global frame-time guarantee or native preemption. `Promise.all`/unawaited calls retain immediate side effects, synchronous ctx helpers do not auto-yield, rollback's internal destroy loop is not split, and one expensive native call cannot be interrupted. Use sequential awaits and explicit pacing. Catching cancellation/terminal gate rejection cannot authorize further edits; inspect `appliedOperations` before retrying.
+
 Runtime debugging is zero-registration by default. When a PlayMode/runtime host is alive, discoverability prefers the runtime owner, and `unity_script_run` exposes `ctx.runtime` for controlled same-`JsEnv` inspection and path-based calls such as `ctx.runtime.call("IJsEnvironment.Environment.ReloadAllMods", [])`. Prefer `ctx.runtime` over assuming raw globals like `VX`, `CS`, or `puer` are part of the public contract.
 
 ## Behavior Trees

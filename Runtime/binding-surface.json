@@ -14,6 +14,7 @@
     { "name": "Pie.PieFileBridge", "assembly": "Pie.Runtime", "usedBy": "native file bridge (bounded reads, base64 fallback)" },
     { "name": "Pie.PieBridge", "assembly": "Pie.Runtime", "usedBy": "LoadResourceText for the lazy TypeScript compiler (optional-chained probe)" },
     { "name": "Pie.PieHttpBridge", "assembly": "Pie.Runtime", "usedBy": "LLM HTTP/SSE streaming (unity-http-client)" },
+    { "name": "Pie.PieUtf8Sha256", "assembly": "Pie.Runtime", "usedBy": "optional streaming UTF-8 SHA-256 accelerator; constructor, UpdateUtf8, DigestHex, Dispose (older native hosts fall back)" },
     { "name": "Pie.PieDiagnostics", "assembly": "Pie.Runtime", "usedBy": "verbose logging from JS" }
   ],
   "optionalProbes": [

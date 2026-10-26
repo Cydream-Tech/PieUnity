@@ -2482,6 +2482,33 @@ namespace Pie.Editor
                     return;
                 }
 
+                // Incremental frame (schemaVersion 2): the payload extends the
+                // transcript we already hold instead of replacing it. The base
+                // must match the last applied sync for the same session — a
+                // mismatch means our view is stale (missed frame, reload) and
+                // the producer must resend a full frame. This skips the full
+                // JsonUtility→ChatMessage rebuild of the whole history, which
+                // measured 34–104ms per turn on the main thread.
+                if (payload != null
+                    && payload.baseMessageCount > 0
+                    && payload.baseMessageCount == _lastSessionSyncMessageCount
+                    && string.Equals(payload.id, _lastSessionSyncId, StringComparison.Ordinal)
+                    && string.Equals(payload.id, _activeSessionId, StringComparison.Ordinal)
+                    && _messages.Count > 0)
+                {
+                    ApplyIncrementalSessionSync(payload, payloadTodoCount);
+                    return;
+                }
+                if (payload != null
+                    && payload.baseMessageCount > 0
+                    && !(string.Equals(payload.id, _lastSessionSyncId, StringComparison.Ordinal)
+                        && payload.baseMessageCount == _lastSessionSyncMessageCount))
+                {
+                    // Incremental frame we cannot apply: ask for a full one.
+                    RequestSessionResync();
+                    return;
+                }
+
                 _activeSessionId = payload?.id ?? "";
                 _lastSessionSyncId = payload?.id ?? "";
                 _lastSessionSyncMessageCount = payload?.messageCount ?? 0;
@@ -2492,66 +2519,7 @@ namespace Pie.Editor
                 _todoItems.Clear();
 
                 if (payload?.messages != null)
-                {
-                    var toolResultCallIds = new HashSet<string>();
-                    foreach (var prior in payload.messages)
-                    {
-                        if (prior != null && prior.role == "toolResult" && !string.IsNullOrEmpty(prior.toolCallId))
-                            toolResultCallIds.Add(prior.toolCallId);
-                    }
-                    foreach (var message in payload.messages)
-                    {
-                        var role = string.IsNullOrEmpty(message.role) ? "assistant" : message.role;
-                        var content = FlattenSessionContent(message);
-                        var isToolResult = role == "toolResult";
-                        var argsJson = HasMeaningfulArgs(message.effectiveArgsJson)
-                            ? message.effectiveArgsJson : message.argsJson;
-                        if (isToolResult) role = "tool";
-                        if (role == "user" && !string.IsNullOrEmpty(message.displayContent))
-                            content = message.displayContent;
-                        if (role == "assistant" && string.IsNullOrEmpty(content) && message.stopReason == "toolUse")
-                        {
-                            // Tool-only assistant shells normally render through their
-                            // toolResult card. A call that never received a result
-                            // (interrupted run, reload) must stay visible.
-                            AddInterruptedToolCalls(message, toolResultCallIds);
-                            continue;
-                        }
-                        if (string.IsNullOrEmpty(content) && !string.IsNullOrEmpty(message.errorMessage))
-                            content = $"⚠ {message.errorMessage}";
-                        if (string.IsNullOrEmpty(content) && !string.IsNullOrEmpty(message.stopReason))
-                            content = $"[{message.stopReason}]";
-                        _messages.Add(new ChatMessage(role, content ?? "")
-                        {
-                            ClientTurnId = message.clientTurnId ?? "",
-                            Title = isToolResult ? message.toolName : "",
-                            ToolName = message.toolName,
-                            ToolCallId = message.toolCallId,
-                            ImagePath = isToolResult ? TryExtractToolImagePath(message.toolName, argsJson ?? "", content ?? "") : null,
-                            ArgsText = argsJson ?? "",
-                            ArgsSummary = BuildArgsSummary(argsJson ?? ""),
-                            Summary = isToolResult
-                                ? (message.isError
-                                    ? SummarizeToolFailure(message.toolName, content)
-                                    : SummarizeToolResult(message.toolName, content, message.detailsJson ?? ""))
-                                : "",
-                            IsError = message.isError,
-                            InputTokens = message.usage != null ? message.usage.input : (role == "user" ? EstimateTextTokens(content) : 0),
-                            OutputTokens = message.usage != null ? message.usage.output : 0,
-                            CacheReadTokens = message.usage != null ? message.usage.cacheRead : 0,
-                            CacheWriteTokens = message.usage != null ? message.usage.cacheWrite : 0,
-                            TotalTokens = message.usage != null ? message.usage.totalTokens : (role == "user" ? EstimateTextTokens(content) : 0),
-                            IsEstimatedUsage = message.usage != null && message.usage.estimated,
-                        });
-                        if (role == "assistant")
-                        {
-                            // A streamed assistant message can carry text plus tool calls
-                            // whose run was interrupted before any result was recorded;
-                            // those calls must still be visible after the text card.
-                            AddInterruptedToolCalls(message, toolResultCallIds);
-                        }
-                    }
-                }
+                    AppendSyncMessages(payload.messages);
 
                 if (payload?.todoState != null)
                     _todoItems.AddRange(payload.todoState);
@@ -2612,6 +2580,171 @@ namespace Pie.Editor
             {
                 PieDiagnostics.Warning($"[PieChatWindow] ApplyTodoStateFromToolDetails: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Append session-sync messages as ChatMessage bubbles. Shared by the
+        /// full rebuild (after _messages.Clear()) and the incremental apply —
+        /// one conversion implementation, two entry shapes.
+        /// </summary>
+        private void AppendSyncMessages(SessionSyncMessage[] messages)
+        {
+            if (messages == null)
+                return;
+            var toolResultCallIds = new HashSet<string>();
+            foreach (var prior in messages)
+            {
+                if (prior != null && prior.role == "toolResult" && !string.IsNullOrEmpty(prior.toolCallId))
+                    toolResultCallIds.Add(prior.toolCallId);
+            }
+            foreach (var message in messages)
+            {
+                var role = string.IsNullOrEmpty(message.role) ? "assistant" : message.role;
+                var content = FlattenSessionContent(message);
+                var isToolResult = role == "toolResult";
+                var argsJson = HasMeaningfulArgs(message.effectiveArgsJson)
+                    ? message.effectiveArgsJson : message.argsJson;
+                if (isToolResult) role = "tool";
+                if (role == "user" && !string.IsNullOrEmpty(message.displayContent))
+                    content = message.displayContent;
+                if (role == "assistant" && string.IsNullOrEmpty(content) && message.stopReason == "toolUse")
+                {
+                    // Tool-only assistant shells normally render through their
+                    // toolResult card. A call that never received a result
+                    // (interrupted run, reload) must stay visible.
+                    AddInterruptedToolCalls(message, toolResultCallIds);
+                    continue;
+                }
+                if (string.IsNullOrEmpty(content) && !string.IsNullOrEmpty(message.errorMessage))
+                    content = $"⚠ {message.errorMessage}";
+                if (string.IsNullOrEmpty(content) && !string.IsNullOrEmpty(message.stopReason))
+                    content = $"[{message.stopReason}]";
+                _messages.Add(new ChatMessage(role, content ?? "")
+                {
+                    ClientTurnId = message.clientTurnId ?? "",
+                    Title = isToolResult ? message.toolName : "",
+                    ToolName = message.toolName,
+                    ToolCallId = message.toolCallId,
+                    ImagePath = isToolResult ? TryExtractToolImagePath(message.toolName, argsJson ?? "", content ?? "") : null,
+                    ArgsText = argsJson ?? "",
+                    ArgsSummary = BuildArgsSummary(argsJson ?? ""),
+                    Summary = isToolResult
+                        ? (message.isError
+                            ? SummarizeToolFailure(message.toolName, content)
+                            : SummarizeToolResult(message.toolName, content, message.detailsJson ?? ""))
+                        : "",
+                    IsError = message.isError,
+                    InputTokens = message.usage != null ? message.usage.input : (role == "user" ? EstimateTextTokens(content) : 0),
+                    OutputTokens = message.usage != null ? message.usage.output : 0,
+                    CacheReadTokens = message.usage != null ? message.usage.cacheRead : 0,
+                    CacheWriteTokens = message.usage != null ? message.usage.cacheWrite : 0,
+                    TotalTokens = message.usage != null ? message.usage.totalTokens : (role == "user" ? EstimateTextTokens(content) : 0),
+                    IsEstimatedUsage = message.usage != null && message.usage.estimated,
+                });
+                if (role == "assistant")
+                {
+                    // A streamed assistant message can carry text plus tool calls
+                    // whose run was interrupted before any result was recorded;
+                    // those calls must still be visible after the text card.
+                    AddInterruptedToolCalls(message, toolResultCallIds);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Apply an incremental (schemaVersion 2) session_sync: replace the
+        /// current turn's live-rendered bubbles with the suffix messages and
+        /// replace the todo state. The caller has already verified the base
+        /// matches our last applied sync for the same session.
+        ///
+        /// During a turn, streaming events (message_update, tool_start/end,
+        /// thinking) render bubbles directly. The suffix contains the same
+        /// turn's canonical messages, so those live bubbles must go before
+        /// appending — otherwise every tool card and assistant text renders
+        /// twice. The live region starts at the suffix's own user message:
+        /// we search backwards for the bubble whose ClientTurnId matches the
+        /// suffix's first clientTurnId and drop everything from it on. No
+        /// match means our view does not line up with the suffix — the
+        /// caller resyncs with a full frame instead of guessing.
+        /// </summary>
+        private void ApplyIncrementalSessionSync(SessionSyncPayload payload, int payloadTodoCount)
+        {
+            var suffix = payload?.messages;
+            var firstSuffixTurnId = suffix != null && suffix.Length > 0 ? suffix[0]?.clientTurnId : null;
+            var suffixStartsWithUser = suffix != null && suffix.Length > 0
+                && string.Equals(suffix[0]?.role, "user", StringComparison.Ordinal);
+            var liveStart = -1;
+            var lastUserBubble = -1;
+            for (var i = _messages.Count - 1; i >= 0; i--)
+            {
+                var bubble = _messages[i];
+                if (bubble == null) continue;
+                // Prefer the turn anchor: a bubble already carrying the
+                // suffix's first clientTurnId (a previously-synced user
+                // bubble for this same turn id).
+                if (!string.IsNullOrEmpty(bubble.ClientTurnId)
+                    && !string.IsNullOrEmpty(firstSuffixTurnId)
+                    && string.Equals(bubble.ClientTurnId, firstSuffixTurnId, StringComparison.Ordinal))
+                {
+                    liveStart = i;
+                    break;
+                }
+                if (string.Equals(bubble.Role, "user", StringComparison.Ordinal) && lastUserBubble < 0)
+                {
+                    lastUserBubble = i;
+                }
+            }
+            if (liveStart < 0 && lastUserBubble >= 0)
+            {
+                if (suffixStartsWithUser)
+                {
+                    // Local send bubbles carry no ClientTurnId, but the
+                    // suffix's first message is this turn's user message:
+                    // the last user bubble IS the live region start and is
+                    // replaced by the suffix's own copy.
+                    liveStart = lastUserBubble;
+                }
+                else
+                {
+                    // Suffix continues an earlier user message (abort finalize,
+                    // mid-turn sync): the user bubble stays, everything after
+                    // it is this turn's live region.
+                    liveStart = lastUserBubble + 1;
+                }
+            }
+            if (liveStart < 0)
+            {
+                // No live region found (e.g. metadata-only frame after a
+                // compaction): keep everything rendered, clear running flags,
+                // and append only genuinely new messages.
+                ClearRunningMessages();
+            }
+            else if (liveStart < _messages.Count)
+            {
+                _messages.RemoveRange(liveStart, _messages.Count - liveStart);
+            }
+
+            AppendSyncMessages(suffix);
+
+            if (payload?.todoState != null)
+            {
+                _todoItems.Clear();
+                _todoItems.AddRange(payload.todoState);
+            }
+            _lastSessionSyncMessageCount = payload?.messageCount ?? _lastSessionSyncMessageCount;
+            _lastSessionSyncTodoCount = payloadTodoCount;
+            _statusText = $"Session: {payload.title} ({payload.id})";
+            RefreshSessions();
+            ScrollToBottomSoon();
+            ScheduleRepaint();
+        }
+
+        /// <summary>Ask the runtime for a full session_sync (incremental base mismatch).</summary>
+        private void RequestSessionResync()
+        {
+            if (_bridge?.IsInitialized != true)
+                return;
+            _bridge.SendToJs("resync_session", "{}");
         }
 
         private int CountCompletedTodos()
@@ -3615,6 +3748,12 @@ namespace Pie.Editor
             public SessionSyncMessage[] messages;
             public PieTimelineItem[] timelineItems;
             public TodoStateItem[] todoState;
+            // schemaVersion 2 incremental fields: baseMessageCount > 0 marks
+            // an incremental frame extending that many already-synced
+            // messages (messages then carries only the suffix); "full" marks
+            // a recovery/resync answer that must rebuild the transcript.
+            public int baseMessageCount;
+            public bool full;
         }
 
         [Serializable]

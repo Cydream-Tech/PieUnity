@@ -4,6 +4,8 @@
     bindings. Those calls are invisible to Unity's static linker, so an
     IL2CPP Player can otherwise strip public members such as
     PieProjectPaths.GetSessionsDirectory and PieBridge.ReceiveFromJs.
+    This also preserves PieUtf8Sha256's constructor, UpdateUtf8, DigestHex
+    and Dispose for the optional UTF-8 streaming SHA-256 adapter.
   -->
   <assembly fullname="Pie.Runtime" preserve="all" />
 

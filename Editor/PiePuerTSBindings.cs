@@ -98,6 +98,7 @@ namespace Pie.Editor
                 yield return typeof(System.Environment);
                 yield return typeof(System.Environment.SpecialFolder);
                 // ── Pie bridges ─────────────────────────────────────────
+                yield return typeof(Pie.PieUtf8Sha256);
                 yield return typeof(Pie.PieFileBridge);
                 yield return typeof(Pie.PieHttpBridge);
                 yield return typeof(Pie.PieDiagnostics);

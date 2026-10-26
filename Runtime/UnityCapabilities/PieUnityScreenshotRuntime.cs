@@ -9,7 +9,7 @@ namespace Pie.Unity.Capabilities
     /// under Application.persistentDataPath/PieScreenshots. Pair with the
     /// runtime read_file tool (root=persistent) to visually inspect captures.
     /// </summary>
-    public static class PieUnityScreenshotRuntime
+    public static partial class PieUnityScreenshotRuntime
     {
         private const int MinDimension = 64;
         private const int MaxDimension = 3840;
@@ -17,6 +17,7 @@ namespace Pie.Unity.Capabilities
         [Serializable]
         private sealed class ScreenshotPayload
         {
+            public string requestId;
             public int width;
             public int height;
             public string cameraName;
@@ -43,6 +44,16 @@ namespace Pie.Unity.Capabilities
 
         public static string ScreenshotJson(string argsJson)
         {
+            using (var capture = PieScreenshotTimingProbe.BeginCapture())
+            {
+                var result = ScreenshotJsonCore(argsJson);
+                capture.Succeed();
+                return result;
+            }
+        }
+
+        private static string ScreenshotJsonCore(string argsJson)
+        {
             // FromJsonOverwrite into a pre-constructed instance: the field
             // initializer for includeUI runs in the constructor, so an absent
             // key keeps the historical default (true) regardless of how a
@@ -52,9 +63,19 @@ namespace Pie.Unity.Capabilities
                 JsonUtility.FromJsonOverwrite(argsJson, payload);
             var width = Mathf.Clamp(payload.width > 0 ? payload.width : 1280, MinDimension, MaxDimension);
             var height = Mathf.Clamp(payload.height > 0 ? payload.height : 720, MinDimension, MaxDimension);
+            PieScreenshotTimingProbe.Dimensions(width, height);
 
-            string cameraUsed;
-            string captureMode;
+            var bytes = Capture(payload, width, height, out var cameraUsed, out var captureMode);
+            var persistentRoot = Application.persistentDataPath;
+            var directory = Path.Combine(persistentRoot, "PieScreenshots");
+            var absolutePath = PieScreenshotFiles.Destination(directory, SanitizeRelativePath(payload.path));
+            using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.Write))
+                absolutePath = PieScreenshotFiles.WriteUnique(absolutePath, bytes, persistentRoot);
+            return JsonUtility.ToJson(BuildResult(directory, absolutePath, width, height, bytes.Length, cameraUsed, captureMode));
+        }
+
+        private static byte[] Capture(ScreenshotPayload payload, int width, int height, out string cameraUsed, out string captureMode, Func<Texture2D, byte[]> snapshot = null)
+        {
             byte[] bytes;
             // An explicit cameraName is user intent: honor it even in play
             // mode via a targeted camera render instead of silently falling
@@ -65,57 +86,115 @@ namespace Pie.Unity.Capabilities
             // panels, HUDs) which the game-view capture always includes.
             if (Application.isPlaying && !explicitCameraRequested && payload.includeUI)
             {
-                bytes = CaptureGameView(width, height, payload.cameraName, out cameraUsed, out captureMode);
+                bytes = CaptureGameView(width, height, payload.cameraName, out cameraUsed, out captureMode, snapshot);
             }
             else
             {
-                bytes = CaptureViaCamera(payload.cameraName, width, height, payload.includeUI, out cameraUsed);
+                bytes = CaptureViaCamera(payload.cameraName, width, height, payload.includeUI, out cameraUsed, snapshot);
                 captureMode = "camera-render";
             }
 
-            var directory = Path.Combine(Application.persistentDataPath, "PieScreenshots");
-            Directory.CreateDirectory(directory);
-            var relativePath = SanitizeRelativePath(payload.path)
-                ?? $"capture_{DateTime.UtcNow:yyyyMMdd_HHmmssfff}.png";
-            var absolutePath = Path.Combine(directory, relativePath.Replace('/', Path.DirectorySeparatorChar));
-            Directory.CreateDirectory(Path.GetDirectoryName(absolutePath) ?? directory);
-            // Never silently overwrite an existing capture: uniquify the
-            // file name so repeated explicit paths and same-millisecond
-            // defaults are preserved.
-            if (File.Exists(absolutePath))
-            {
-                var stem = Path.Combine(
-                    Path.GetDirectoryName(absolutePath) ?? directory,
-                    Path.GetFileNameWithoutExtension(absolutePath));
-                var ext = Path.GetExtension(absolutePath);
-                for (var attempt = 1; ; attempt += 1)
-                {
-                    var candidate = $"{stem}_{attempt}{ext}";
-                    if (!File.Exists(candidate))
-                    {
-                        absolutePath = candidate;
-                        break;
-                    }
-                }
-            }
+            return bytes;
+        }
 
-            File.WriteAllBytes(absolutePath, bytes);
-
+        private static ScreenshotResult BuildResult(string directory, string absolutePath, int width, int height, int byteCount, string cameraUsed, string captureMode)
+        {
             // The reported relative path must track the uniquified file: derive
             // it from the final absolute path so path/absolutePath never diverge.
             var finalRelative = Path.GetRelativePath(directory, absolutePath).Replace('\\', '/');
             var result = new ScreenshotResult
             {
-                summary = $"Captured {width}x{height} screenshot ({captureMode}, {bytes.Length} bytes).",
+                summary = $"Captured {width}x{height} screenshot ({captureMode}, {byteCount} bytes).",
                 path = $"PieScreenshots/{finalRelative}",
                 absolutePath = absolutePath.Replace('\\', '/'),
                 width = width,
                 height = height,
-                bytes = bytes.Length,
+                bytes = byteCount,
                 camera = cameraUsed,
                 mode = captureMode,
             };
-            return JsonUtility.ToJson(result);
+            return result;
+        }
+
+        private static readonly PieScreenshotJobs Jobs = new PieScreenshotJobs();
+        internal static void ResetJobs() => Jobs.Reset();
+
+        [Serializable] private sealed class JobReport
+        {
+            public string requestId, status, error;
+            public ScreenshotResult result;
+        }
+        private static ScreenshotPayload Parse(string json)
+        {
+            var payload = new ScreenshotPayload();
+            if (!string.IsNullOrWhiteSpace(json)) JsonUtility.FromJsonOverwrite(json, payload);
+            return payload;
+        }
+        internal static string BeginJson(string json)
+        {
+            var payload = Parse(json);
+            var job = Jobs.BeginDeferred(payload.requestId, owner =>
+            {
+                var owned = owner.Job;
+                var gpuReadback = CanUseGpuReadback();
+                using (var scope = PieScreenshotTimingProbe.BeginCapture(captureOnly: true, phase: gpuReadback ? "gpu-admission" : null))
+                {
+                    var width = Mathf.Clamp(payload.width > 0 ? payload.width : 1280, MinDimension, MaxDimension);
+                    var height = Mathf.Clamp(payload.height > 0 ? payload.height : 720, MinDimension, MaxDimension);
+                    owned.Width = width; owned.Height = height;
+                    var persistentRoot = Application.persistentDataPath;
+                    owned.Directory = Path.Combine(persistentRoot, "PieScreenshots");
+                    var destination = PieScreenshotFiles.Destination(owned.Directory, SanitizeRelativePath(payload.path));
+                    PieScreenshotTimingProbe.Dimensions(width, height);
+                    if (gpuReadback)
+                    {
+                        StartGpuCapture(owner, payload, width, height, destination, persistentRoot);
+                        scope.Succeed();
+                        return;
+                    }
+                    var format = default(global::UnityEngine.Experimental.Rendering.GraphicsFormat);
+                    var pixels = Capture(payload, width, height, out owned.Camera, out owned.Mode, texture =>
+                    {
+                        format = texture.graphicsFormat;
+                        // Copy NativeArray into owned managed storage before texture destruction.
+                        return texture.GetRawTextureData<byte>().ToArray();
+                    });
+                    scope.Succeed();
+                    owner.Submit(MakeWorker(pixels, format, width, height, destination, persistentRoot));
+                }
+            });
+            return Report(payload.requestId, job);
+        }
+        // A separate closure factory prevents retaining payload, textures, probe
+        // scopes or the main-thread capture callback in the worker's environment.
+        private static Func<PieScreenshotJobs.Output> MakeWorker(byte[] pixels, UnityEngine.Experimental.Rendering.GraphicsFormat format, int width, int height, string destination, string persistentRoot, bool rgba = false, bool flipRows = false)
+        {
+            return () =>
+            {
+                // EncodeArrayToPNG is the thread-safe array encoder; use no other
+                // Unity API, static probe, JsonUtility or Application on this thread.
+                if (rgba) pixels = PackRgb(pixels, width, height, flipRows);
+                var png = ImageConversion.EncodeArrayToPNG(pixels, format, (uint)width, (uint)height);
+                return new PieScreenshotJobs.Output { Path = PieScreenshotFiles.WriteUnique(destination, png, persistentRoot), Bytes = png.Length };
+            };
+        }
+        internal static string PollJson(string json)
+        {
+            var id = Parse(json).requestId;
+            return Report(id, Jobs.Poll(id));
+        }
+        internal static string CancelJson(string json)
+        {
+            var id = Parse(json).requestId;
+            return Report(id, Jobs.Cancel(id));
+        }
+        private static string Report(string id, PieScreenshotJobs.Job job)
+        {
+            var state = job?.Read();
+            return JsonUtility.ToJson(new JobReport {
+                requestId = id, status = state?.Status ?? "unknown", error = state?.Error,
+                result = state?.Status == "succeeded" ? BuildResult(job.Directory, state.Result.Path, job.Width, job.Height, state.Result.Bytes, job.Camera, job.Mode) : null,
+            });
         }
 
         /// <summary>
@@ -124,12 +203,13 @@ namespace Pie.Unity.Capabilities
         /// texture would skip. Falls back to a camera render when no game
         /// frame is available.
         /// </summary>
-        private static byte[] CaptureGameView(int width, int height, string cameraName, out string cameraUsed, out string captureMode)
+        private static byte[] CaptureGameView(int width, int height, string cameraName, out string cameraUsed, out string captureMode, Func<Texture2D, byte[]> snapshot = null)
         {
             Texture2D captured = null;
             try
             {
-                captured = ScreenCapture.CaptureScreenshotAsTexture();
+                using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.Capture))
+                    captured = ScreenCapture.CaptureScreenshotAsTexture();
             }
             catch (Exception)
             {
@@ -137,8 +217,9 @@ namespace Pie.Unity.Capabilities
             }
             if (captured == null)
             {
+                PieScreenshotTimingProbe.Fallback();
                 captureMode = "camera-render";
-                return CaptureViaCamera(cameraName, width, height, true, out cameraUsed);
+                return CaptureViaCamera(cameraName, width, height, true, out cameraUsed, snapshot);
             }
             try
             {
@@ -147,7 +228,9 @@ namespace Pie.Unity.Capabilities
                 {
                     captureMode = "game-view";
                     cameraUsed = "game-view";
-                    return readable.EncodeToPNG();
+                    if (snapshot != null) return snapshot(readable);
+                    using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.Encode))
+                        return readable.EncodeToPNG();
                 }
                 finally
                 {
@@ -160,7 +243,7 @@ namespace Pie.Unity.Capabilities
             }
         }
 
-        private static byte[] CaptureViaCamera(string cameraName, int width, int height, bool includeUI, out string cameraUsed)
+        private static byte[] CaptureViaCamera(string cameraName, int width, int height, bool includeUI, out string cameraUsed, Func<Texture2D, byte[]> snapshot = null)
         {
             var camera = ResolveCamera(cameraName);
             if (camera == null)
@@ -171,10 +254,35 @@ namespace Pie.Unity.Capabilities
                 throw new InvalidOperationException(message);
             }
             cameraUsed = camera.name;
-            return RenderCameraToPng(camera, width, height, includeUI);
+            return RenderCameraToPng(camera, width, height, includeUI, snapshot);
         }
 
         private static Texture2D ScaleToSize(Texture2D source, int width, int height)
+        {
+            // CaptureScreenshotAsTexture can return display bytes with UNorm
+            // metadata. In Linear projects sampling those as linear would encode
+            // them a second time. Retag only this legacy game-view input; keep
+            // its bytes intact and leave camera/GPU capture paths unchanged.
+            if (!IsLinearColorSpace() || UnityEngine.Experimental.Rendering.GraphicsFormatUtility.IsSRGBFormat(source.graphicsFormat))
+                return ScaleToSizeCore(source, width, height);
+
+            var tagged = new Texture2D(source.width, source.height, source.format, false, false);
+            try
+            {
+                using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.PixelCopy))
+                {
+                    tagged.LoadRawTextureData(source.GetRawTextureData<byte>());
+                    tagged.Apply(false);
+                }
+                return ScaleToSizeCore(tagged, width, height);
+            }
+            finally
+            {
+                UnityEngine.Object.Destroy(tagged);
+            }
+        }
+
+        private static Texture2D ScaleToSizeCore(Texture2D source, int width, int height)
         {
             // A PNG must carry display-referred sRGB bytes regardless of the
             // project's color space: source pixel metadata, the blit write
@@ -195,8 +303,11 @@ namespace Pie.Unity.Capabilities
                 var copy = new Texture2D(width, height, TextureFormat.RGB24, false);
                 try
                 {
-                    copy.SetPixels(source.GetPixels());
-                    copy.Apply(false);
+                    using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.PixelCopy))
+                    {
+                        copy.SetPixels(source.GetPixels());
+                        copy.Apply(false);
+                    }
                     return copy;
                 }
                 catch
@@ -224,13 +335,17 @@ namespace Pie.Unity.Capabilities
                 // effects), so scope it explicitly around the conversion blit.
                 if (linear)
                     GL.sRGBWrite = true;
-                Graphics.Blit(source, scaled);
+                using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.Blit))
+                    Graphics.Blit(source, scaled);
                 RenderTexture.active = scaled;
                 var texture = new Texture2D(width, height, TextureFormat.RGB24, false);
                 try
                 {
-                    texture.ReadPixels(new Rect(0, 0, width, height), 0, 0);
-                    texture.Apply(false);
+                    using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.ReadbackApply))
+                    {
+                        texture.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                        texture.Apply(false);
+                    }
                     return texture;
                 }
                 catch
@@ -272,7 +387,7 @@ namespace Pie.Unity.Capabilities
             return null;
         }
 
-        private static byte[] RenderCameraToPng(Camera camera, int width, int height, bool includeUI)
+        private static byte[] RenderCameraToPng(Camera camera, int width, int height, bool includeUI, Func<Texture2D, byte[]> snapshot = null)
         {
             var previousTarget = camera.targetTexture;
             var previousActive = RenderTexture.active;
@@ -319,7 +434,8 @@ namespace Pie.Unity.Capabilities
                     RenderTextureFormat.ARGB32,
                     linear ? RenderTextureReadWrite.Linear : RenderTextureReadWrite.Default);
                 camera.targetTexture = renderTexture;
-                camera.Render();
+                using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.Render))
+                    camera.Render();
                 var readSource = renderTexture;
                 if (linear)
                 {
@@ -327,16 +443,23 @@ namespace Pie.Unity.Capabilities
                     // Scope the global sRGB-write state around the conversion
                     // blit (see ScaleToSize).
                     GL.sRGBWrite = true;
-                    Graphics.Blit(renderTexture, bounce);
+                    using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.Blit))
+                        Graphics.Blit(renderTexture, bounce);
                     readSource = bounce;
                 }
                 RenderTexture.active = readSource;
                 var texture = new Texture2D(width, height, TextureFormat.RGB24, false);
                 try
                 {
-                    texture.ReadPixels(new Rect(0, 0, width, height), 0, 0);
-                    texture.Apply(false);
-                    png = texture.EncodeToPNG();
+                    using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.ReadbackApply))
+                    {
+                        texture.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                        texture.Apply(false);
+                    }
+                    if (snapshot != null) png = snapshot(texture);
+                    else
+                        using (PieScreenshotTimingProbe.Measure(PieScreenshotTimingProbe.Stage.Encode))
+                            png = texture.EncodeToPNG();
                 }
                 finally
                 {
