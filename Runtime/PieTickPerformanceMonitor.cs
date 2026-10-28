@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
 
@@ -317,6 +318,89 @@ namespace Pie
                 if (_pending.Score <= _frames[slot].Score) return;
             }
             var spare = _frames[slot]; _frames[slot] = _pending; _pending = spare;
+        }
+
+        /// <summary>Compact retained-frame statistics for frequent RPC polling.
+        /// Uses the same retained evidence as BuildFramesReport without serializing
+        /// every frame, native marker, and attribution string on each request.</summary>
+        public string BuildFramesSummaryReport()
+        {
+            var sb = new StringBuilder(768);
+            sb.Append("{\"capacity\":").Append(FrameCapacity)
+              .Append(",\"retention\":\"worst max(updateInterval,runnerWall)\"")
+              .Append(",\"frames\":").Append(_retained)
+              .Append(",\"updateMs\":");
+            AppendFrameSummaryStats(sb, 0, true);
+            sb.Append(",\"runnerMs\":");
+            AppendFrameSummaryStats(sb, 1, true);
+            sb.Append(",\"jsMs\":");
+            AppendFrameSummaryStats(sb, 2, true);
+            sb.Append(",\"gcAllocRaw\":");
+            AppendFrameSummaryStats(sb, 3, false);
+            sb.Append(",\"gcCollectRaw\":");
+            AppendFrameSummaryStats(sb, 4, false);
+            var collectionFrames = 0;
+            var validAllocFrames = 0;
+            long totalAlloc = 0;
+            for (var i = 0; i < _retained; i++)
+            {
+                var frame = _frames[i];
+                if (frame.Gc[0] > 0 || frame.Gc[1] > 0 || frame.Gc[2] > 0) collectionFrames++;
+                if (!HasNativeSample(frame, 2)) continue;
+                validAllocFrames++;
+                totalAlloc += frame.Values[2];
+            }
+            sb.Append(",\"collectionFrames\":").Append(collectionFrames)
+              .Append(",\"totalAllocRaw\":");
+            if (validAllocFrames == 0) sb.Append("null");
+            else sb.Append(totalAlloc);
+            return sb.Append(",\"nativeUnits\":\"raw recorder values for gcAllocRaw/gcCollectRaw; milliseconds for update/runner/js\"}").ToString();
+        }
+
+        private void AppendFrameSummaryStats(StringBuilder sb, int kind, bool milliseconds)
+        {
+            var values = new List<long>(_retained);
+            for (var i = 0; i < _retained; i++)
+            {
+                var frame = _frames[i];
+                switch (kind)
+                {
+                    case 0: values.Add(frame.Interval); break;
+                    case 1: values.Add(frame.Runner); break;
+                    case 2: values.Add(frame.Segments[SegmentJs]); break;
+                    case 3: if (HasNativeSample(frame, 2)) values.Add(frame.Values[2]); break;
+                    default: if (HasNativeSample(frame, 1)) values.Add(frame.Values[1]); break;
+                }
+            }
+            values.Sort();
+            // kind 0/1/2 always carry a value per retained frame, but with zero
+            // retained frames "0" would read as a measured latency. "no samples"
+            // is null for every kind, matching the native-marker convention.
+            var available = values.Count > 0;
+            sb.Append("{\"p50\":");
+            AppendFrameSummaryValue(sb, values, 0.50, milliseconds, available);
+            sb.Append(",\"p95\":");
+            AppendFrameSummaryValue(sb, values, 0.95, milliseconds, available);
+            sb.Append(",\"p99\":");
+            AppendFrameSummaryValue(sb, values, 0.99, milliseconds, available);
+            sb.Append(",\"max\":");
+            AppendFrameSummaryValue(sb, values, 1.0, milliseconds, available);
+            if (kind >= 2) sb.Append(",\"validFrames\":").Append(values.Count);
+            sb.Append('}');
+        }
+
+        private void AppendFrameSummaryValue(StringBuilder sb, List<long> values, double percentile, bool milliseconds, bool available)
+        {
+            if (!available) { sb.Append("null"); return; }
+            if (values.Count == 0) { sb.Append('0'); return; }
+            var index = Math.Min(values.Count - 1, Math.Max(0, (int)Math.Ceiling(values.Count * percentile) - 1));
+            if (milliseconds) sb.Append(Format(TicksToMilliseconds(values[index], 1)));
+            else sb.Append(values[index]);
+        }
+
+        private static bool HasNativeSample(FrameEvidence frame, int index)
+        {
+            return frame.Valid[index] && frame.Counts[index] > 0;
         }
 
         // Separate report keeps the existing aggregate perf.get_report schema stable.

@@ -21,8 +21,12 @@ namespace Pie.Editor
         private Vector2 _chatScrollPos;
         private Vector2 _logScrollPos;
         private List<ChatMessage> _messages = new List<ChatMessage>();
+        private int _syncedBubbleCount = 0;
         private bool _isStreaming = false;
         private double _lastRepaintTime = 0;
+        private readonly PiePresentationJournal _presentationJournal = new PiePresentationJournal();
+        private readonly Dictionary<string, ChatMessage> _presentationBubbles = new Dictionary<string, ChatMessage>();
+        private string _activePresentationItemId = "";
         private string _statusText = "Idle";
         private bool _followLatest = true;
         private bool _scrollToLatestScheduled = false;
@@ -787,7 +791,7 @@ namespace Pie.Editor
         {
             TickRecoveryRestore();
             CheckInteractionTimeout();
-            if (_isStreaming) Repaint();
+            if (_isStreaming) ScheduleStreamingRepaint();
             if (_pendingInteraction != null && !_pendingInteraction.completed)
                 Repaint();
         }
@@ -805,6 +809,9 @@ namespace Pie.Editor
         {
             DisposeBridge();
             _isStreaming = false;  // reset any stuck streaming state
+            _presentationJournal.Clear();
+            _presentationBubbles.Clear();
+            _activePresentationItemId = "";
 
             _bridge = new PieBridge();
             _bridge.OnJsEvent += HandleJsEvent;
@@ -2113,18 +2120,27 @@ namespace Pie.Editor
             };
         }
 
+        private void ScheduleStreamingRepaint()
+        {
+            var now = EditorApplication.timeSinceStartup;
+            if (now - _lastRepaintTime <= 0.1) return;
+            _lastRepaintTime = now;
+            ScheduleRepaint();
+        }
+
         private void HandleJsEvent(string eventName, string json)
         {
             switch (eventName)
             {
+                case "presentation_journal":
+                    HandlePresentationJournal(json);
+                    return;
+                case "timeline_item":
+                    HandleCanonicalTimelineItem(json);
+                    break;
                 case "message_update":
                     HandleMessageUpdate(json);
-                    var now = EditorApplication.timeSinceStartup;
-                    if (now - _lastRepaintTime > 0.1)
-                    {
-                        _lastRepaintTime = now;
-                        ScheduleRepaint();
-                    }
+                    ScheduleStreamingRepaint();
                     return;
                 case "thinking_event":  HandleThinkingEvent(json); break;
                 case "message_metrics": HandleMessageMetrics(json); break;
@@ -2137,6 +2153,9 @@ namespace Pie.Editor
                     TryDispatchPendingAutoResend();
                     break;
                 case "session_rewound":
+                    _presentationJournal.Clear();
+                    _presentationBubbles.Clear();
+                    _activePresentationItemId = "";
                     _statusText = $"Rewound ({ExtractJsonInt(json, "messageCount")} msgs kept)";
                     break;
                 case "session_forked":
@@ -2148,6 +2167,8 @@ namespace Pie.Editor
                 case "config_applied":  HandleConfigApplied(json);  break;
                 case "error":           HandleError(json);          break;
                 case "agent_end":
+                    RetirePresentation(_activePresentationItemId);
+                    RemoveUnboundAssistantPlaceholder();
                     _isStreaming = false;
                     _statusText = "Idle";
                     TryDequeueNextMessage();
@@ -2243,6 +2264,91 @@ namespace Pie.Editor
             }
         }
 
+        private void HandlePresentationJournal(string json)
+        {
+            try
+            {
+                var frame = JsonUtility.FromJson<PiePresentationFrame>(json ?? "{}");
+                var applied = _presentationJournal.Apply(frame, _activeSessionId);
+                if (applied.resyncRequired)
+                {
+                    // itemId embeds the client-controlled clientTurnId; serialize it
+                    // instead of interpolating so quotes/backslashes cannot corrupt
+                    // the payload (mirrors PieRunner's identical path).
+                    _bridge?.SendToJs("resync_presentation", JsonUtility.ToJson(new ResyncPresentationPayload { itemId = frame.itemId, lastSeq = frame.seq - 1 }));
+                    return;
+                }
+                if (!applied.accepted || applied.item == null) return;
+                var item = applied.item;
+                var bubble = GetPresentationBubble(item.itemId);
+                if (!applied.terminal) _activePresentationItemId = item.itemId;
+                bubble.ClientTurnId = item.clientTurnId;
+                bubble.Content = item.text ?? "";
+                bubble.IsRunning = !applied.terminal;
+                if (!applied.terminal) _statusText = "Streaming response...";
+                ScheduleStreamingRepaint();
+            }
+            catch (Exception ex)
+            {
+                PieDiagnostics.Warning($"HandlePresentationJournal error: {ex.Message}");
+            }
+        }
+
+        private void HandleCanonicalTimelineItem(string json)
+        {
+            try
+            {
+                var item = JsonUtility.FromJson<PieTimelineItem>(json ?? "{}");
+                if (item == null || item.kind != "assistant" || item.status == "running"
+                    || string.IsNullOrEmpty(item.itemId) || _presentationJournal.IsTerminal(item.itemId)) return;
+                var bubble = GetPresentationBubble(item.itemId);
+                var finalText = item.text ?? "";
+                var needsRepair = _presentationJournal.NeedsTerminalText(item.itemId, finalText, item.isTruncated);
+                if (item.isTruncated && bubble.Content.Length > finalText.Length
+                    && bubble.Content.StartsWith(finalText, StringComparison.Ordinal))
+                    finalText = bubble.Content;
+                bubble.ClientTurnId = item.clientTurnId ?? "";
+                bubble.Content = finalText;
+                bubble.IsError = item.isError;
+                bubble.IsRunning = false;
+                RetirePresentation(item.itemId, item.status, needsRepair);
+            }
+            catch (Exception ex)
+            {
+                PieDiagnostics.Warning($"HandleCanonicalTimelineItem error: {ex.Message}");
+            }
+        }
+
+        private ChatMessage GetPresentationBubble(string itemId)
+        {
+            if (_presentationBubbles.TryGetValue(itemId, out var existing)) return existing;
+            ChatMessage bubble = null;
+            if (_messages.Count > 0)
+            {
+                var candidate = _messages[_messages.Count - 1];
+                if (candidate.Role == "assistant" && candidate.IsRunning
+                    && string.IsNullOrEmpty(candidate.PresentationItemId)
+                    && (candidate.Content == "…" || string.IsNullOrEmpty(candidate.Content)))
+                    bubble = candidate;
+            }
+            if (bubble == null)
+            {
+                AddMessage("assistant", "");
+                bubble = _messages[_messages.Count - 1];
+            }
+            bubble.PresentationItemId = itemId;
+            _presentationBubbles[itemId] = bubble;
+            return bubble;
+        }
+
+        private void RetirePresentation(string itemId, string status = "succeeded", bool allowTerminalCommit = false)
+        {
+            if (string.IsNullOrEmpty(itemId)) return;
+            _presentationJournal.Retire(itemId, status, allowTerminalCommit);
+            if (_presentationBubbles.TryGetValue(itemId, out var bubble)) bubble.IsRunning = false;
+            if (_activePresentationItemId == itemId) _activePresentationItemId = "";
+        }
+
         private void HandleStateEvent(string json)
         {
             var stateName = ExtractJsonString(json, "name") ?? "state";
@@ -2274,6 +2380,8 @@ namespace Pie.Editor
                     _statusText = string.IsNullOrEmpty(detail) ? "Turn completed" : detail;
                     break;
                 case "agent_end":
+                    RetirePresentation(_activePresentationItemId);
+                    RemoveUnboundAssistantPlaceholder();
                     _isStreaming = false;
                     _statusText = "Idle";
                     TryDequeueNextMessage();
@@ -2417,8 +2525,20 @@ namespace Pie.Editor
             ScrollToBottomSoon();
         }
 
+        private void RemoveUnboundAssistantPlaceholder()
+        {
+            if (_messages.Count == 0) return;
+            var last = _messages[_messages.Count - 1];
+            if (last.Role == "assistant" && last.IsRunning
+                && string.IsNullOrEmpty(last.PresentationItemId)
+                && (last.Content == "…" || string.IsNullOrEmpty(last.Content)))
+                _messages.RemoveAt(_messages.Count - 1);
+        }
+
         private void HandleTurnEnd(string json)
         {
+            RetirePresentation(_activePresentationItemId);
+            RemoveUnboundAssistantPlaceholder();
             var stopReason = ExtractJsonString(json, "stopReason");
 
             if (stopReason == null || stopReason == "stop" || stopReason == "error"
@@ -2442,6 +2562,12 @@ namespace Pie.Editor
             try
             {
                 var payload = JsonUtility.FromJson<SessionSyncPayload>(json);
+                if (!string.Equals(_activeSessionId, payload.id, StringComparison.Ordinal))
+                {
+                    _presentationJournal.Clear();
+                    _presentationBubbles.Clear();
+                    _activePresentationItemId = "";
+                }
 
                 // Same session with unchanged message/todo counts carries no
                 // transcript delta: local-command turns ("/self-check",
@@ -2516,10 +2642,12 @@ namespace Pie.Editor
                 if (!string.IsNullOrEmpty(_activeSessionId))
                     PieChatSessionRecovery.SetLastKnownActiveSession(_activeSessionId);
                 _messages.Clear();
+                _presentationBubbles.Clear();
                 _todoItems.Clear();
 
                 if (payload?.messages != null)
                     AppendSyncMessages(payload.messages);
+                _syncedBubbleCount = _messages.Count;
 
                 if (payload?.todoState != null)
                     _todoItems.AddRange(payload.todoState);
@@ -2604,6 +2732,7 @@ namespace Pie.Editor
                 var isToolResult = role == "toolResult";
                 var argsJson = HasMeaningfulArgs(message.effectiveArgsJson)
                     ? message.effectiveArgsJson : message.argsJson;
+                var assistantItemId = role == "assistant" ? message.presentationItemId ?? "" : "";
                 if (isToolResult) role = "tool";
                 if (role == "user" && !string.IsNullOrEmpty(message.displayContent))
                     content = message.displayContent;
@@ -2619,9 +2748,10 @@ namespace Pie.Editor
                     content = $"⚠ {message.errorMessage}";
                 if (string.IsNullOrEmpty(content) && !string.IsNullOrEmpty(message.stopReason))
                     content = $"[{message.stopReason}]";
-                _messages.Add(new ChatMessage(role, content ?? "")
+                var syncedBubble = new ChatMessage(role, content ?? "")
                 {
                     ClientTurnId = message.clientTurnId ?? "",
+                    PresentationItemId = assistantItemId,
                     Title = isToolResult ? message.toolName : "",
                     ToolName = message.toolName,
                     ToolCallId = message.toolCallId,
@@ -2640,7 +2770,13 @@ namespace Pie.Editor
                     CacheWriteTokens = message.usage != null ? message.usage.cacheWrite : 0,
                     TotalTokens = message.usage != null ? message.usage.totalTokens : (role == "user" ? EstimateTextTokens(content) : 0),
                     IsEstimatedUsage = message.usage != null && message.usage.estimated,
-                });
+                };
+                _messages.Add(syncedBubble);
+                if (!string.IsNullOrEmpty(assistantItemId))
+                {
+                    _presentationBubbles[assistantItemId] = syncedBubble;
+                    _presentationJournal.Retire(assistantItemId);
+                }
                 if (role == "assistant")
                 {
                     // A streamed assistant message can carry text plus tool calls
@@ -2661,70 +2797,36 @@ namespace Pie.Editor
         /// thinking) render bubbles directly. The suffix contains the same
         /// turn's canonical messages, so those live bubbles must go before
         /// appending — otherwise every tool card and assistant text renders
-        /// twice. The live region starts at the suffix's own user message:
-        /// we search backwards for the bubble whose ClientTurnId matches the
-        /// suffix's first clientTurnId and drop everything from it on. No
-        /// match means our view does not line up with the suffix — the
-        /// caller resyncs with a full frame instead of guessing.
+        /// twice. _syncedBubbleCount is the rendered counterpart of the
+        /// producer's verified baseMessageCount: everything before it is
+        /// canonical history, and only the unsynchronized live tail is replaced.
+        /// A metadata-only empty suffix never deletes that tail.
         /// </summary>
         private void ApplyIncrementalSessionSync(SessionSyncPayload payload, int payloadTodoCount)
         {
             var suffix = payload?.messages;
-            var firstSuffixTurnId = suffix != null && suffix.Length > 0 ? suffix[0]?.clientTurnId : null;
-            var suffixStartsWithUser = suffix != null && suffix.Length > 0
-                && string.Equals(suffix[0]?.role, "user", StringComparison.Ordinal);
-            var liveStart = -1;
-            var lastUserBubble = -1;
-            for (var i = _messages.Count - 1; i >= 0; i--)
+            if (suffix == null || suffix.Length == 0)
             {
-                var bubble = _messages[i];
-                if (bubble == null) continue;
-                // Prefer the turn anchor: a bubble already carrying the
-                // suffix's first clientTurnId (a previously-synced user
-                // bubble for this same turn id).
-                if (!string.IsNullOrEmpty(bubble.ClientTurnId)
-                    && !string.IsNullOrEmpty(firstSuffixTurnId)
-                    && string.Equals(bubble.ClientTurnId, firstSuffixTurnId, StringComparison.Ordinal))
+                if (payload?.todoState != null)
                 {
-                    liveStart = i;
-                    break;
+                    _todoItems.Clear();
+                    _todoItems.AddRange(payload.todoState);
                 }
-                if (string.Equals(bubble.Role, "user", StringComparison.Ordinal) && lastUserBubble < 0)
-                {
-                    lastUserBubble = i;
-                }
+                _lastSessionSyncMessageCount = payload?.messageCount ?? _lastSessionSyncMessageCount;
+                _lastSessionSyncTodoCount = payloadTodoCount;
+                ScheduleRepaint();
+                return;
             }
-            if (liveStart < 0 && lastUserBubble >= 0)
+            if (_syncedBubbleCount < 0 || _syncedBubbleCount > _messages.Count)
             {
-                if (suffixStartsWithUser)
-                {
-                    // Local send bubbles carry no ClientTurnId, but the
-                    // suffix's first message is this turn's user message:
-                    // the last user bubble IS the live region start and is
-                    // replaced by the suffix's own copy.
-                    liveStart = lastUserBubble;
-                }
-                else
-                {
-                    // Suffix continues an earlier user message (abort finalize,
-                    // mid-turn sync): the user bubble stays, everything after
-                    // it is this turn's live region.
-                    liveStart = lastUserBubble + 1;
-                }
+                RequestSessionResync();
+                return;
             }
-            if (liveStart < 0)
-            {
-                // No live region found (e.g. metadata-only frame after a
-                // compaction): keep everything rendered, clear running flags,
-                // and append only genuinely new messages.
-                ClearRunningMessages();
-            }
-            else if (liveStart < _messages.Count)
-            {
-                _messages.RemoveRange(liveStart, _messages.Count - liveStart);
-            }
+            if (_syncedBubbleCount < _messages.Count)
+                _messages.RemoveRange(_syncedBubbleCount, _messages.Count - _syncedBubbleCount);
 
             AppendSyncMessages(suffix);
+            _syncedBubbleCount = _messages.Count;
 
             if (payload?.todoState != null)
             {
@@ -3682,6 +3784,7 @@ namespace Pie.Editor
             public string Role;
             public string Content;
             public string ClientTurnId;
+            public string PresentationItemId;
             public string Title;
             public string Summary;
             public string ArgsText;
@@ -3766,6 +3869,13 @@ namespace Pie.Editor
         }
 
         [Serializable]
+        private class ResyncPresentationPayload
+        {
+            public string itemId;
+            public long lastSeq;
+        }
+
+        [Serializable]
         private class TodoToolDetailsPayload
         {
             public string action;
@@ -3779,6 +3889,7 @@ namespace Pie.Editor
         private class SessionSyncMessage
         {
             public string clientTurnId;
+            public string presentationItemId;
             public string role;
             public string displayContent;
             public string toolName;

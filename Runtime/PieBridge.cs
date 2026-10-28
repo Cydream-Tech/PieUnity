@@ -142,6 +142,8 @@ namespace Pie
             });
             PieDevRpc.Register("perf.frames.get_report", _ =>
                 PieBridge.Instance == owner ? TickPerformance.BuildFramesReport() : "{\"frames\":[],\"stale\":true}");
+            PieDevRpc.Register("perf.frames.get_summary", _ =>
+                PieBridge.Instance == owner ? TickPerformance.BuildFramesSummaryReport() : "{\"frames\":0,\"stale\":true}");
             PieDevRpc.Register("perf.reset", _ =>
             {
                 if (PieBridge.Instance != owner) return "{}";
@@ -161,6 +163,7 @@ namespace Pie
             PieDevRpc.Unregister("perf.get_report");
             PieDevRpc.Unregister("perf.reset");
             PieDevRpc.Unregister("perf.frames.get_report");
+            PieDevRpc.Unregister("perf.frames.get_summary");
         }
 
         [Serializable]

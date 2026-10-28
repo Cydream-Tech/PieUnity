@@ -39,6 +39,21 @@ namespace Pie
     }
 
     [Serializable]
+    public sealed class PiePresentationFrame
+    {
+        public int schemaVersion = 1;
+        public string sessionId = "";
+        public string clientTurnId = "";
+        public string itemId = "";
+        public long startedAt;
+        public long updatedAt;
+        public long seq;
+        public string type = "";
+        public string delta;
+        public string text;
+    }
+
+    [Serializable]
     public sealed class PieSessionContentBlock
     {
         public string type = "";

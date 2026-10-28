@@ -5880,20 +5880,41 @@ var _PieAgent = (() => {
                 waiting = null;
                 w(value);
               };
+              let pendingFailureLog = null;
+              let failureLogged = false;
+              const classifyFailure = (e) => {
+                if (signal?.aborted === true || isAbortErrorMessage(e.message)) {
+                  return { level: "INFO", message: `Request [${reqTag}] SSE stream aborted by caller`, extra: { error: e.message } };
+                }
+                if (requestTimeoutError) {
+                  return { level: "WARN", message: `Request [${reqTag}] SSE stream failed (request timeout)`, extra: { error: e.message } };
+                }
+                if (e.message === "SSE stream aborted" || e.message === "SSE stream closed before end" || e.message === "SSE stream ended before response completed") {
+                  return { level: "WARN", message: `Request [${reqTag}] SSE stream closed by remote`, extra: { error: e.message } };
+                }
+                return { level: "ERROR", message: `Request [${reqTag}] SSE stream error`, extra: { error: e.message } };
+              };
+              const logFailureIfDelivered = () => {
+                if (failureLogged || !pendingFailureLog) return;
+                failureLogged = true;
+                const entry = pendingFailureLog;
+                pendingFailureLog = null;
+                logHttp(entry.level, entry.message, entry.extra);
+              };
+              const logUndeliveredFailure = () => {
+                if (failureLogged || !pendingFailureLog) return;
+                failureLogged = true;
+                const entry = pendingFailureLog;
+                pendingFailureLog = null;
+                logHttp("DEBUG", `${entry.message} (not consumed by the reader)`, entry.extra);
+              };
               const failStream = (e) => {
                 if (done && error) return;
+                const firstFailure = !error;
                 error = e;
                 done = true;
+                if (firstFailure) pendingFailureLog = classifyFailure(e);
                 wake({ done: true, value: void 0 });
-                if (signal?.aborted === true || isAbortErrorMessage(e.message)) {
-                  logHttp("INFO", `Request [${reqTag}] SSE stream aborted by caller`, { error: e.message });
-                } else if (requestTimeoutError) {
-                  logHttp("WARN", `Request [${reqTag}] SSE stream failed (request timeout)`, { error: e.message });
-                } else if (e.message === "SSE stream aborted" || e.message === "SSE stream closed before end" || e.message === "SSE stream ended before response completed") {
-                  logHttp("WARN", `Request [${reqTag}] SSE stream closed by remote`, { error: e.message });
-                } else {
-                  logHttp("ERROR", `Request [${reqTag}] SSE stream error`, { error: e.message });
-                }
               };
               const flushBuffer = (final = false) => {
                 if (final) {
@@ -5953,16 +5974,19 @@ var _PieAgent = (() => {
                 });
               });
               res.on("error", (e) => {
+                if (/aborted|econnreset|socket hang up/i.test(e.message)) {
+                  failStream(requestTimeoutError ?? new Error("SSE stream aborted"));
+                  return;
+                }
                 failStream(requestTimeoutError ?? e);
               });
               res.on("aborted", () => {
+                if (consumerClosed || done) return;
                 failStream(requestTimeoutError ?? new Error("SSE stream aborted"));
               });
               res.on("close", () => {
                 if (consumerClosed) return;
-                if (!done || !res.complete) {
-                  failStream(requestTimeoutError ?? new Error("SSE stream closed before end"));
-                }
+                if (!done || !res.complete) failStream(requestTimeoutError ?? new Error("SSE stream closed before end"));
               });
               try {
                 while (true) {
@@ -5976,7 +6000,10 @@ var _PieAgent = (() => {
                     queueHead = 0;
                   }
                   if (done) {
-                    if (error) throw error;
+                    if (error) {
+                      logFailureIfDelivered();
+                      throw error;
+                    }
                     return;
                   }
                   const waitResult = await new Promise((r) => {
@@ -5986,6 +6013,7 @@ var _PieAgent = (() => {
                 }
               } finally {
                 consumerClosed = true;
+                logUndeliveredFailure();
                 if (signal && abortHandler) {
                   signal.removeEventListener("abort", abortHandler);
                 }
@@ -25323,6 +25351,80 @@ ${summary2}`;
     if (normalizedType === "subagent_summary") return null;
     return null;
   }
+  var TRACE_EVENT_META_MAX_CHARS = 4096;
+  var TRACE_TEXT_MAX_CHARS = 8e3;
+  var TRACE_TOOL_ARGS_MAX_CHARS = 1024;
+  var TRACE_TOOL_CALLS_PER_TURN = 100;
+  function isTraceTruncationMarker(value) {
+    if (!isRecord5(value) || value.truncated !== true) return false;
+    const keys = Object.keys(value).sort();
+    if (value.reason === "unserializable") return keys.length === 2 && keys.includes("reason") && keys.includes("truncated");
+    return keys.length === 3 && keys.includes("originalChars") && keys.includes("preview") && keys.includes("truncated") && typeof value.originalChars === "number" && typeof value.preview === "string";
+  }
+  function boundTraceText(text) {
+    if (text.length <= TRACE_TEXT_MAX_CHARS) return text;
+    if (text.length <= TRACE_TEXT_MAX_CHARS + 100 && /…\[truncated \d+ chars\]$/.test(text)) return text;
+    return `${text.slice(0, TRACE_TEXT_MAX_CHARS)}\u2026[truncated ${text.length - TRACE_TEXT_MAX_CHARS} chars]`;
+  }
+  function boundToolArgs(args) {
+    if (args === void 0) return args;
+    if (isTraceTruncationMarker(args)) return args;
+    let serialized;
+    try {
+      serialized = JSON.stringify(args) ?? "";
+    } catch {
+      return { truncated: true, reason: "unserializable" };
+    }
+    if (serialized.length <= TRACE_TOOL_ARGS_MAX_CHARS) return args;
+    return { truncated: true, originalChars: serialized.length, preview: serialized.slice(0, TRACE_TOOL_ARGS_MAX_CHARS) };
+  }
+  function trimTraceToolCalls(turn) {
+    const overflow = turn.toolCalls.length - TRACE_TOOL_CALLS_PER_TURN;
+    if (overflow <= 0) return;
+    const evict = /* @__PURE__ */ new Set();
+    for (let index = 0; index < turn.toolCalls.length && evict.size < overflow; index++) {
+      if (turn.toolCalls[index].status !== "running") evict.add(index);
+    }
+    if (evict.size === 0) return;
+    turn.toolCalls = turn.toolCalls.filter((_, index) => !evict.has(index));
+    turn.toolCallsOmitted = (turn.toolCallsOmitted ?? 0) + evict.size;
+  }
+  function normalizeTraceTurn(turn) {
+    if (typeof turn.userText === "string") turn.userText = boundTraceText(turn.userText);
+    if (typeof turn.assistantText === "string") turn.assistantText = boundTraceText(turn.assistantText);
+    turn.toolCalls = Array.isArray(turn.toolCalls) ? turn.toolCalls.filter((call) => isRecord5(call)) : [];
+    for (const call of turn.toolCalls) call.args = boundToolArgs(call.args);
+    trimTraceToolCalls(turn);
+  }
+  function compactAgentEventMeta(meta) {
+    if (!meta || typeof meta !== "object") return meta;
+    const event = meta.event;
+    if (!event || typeof event !== "object") return meta;
+    const assistant = event.assistantMessageEvent;
+    if (!assistant || typeof assistant !== "object") return meta;
+    const partial = assistant.partial;
+    if (partial === void 0 || partial === null || typeof partial !== "object") return meta;
+    if (partial.omitted === true) return meta;
+    const content = partial.content;
+    const stub = {
+      omitted: true,
+      role: typeof partial.role === "string" ? partial.role : void 0,
+      contentBlocks: Array.isArray(content) ? content.length : void 0
+    };
+    return { ...meta, event: { ...event, assistantMessageEvent: { ...assistant, partial: stub } } };
+  }
+  function boundTraceMeta(meta) {
+    if (meta === void 0) return void 0;
+    if (isTraceTruncationMarker(meta)) return meta;
+    let serialized;
+    try {
+      serialized = JSON.stringify(meta) ?? "";
+    } catch {
+      return { truncated: true, reason: "unserializable" };
+    }
+    if (serialized.length <= TRACE_EVENT_META_MAX_CHARS) return meta;
+    return { truncated: true, originalChars: serialized.length, preview: serialized.slice(0, TRACE_EVENT_META_MAX_CHARS) };
+  }
   function cloneTurn(turn) {
     return JSON.parse(JSON.stringify(turn));
   }
@@ -25346,23 +25448,24 @@ ${summary2}`;
       this.trace = trace;
       this.recentTurnsLimit = recentTurnsLimit;
       this.recentEventsLimit = recentEventsLimit;
-      if (!Array.isArray(this.trace.recentTurns)) {
-        this.trace.recentTurns = [];
-      }
-      if (!Array.isArray(this.trace.recentEvents)) {
-        this.trace.recentEvents = [];
-      }
+      this.trace.recentTurns = Array.isArray(this.trace.recentTurns) ? this.trace.recentTurns.filter((turn) => isRecord5(turn)).slice(-this.recentTurnsLimit) : [];
+      this.trace.recentEvents = Array.isArray(this.trace.recentEvents) ? this.trace.recentEvents.filter((event) => isRecord5(event)) : [];
       if (!this.trace.runtimeSummary) {
         this.trace.runtimeSummary = createEmptyRuntimeSummary();
       }
-      if (!Array.isArray(this.trace.subagentSummaries)) {
-        this.trace.subagentSummaries = [];
-      }
-      if (!Array.isArray(this.trace.recentTimeline)) {
-        this.trace.recentTimeline = [];
-      }
-      this.trace.recentEvents = this.trace.recentEvents.slice(-this.recentEventsLimit);
-      this.trace.recentTimeline = this.trace.recentTimeline.slice(-this.recentEventsLimit);
+      this.trace.subagentSummaries = Array.isArray(this.trace.subagentSummaries) ? this.trace.subagentSummaries.slice(-50) : [];
+      this.trace.recentTimeline = Array.isArray(this.trace.recentTimeline) ? this.trace.recentTimeline.filter((event) => isRecord5(event)) : [];
+      this.trace.recentEvents = this.trace.recentEvents.slice(-this.recentEventsLimit).map((event) => ({
+        ...event,
+        ...event.meta !== void 0 ? { meta: boundTraceMeta(compactAgentEventMeta(event.meta)) } : {}
+      }));
+      this.trace.recentTimeline = this.trace.recentTimeline.slice(-this.recentEventsLimit).map((event) => ({
+        ...event,
+        ...event.details !== void 0 ? { details: boundTraceMeta(event.details) } : {}
+      }));
+      for (const turn of this.trace.recentTurns) normalizeTraceTurn(turn);
+      if (isRecord5(this.trace.activeTurn)) normalizeTraceTurn(this.trace.activeTurn);
+      else this.trace.activeTurn = null;
       this.trace.runtimeSummary = recomputeRuntimeSummaryFromTimeline(this.trace.recentTimeline);
     }
     trace;
@@ -25370,10 +25473,11 @@ ${summary2}`;
     recentEventsLimit;
     pendingUserText = null;
     pushEvent(type, meta) {
+      const storedMeta = boundTraceMeta(compactAgentEventMeta(meta));
       this.trace.recentEvents.push({
         type,
         at: Date.now(),
-        ...meta !== void 0 ? { meta } : {}
+        ...storedMeta !== void 0 ? { meta: storedMeta } : {}
       });
       if (this.trace.recentEvents.length > this.recentEventsLimit) {
         this.trace.recentEvents = this.trace.recentEvents.slice(-this.recentEventsLimit);
@@ -25412,13 +25516,13 @@ ${summary2}`;
         this.trace.activeTurn = {
           turnIndex: this.nextTurnIndex(),
           state: "queued",
-          userText: trimmed,
+          userText: boundTraceText(trimmed),
           toolCalls: []
         };
         this.touch();
         return;
       }
-      this.trace.activeTurn.userText = trimmed;
+      this.trace.activeTurn.userText = boundTraceText(trimmed);
       this.trace.activeTurn.state = "queued";
       this.touch();
     }
@@ -25478,7 +25582,7 @@ ${summary2}`;
       nextTurn.state = "running";
       nextTurn.startedAt = Date.now();
       if (this.pendingUserText) {
-        nextTurn.userText = this.pendingUserText;
+        nextTurn.userText = boundTraceText(this.pendingUserText);
         this.pendingUserText = null;
       }
       this.trace.activeTurn = nextTurn;
@@ -25488,7 +25592,7 @@ ${summary2}`;
     updateAssistantMessage(message) {
       if (!message || message.role !== "assistant" || !this.trace.activeTurn) return;
       this.trace.activeTurn.state = this.trace.activeTurn.toolCalls.some((tool) => tool.status === "running") ? "tool_running" : "streaming";
-      this.trace.activeTurn.assistantText = getTextFromMessageContent(message.content);
+      this.trace.activeTurn.assistantText = boundTraceText(getTextFromMessageContent(message.content));
       this.touch();
     }
     startTool(toolCallId, toolName, args) {
@@ -25503,7 +25607,7 @@ ${summary2}`;
       const existing = this.trace.activeTurn.toolCalls.find((tool) => tool.toolCallId && tool.toolCallId === toolCallId);
       if (existing) {
         existing.status = "running";
-        existing.args = args;
+        existing.args = boundToolArgs(args);
         existing.startedAt = existing.startedAt || Date.now();
         this.touch();
         return;
@@ -25512,9 +25616,10 @@ ${summary2}`;
         toolCallId,
         toolName,
         status: "running",
-        args,
+        args: boundToolArgs(args),
         startedAt: Date.now()
       });
+      trimTraceToolCalls(this.trace.activeTurn);
       this.pushEvent("tool_start", { toolCallId, toolName });
       this.touch();
     }
@@ -25536,6 +25641,7 @@ ${summary2}`;
       if (!existing) {
         this.trace.activeTurn.toolCalls.push(target);
       }
+      trimTraceToolCalls(this.trace.activeTurn);
       const subagentSummaries = extractSubagentSummaries(toolCallId, toolName, result);
       if (subagentSummaries.length > 0) {
         this.trace.subagentSummaries = [
@@ -25559,7 +25665,7 @@ ${summary2}`;
     completeTurn(message, failed = false) {
       if (!this.trace.activeTurn) return;
       if (message?.role === "assistant") {
-        this.trace.activeTurn.assistantText = getTextFromMessageContent(message.content);
+        this.trace.activeTurn.assistantText = boundTraceText(getTextFromMessageContent(message.content));
       }
       this.trace.activeTurn.state = failed ? "failed" : "completed";
       this.trace.activeTurn.completedAt = Date.now();
@@ -25588,6 +25694,12 @@ ${summary2}`;
     }
     getSnapshot() {
       return cloneTrace(this.trace);
+    }
+    /** Internal persistence view: saveTrace must consume/serialize it before
+     * returning control to mutating code. Public snapshots stay defensively
+     * cloned; the hot persistence path must not stringify the whole trace twice. */
+    getPersistenceSnapshot() {
+      return this.trace;
     }
   };
   function attachAgentEventsToSessionTrace(params) {
@@ -25631,12 +25743,14 @@ ${summary2}`;
       this.options = options;
       this.recentTurnsLimit = options.recentTurnsLimit ?? 10;
       this.recentEventsLimit = options.recentEventsLimit ?? 100;
-      this.debounceMs = options.debounceMs ?? 50;
+      this.debounceMs = options.debounceMs ?? 1e3;
     }
     options;
     cachedSessionId = null;
     cachedController = null;
     flushTimer = null;
+    flushInFlight = null;
+    pendingFlushes = /* @__PURE__ */ new Map();
     recentTurnsLimit;
     recentEventsLimit;
     debounceMs;
@@ -25656,10 +25770,17 @@ ${summary2}`;
       if (this.cachedSessionId === sessionId && this.cachedController) {
         return this.cachedController;
       }
-      const trace = this.options.loadTrace?.(sessionId) ?? createEmptySessionTrace(sessionId);
+      this.flush();
+      let controller;
+      try {
+        const trace = this.options.loadTrace?.(sessionId) ?? createEmptySessionTrace(sessionId);
+        controller = new SessionTraceController(trace, this.recentTurnsLimit, this.recentEventsLimit);
+      } catch {
+        controller = new SessionTraceController(createEmptySessionTrace(sessionId), this.recentTurnsLimit, this.recentEventsLimit);
+      }
       this.cachedSessionId = sessionId;
-      this.cachedController = new SessionTraceController(trace, this.recentTurnsLimit, this.recentEventsLimit);
-      return this.cachedController;
+      this.cachedController = controller;
+      return controller;
     }
     scheduleFlush() {
       if (this.flushTimer) return;
@@ -25680,16 +25801,68 @@ ${summary2}`;
       }
       this.flush();
     }
+    /** Start persistence immediately. Use flushAsync() when the caller needs a
+     * completion guarantee; async host writes finish in a later microtask. */
     flush() {
       if (this.flushTimer) {
         clearTimeout(this.flushTimer);
         this.flushTimer = null;
       }
       if (!this.cachedController || !this.cachedSessionId) return;
+      this.flushController(this.cachedSessionId, this.cachedController);
+    }
+    flushController(sessionId, controller) {
+      if (this.flushInFlight) {
+        this.pendingFlushes.set(sessionId, controller);
+        return;
+      }
       try {
-        this.options.saveTrace(this.cachedController.getSnapshot());
+        const snapshot = controller.getPersistenceSnapshot();
+        const result = this.options.saveTraceJson ? this.options.saveTraceJson(JSON.stringify(snapshot), sessionId) : this.options.saveTrace(snapshot);
+        if (!result || typeof result.then !== "function") {
+          this.drainNextFlush();
+          return;
+        }
+        const tracked = Promise.resolve(result).catch((error) => {
+          console.warn("[SessionTrace] Failed to save session trace:", error);
+        }).finally(() => {
+          if (this.flushInFlight === tracked) this.flushInFlight = null;
+          this.drainNextFlush();
+        });
+        this.flushInFlight = tracked;
       } catch (error) {
         console.warn("[SessionTrace] Failed to save session trace:", error);
+        this.drainNextFlush();
+      }
+    }
+    drainNextFlush() {
+      if (this.flushInFlight) return;
+      const next = this.pendingFlushes.entries().next().value;
+      if (!next) return;
+      this.pendingFlushes.delete(next[0]);
+      this.flushController(next[0], next[1]);
+    }
+    /** Force the latest snapshot and wait until all requested trailing writes
+     * finish. Hosts use this at shutdown and other durable lifecycle boundaries. */
+    async flushAsync(timeoutMs = 5e3) {
+      if (!this.flushInFlight || this.flushTimer) this.flush();
+      const drained = (async () => {
+        while (this.flushInFlight) await this.flushInFlight;
+      })();
+      let timer;
+      try {
+        await Promise.race([
+          drained,
+          new Promise((resolve2) => {
+            timer = setTimeout(() => {
+              console.warn(`[SessionTrace] Timed out waiting for trace persistence after ${timeoutMs}ms.`);
+              resolve2();
+            }, timeoutMs);
+            timer.unref?.();
+          })
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
       }
     }
     notePendingUserText(text) {
@@ -25710,12 +25883,12 @@ ${summary2}`;
     startTool(toolCallId, toolName, args) {
       this.mutate((controller) => {
         controller.startTool(toolCallId, toolName, args);
-      }, { flush: true });
+      }, { flush: false });
     }
     finishTool(toolCallId, toolName, result, isError) {
       this.mutate((controller) => {
         controller.finishTool(toolCallId, toolName, result, isError);
-      }, { flush: true });
+      }, { flush: false });
     }
     completeTurn(message, failed = false) {
       this.mutate((controller) => {
@@ -25761,7 +25934,7 @@ ${summary2}`;
 
   // ../../packages/agent-framework/src/delegation.ts
   var DELEGATION_REPORT_MAX_CHARS = 24e3;
-  var DELEGATION_REPORT_INSTRUCTION = 'Return your final response once as a JSON object: {"summary":string,"result":string,"remainingWork"?:string[],"evidenceRefs"?:string[]}. Keep the entire JSON response within 24,000 characters: give concise conclusions and bounded evidence references, not repeated drafting notes. Do not make an extra tool call to report. Evidence references are your claims, not runtime verification. Emit the raw JSON object only \u2014 no markdown code fences around it, and no raw line breaks inside JSON string values (escape them as \\n); anything JSON.parse rejects is treated as no report.';
+  var DELEGATION_REPORT_INSTRUCTION = 'Return your final response once as a JSON object: {"summary":string,"result":string,"remainingWork"?:string[],"evidenceRefs"?:string[]}. Keep the entire JSON response within 24,000 characters: give concise conclusions and bounded evidence references, not repeated drafting notes. Do not make an extra tool call to report. Evidence references are your claims, not runtime verification. Emit the raw JSON object only \u2014 no markdown code fences around it, and no raw line breaks inside JSON string values (escape them as \\n); malformed JSON may be discarded.';
   function parseDelegationReport(text, runId, truncated = false) {
     const raw = (text ?? "").slice(0, DELEGATION_REPORT_MAX_CHARS);
     const base = { version: 1, runId: runId.slice(0, 160), raw };
@@ -25770,22 +25943,158 @@ ${summary2}`;
     if (reason) return { ...base, stopReason, reason, availability: raw ? "truncated" : "missing" };
     if ((text?.length ?? 0) > DELEGATION_REPORT_MAX_CHARS) return { ...base, availability: "truncated", reason: "char_cap" };
     if (!raw.trim()) return { ...base, availability: "missing", reason: "empty" };
-    let value;
+    const strict = tryParseJsonObject(raw);
+    const parsed = strict.ok ? strict : recoverReportJson(raw);
+    if (!parsed || !parsed.ok) return { ...base, availability: "malformed", reason: "invalid_json" };
+    const report = validateDelegationReport(parsed.value);
+    if (!report) return { ...base, availability: "malformed", reason: "invalid_shape" };
+    return { ...base, availability: "available", report, ...parsed.recovered ? { recovered: parsed.recovered } : {} };
+  }
+  function tryParseJsonObject(text) {
+    const trimmed = text.trim();
+    if (!trimmed) return { ok: false };
     try {
-      value = JSON.parse(raw);
+      return { ok: true, value: JSON.parse(trimmed) };
     } catch {
-      return { ...base, availability: "malformed", reason: "invalid_json" };
-    }
-    try {
-      if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.summary !== "string" || typeof value.result !== "string") throw new Error();
-      if (Object.keys(value).some((key) => !["summary", "result", "remainingWork", "evidenceRefs"].includes(key))) throw new Error();
-      for (const key of ["remainingWork", "evidenceRefs"]) {
-        if (value[key] !== void 0 && (!Array.isArray(value[key]) || value[key].length > 32 || value[key].some((item) => typeof item !== "string" || item.length > 2e3))) throw new Error();
+      const escaped = escapeRawControlCharsInStrings(trimmed);
+      if (escaped !== trimmed) {
+        try {
+          return { ok: true, value: JSON.parse(escaped), recovered: "escaped_controls" };
+        } catch {
+        }
       }
-      return { ...base, availability: "available", report: value };
-    } catch {
-      return { ...base, availability: "malformed", reason: "invalid_shape" };
+      return { ok: false };
     }
+  }
+  function recoverReportJson(raw) {
+    const candidates = collectRecoveryCandidates(raw);
+    if (candidates.length !== 1) return null;
+    const candidate = candidates[0];
+    if (hasStructuralJsonOutside(raw, candidate)) return null;
+    if (raw.slice(candidate.envelopeEnd).trim().length > 0) return null;
+    const parsed = tryParseJsonObject(candidate.text);
+    if (!parsed.ok) return null;
+    return { ...parsed, recovered: combineRecovery(candidate.source, parsed.recovered) };
+  }
+  function combineRecovery(source, escaping) {
+    return escaping === "escaped_controls" ? `${source}+escaped_controls` : source;
+  }
+  function collectRecoveryCandidates(raw) {
+    const candidates = [];
+    const fence = /```[ \t]*(?:json|JSON)?[ \t]*\r?\n?([\s\S]*?)```/g;
+    for (let match2 = fence.exec(raw); match2; match2 = fence.exec(raw)) {
+      const body = match2[1];
+      const start = match2.index + match2[0].indexOf(body);
+      candidates.push({
+        start,
+        end: start + body.length,
+        envelopeStart: match2.index,
+        envelopeEnd: match2.index + match2[0].length,
+        text: body,
+        source: "fenced"
+      });
+      if (match2.index === fence.lastIndex) fence.lastIndex++;
+    }
+    for (const span of balancedJsonObjects(raw)) {
+      if (candidates.some((candidate) => span.start >= candidate.start && span.end <= candidate.end)) continue;
+      candidates.push({ ...span, envelopeStart: span.start, envelopeEnd: span.end, source: "embedded" });
+    }
+    return candidates;
+  }
+  function hasStructuralJsonOutside(raw, candidate) {
+    if (candidate.source === "embedded" && /```|~~~/.test(raw.slice(0, candidate.envelopeStart))) return true;
+    const outside = raw.slice(0, candidate.envelopeStart) + raw.slice(candidate.envelopeEnd);
+    if (/[{}]/.test(outside)) return true;
+    const before = raw.slice(0, candidate.envelopeStart).trimEnd();
+    const after = raw.slice(candidate.envelopeEnd).trimStart();
+    return /[\[{]$/.test(before) || /^[\]}]/.test(after);
+  }
+  function escapeRawControlCharsInStrings(text) {
+    let out = "";
+    let inString = false;
+    let escaped = false;
+    for (const ch of text) {
+      if (inString) {
+        if (escaped) {
+          out += ch;
+          escaped = false;
+          continue;
+        }
+        if (ch === "\\") {
+          out += ch;
+          escaped = true;
+          continue;
+        }
+        if (ch === '"') {
+          inString = false;
+          out += ch;
+          continue;
+        }
+        if (ch.charCodeAt(0) < 32) {
+          out += JSON.stringify(ch).slice(1, -1);
+          continue;
+        }
+        out += ch;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      out += ch;
+    }
+    return out;
+  }
+  function balancedJsonObjects(text) {
+    const found = [];
+    let position = 0;
+    while (position < text.length) {
+      const start = text.indexOf("{", position);
+      if (start < 0) break;
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      let end = -1;
+      for (let index = start; index < text.length && index - start <= DELEGATION_REPORT_MAX_CHARS; index++) {
+        const ch = text[index];
+        if (inString) {
+          if (escaped) {
+            escaped = false;
+            continue;
+          }
+          if (ch === "\\") {
+            escaped = true;
+            continue;
+          }
+          if (ch === '"') inString = false;
+          continue;
+        }
+        if (ch === '"') {
+          inString = true;
+          continue;
+        }
+        if (ch === "{") depth++;
+        else if (ch === "}") {
+          depth--;
+          if (depth === 0) {
+            end = index + 1;
+            break;
+          }
+        }
+      }
+      if (end < 0) break;
+      found.push({ start, end, text: text.slice(start, end) });
+      position = end;
+    }
+    return found;
+  }
+  function validateDelegationReport(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const candidate = value;
+    if (typeof candidate.summary !== "string" || typeof candidate.result !== "string") return null;
+    if (Object.keys(candidate).some((key) => !["summary", "result", "remainingWork", "evidenceRefs"].includes(key))) return null;
+    for (const key of ["remainingWork", "evidenceRefs"]) {
+      const items = candidate[key];
+      if (items !== void 0 && (!Array.isArray(items) || items.length > 32 || items.some((item) => typeof item !== "string" || item.length > 2e3))) return null;
+    }
+    return candidate;
   }
   function observeDelegationPhase(observation, phase, workActivity = true) {
     observation.phase = phase;
@@ -28036,7 +28345,7 @@ ${formatSkillsForPrompt(skills ?? [])}`;
       pendingMessages: record2.messages,
       reports: Array.isArray(record2.reports) ? record2.reports.slice(-4).map((report) => {
         const parsed = parseDelegationReport(typeof report?.raw === "string" ? report.raw : void 0, typeof report?.runId === "string" ? report.runId : "legacy", report?.stopReason ?? report?.availability === "truncated");
-        if (["empty", "invalid_json", "invalid_shape", "char_cap", "provider_length", "error", "aborted", "deadline", "cancelled", "no_terminal"].includes(report?.reason ?? "")) parsed.reason = report.reason;
+        if (parsed.availability !== "available" && ["empty", "invalid_json", "invalid_shape", "char_cap", "provider_length", "error", "aborted", "deadline", "cancelled", "no_terminal"].includes(report?.reason ?? "")) parsed.reason = report.reason;
         return parsed;
       }) : void 0,
       usageRuns: restoreSubagentUsageRuns(record2.usageRuns),
@@ -46088,9 +46397,7 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
   }
 
   // src/step-guards.ts
-  function injectStepGuardsIntoSource(source, sourceType) {
-    const text = String(source || "");
-    const ast = parse4(text, { ecmaVersion: "latest", sourceType });
+  function collectStepGuardEdits(ast) {
     const inserts = [];
     const visit = (value) => {
       if (!value || typeof value !== "object") return;
@@ -46112,11 +46419,89 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
       for (const child of Object.values(node)) visit(child);
     };
     visit(ast);
-    inserts.sort((a, b) => b.at - a.at);
-    let output = text;
-    for (const insertion of inserts) output = `${output.slice(0, insertion.at)}${insertion.text}${output.slice(insertion.at)}`;
-    return output;
+    return inserts;
   }
+  function applyUnitySourceEdits(source, edits) {
+    for (const edit of edits) {
+      const end = edit.end ?? edit.at;
+      if (!Number.isInteger(edit.at) || !Number.isInteger(end) || edit.at < 0 || end < edit.at || end > source.length)
+        throw new Error("Invalid Unity source edit offsets");
+    }
+    const ordered = edits.map((edit, index) => ({ ...edit, index })).sort((left, right) => {
+      if (left.at !== right.at) return left.at - right.at;
+      const leftInsert = (left.end ?? left.at) === left.at;
+      const rightInsert = (right.end ?? right.at) === right.at;
+      if (leftInsert !== rightInsert) return leftInsert ? -1 : 1;
+      return right.index - left.index;
+    });
+    const chunks = [];
+    let cursor = 0;
+    for (const edit of ordered) {
+      const end = edit.end ?? edit.at;
+      if (edit.at < cursor || edit.at < 0 || end < edit.at || end > source.length)
+        throw new Error("Overlapping or invalid Unity source edits");
+      chunks.push(source.slice(cursor, edit.at), edit.text);
+      cursor = end;
+    }
+    chunks.push(source.slice(cursor));
+    return chunks.join("");
+  }
+
+  // src/unity-script-compiler.ts
+  function createCompilerError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+  function prepareUnityScriptSource(script) {
+    const text = String(script || "");
+    const ast = parse4(text, { ecmaVersion: "latest", sourceType: "module" });
+    const exports = ast.body;
+    const runExport = exports.find((item) => item.type === "ExportNamedDeclaration" && item.declaration?.type === "FunctionDeclaration" && item.declaration.id?.name === "run" && item.declaration.async === true && item.declaration.generator !== true);
+    const declarationStart = runExport?.declaration?.start;
+    if (!runExport || typeof declarationStart !== "number") {
+      throw createCompilerError("SCRIPT_CONTRACT", "Script must define export async function run(ctx, args).");
+    }
+    return applyUnitySourceEdits(text, [
+      ...collectStepGuardEdits(ast),
+      { at: runExport.start, end: declarationStart, text: "" }
+    ]);
+  }
+  function compileUnityScriptEntry(script, onStep) {
+    const normalized = prepareUnityScriptSource(script);
+    const module = { exports: {} };
+    const exports = module.exports;
+    const executor = new Function(
+      "module",
+      "exports",
+      "console",
+      "__pieStepGuard",
+      `"use strict";
+const CS = undefined;
+const puer = undefined;
+${normalized}
+return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports.run)), default: (module.exports.default || exports.default) };`
+    );
+    const exported = executor(module, exports, console, onStep);
+    const entry = exported?.run;
+    if (typeof entry !== "function") {
+      throw createCompilerError("SCRIPT_CONTRACT", "Script must define export async function run(ctx, args).");
+    }
+    return entry;
+  }
+
+  // src/work-scheduler.ts
+  var UNITY_WORK_SOFT_SLICE_MS = 4;
+  var UnityWorkScheduler = class {
+    shouldYield(taskKey, sliceStartMs, clock) {
+      void taskKey;
+      const elapsed = clock.now() - sliceStartMs;
+      return Number.isFinite(elapsed) && elapsed >= UNITY_WORK_SOFT_SLICE_MS;
+    }
+    reset() {
+    }
+  };
+  var unityWorkScheduler = new UnityWorkScheduler();
 
   // src/unity-runtime-access.ts
   function isRecord8(value) {
@@ -46421,17 +46806,6 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
     if (value.target) return [value.target];
     return [];
   }
-  function normalizeModuleSource(source) {
-    const text = String(source || "");
-    const ast = parse4(text, { ecmaVersion: "latest", sourceType: "module" });
-    const exports = ast.body;
-    const runExport = exports.find((item) => item.type === "ExportNamedDeclaration" && item.declaration?.type === "FunctionDeclaration" && item.declaration.id?.name === "run" && item.declaration.async === true && item.declaration.generator !== true);
-    if (typeof runExport?.declaration?.start !== "number") throw createScriptHostError("SCRIPT_CONTRACT", "Script must define export async function run(ctx, args).");
-    return `${text.slice(0, runExport.start)}${text.slice(runExport.declaration.start)}`;
-  }
-  function injectStepGuards(source) {
-    return injectStepGuardsIntoSource(source, "module");
-  }
   function isStepTimeoutError(error) {
     return isRecord9(error) && (error.code === STEP_TIMEOUT_ERROR_CODE || error.name === "PieStepTimeoutError");
   }
@@ -46655,7 +47029,9 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
       return pending;
     };
     const deliverResult = (value) => {
-      if (sliceNowMs() - task.sliceStartMs < SOFT_SLICE_MS) return Promise.resolve(value);
+      if (!unityWorkScheduler.shouldYield(task.id, task.sliceStartMs, {
+        now: () => sliceNowMs()
+      })) return Promise.resolve(value);
       const pending = createStepGate(1, 0).then(() => {
         assertTaskActive(task);
         return value;
@@ -46775,31 +47151,6 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
       }
     };
   }
-  function compileScriptEntry(script, task) {
-    const normalized = injectStepGuards(normalizeModuleSource(script));
-    const module = { exports: {} };
-    const exports = module.exports;
-    const stepGuard = () => {
-      assertTaskActive(task);
-    };
-    const executor = new Function(
-      "module",
-      "exports",
-      "console",
-      "__pieStepGuard",
-      `"use strict";
-const CS = undefined;
-const puer = undefined;
-${normalized}
-return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports.run)), default: (module.exports.default || exports.default) };`
-    );
-    const exported = executor(module, exports, console, stepGuard);
-    const entry = exported?.run;
-    if (typeof entry !== "function") {
-      throw createScriptHostError("SCRIPT_CONTRACT", "Script must define export async function run(ctx, args).");
-    }
-    return entry;
-  }
   function isThenable(value) {
     return !!value && (typeof value === "object" || typeof value === "function") && typeof value.then === "function";
   }
@@ -46902,7 +47253,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       }
       const args = isRecord9(payload.args) ? payload.args : {};
       const ctx = createTaskContext(bridge2, task, args);
-      const entry = compileScriptEntry(script, task);
+      const entry = compileUnityScriptEntry(script, () => assertTaskActive(task));
       task.stepStartMs = nowMs();
       task.sliceStartMs = sliceNowMs();
       settleEntryResult(task, entry(ctx, args));
@@ -48772,10 +49123,44 @@ ${extensionSection.join("\n\n---\n\n")}
     return { kind: "incremental", baseMessageCount: sent.length, suffix };
   }
 
+  // src/presentation-journal.ts
+  var PresentationJournal = class {
+    constructor(identity) {
+      this.identity = identity;
+    }
+    identity;
+    sequence = 0;
+    delta(text, updatedAt = Date.now()) {
+      if (!text) throw new Error("Presentation deltas must not be empty");
+      return this.frame("text_delta", updatedAt, { delta: text });
+    }
+    full(text, updatedAt = Date.now()) {
+      return this.frame("text_full", updatedAt, { text });
+    }
+    frame(type, updatedAt, body) {
+      return { schemaVersion: 1, ...this.identity, seq: ++this.sequence, type, updatedAt, ...body };
+    }
+    /** Roll back only when the synchronous send failed before any reentrant
+     * replacement became the active journal. */
+    rollback(sequence) {
+      if (this.sequence === sequence) this.sequence--;
+    }
+  };
+
   // src/text-delta-sender.ts
   var TEXT_DELTA_MERGE_WINDOW_MS = 50;
-  function createState() {
-    return { currentText: "", sentLength: 0, timer: void 0 };
+  var MAX_SEND_RETRIES = 3;
+  var nextAssistantItemId = 1;
+  function createState(identity) {
+    const resolved = typeof identity === "string" ? { sessionId: "", clientTurnId: identity, itemId: identity, startedAt: Date.now() } : identity ?? { sessionId: "", clientTurnId: "", itemId: `assistant:live:${nextAssistantItemId++}`, startedAt: Date.now() };
+    return {
+      journal: new PresentationJournal(resolved),
+      currentText: "",
+      sentLength: 0,
+      needsFull: false,
+      retryCount: 0,
+      timer: void 0
+    };
   }
   var UnityTextDeltaSender = class {
     constructor(bridge2, mergeWindowMs = TEXT_DELTA_MERGE_WINDOW_MS) {
@@ -48785,49 +49170,51 @@ ${extensionSection.join("\n\n---\n\n")}
     bridge;
     mergeWindowMs;
     state = createState();
-    /** A new assistant message started: forget the previous stream state. */
-    beginAssistant() {
+    hasActiveAssistant = false;
+    hasVisiblePresentation = false;
+    beginAssistant(identity) {
       this.clearTimer();
-      this.state = createState();
+      this.state = createState(identity);
+      this.hasActiveAssistant = true;
+      this.hasVisiblePresentation = false;
     }
-    /**
-     * The streamed text changed. Ships the appended suffix, coalesced.
-     * Handles the three shapes the projection can produce: pure append,
-     * shrink/replace (sends a full frame), and no-change (no-op).
-     */
     updateAssistant(text) {
       const state = this.state;
       if (text === state.currentText) return;
+      if (text.length > 0) this.hasVisiblePresentation = true;
+      state.retryCount = 0;
       if (!text.startsWith(state.currentText) || state.sentLength > text.length) {
         state.currentText = text;
         state.sentLength = text.length;
+        state.needsFull = true;
         this.clearTimer();
-        this.bridge.sendToUnity("message_update", { type: "text_full", text });
+        this.sendFull();
         return;
       }
       state.currentText = text;
       this.scheduleFlush();
     }
-    /** The assistant message completed: flush any pending suffix, then send a
-     *  final full frame so the consumer's state equals the message text. */
     endAssistant(text) {
       this.clearTimer();
       const state = this.state;
-      if (typeof text === "string" && text.length > 0) {
-        state.currentText = text;
-        state.sentLength = text.length;
-        this.bridge.sendToUnity("message_update", { type: "text_full", text });
-        return;
-      }
-      if (state.sentLength < state.currentText.length) {
-        state.sentLength = state.currentText.length;
-        this.bridge.sendToUnity("message_update", { type: "text_full", text: state.currentText });
-      }
+      if (!text && !state.currentText) return;
+      if (text.length > 0) this.hasVisiblePresentation = true;
+      state.currentText = text;
+      this.sendFull();
     }
-    /** Drop all state (turn aborted, session switched). */
+    get activeItemId() {
+      return this.hasActiveAssistant ? this.state.journal.identity.itemId : "";
+    }
+    resync(itemId) {
+      if (!itemId || !this.hasActiveAssistant || !this.hasVisiblePresentation || itemId !== this.activeItemId) return;
+      this.clearTimer();
+      this.sendFull();
+    }
     reset() {
       this.clearTimer();
       this.state = createState();
+      this.hasActiveAssistant = false;
+      this.hasVisiblePresentation = false;
     }
     scheduleFlush() {
       if (this.state.timer !== void 0) return;
@@ -48836,12 +49223,58 @@ ${extensionSection.join("\n\n---\n\n")}
         this.flush();
       }, this.mergeWindowMs);
     }
+    scheduleRetry() {
+      if (this.state.retryCount >= MAX_SEND_RETRIES || this.state.timer !== void 0) return;
+      this.state.retryCount++;
+      this.state.timer = setTimeout(() => {
+        this.state.timer = void 0;
+        this.flush();
+      }, this.mergeWindowMs);
+    }
     flush() {
+      this.clearTimer();
       const state = this.state;
+      if (state.needsFull) {
+        this.sendFull();
+        return;
+      }
       const pending = state.currentText.slice(state.sentLength);
-      if (pending.length === 0) return;
-      state.sentLength = state.currentText.length;
-      this.bridge.sendToUnity("message_update", { type: "text_delta", delta: pending });
+      if (pending.length === 0) {
+        state.retryCount = 0;
+        return;
+      }
+      const textAtSend = state.currentText;
+      this.send(state.journal.delta(pending));
+      if (state.currentText === textAtSend) state.sentLength = textAtSend.length;
+    }
+    sendFull() {
+      const state = this.state;
+      state.needsFull = true;
+      this.send(state.journal.full(state.currentText));
+    }
+    send(frame) {
+      const state = this.state;
+      const journal = state.journal;
+      const textAtSend = state.currentText;
+      try {
+        this.bridge.sendToUnity("presentation_journal", frame);
+        if (state.currentText !== textAtSend) {
+          state.needsFull = true;
+          state.sentLength = state.currentText.length;
+          this.scheduleFlush();
+        } else if (frame.type === "text_full") {
+          state.needsFull = false;
+          state.sentLength = state.currentText.length;
+        }
+        state.retryCount = 0;
+      } catch (error) {
+        if (state.journal === journal) {
+          journal.rollback(frame.seq);
+          state.needsFull = true;
+          this.scheduleRetry();
+        }
+        this.bridge.log("warning", `[presentation] send failed; full resync scheduled: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     clearTimer() {
       if (this.state.timer !== void 0) {
@@ -48849,9 +49282,9 @@ ${extensionSection.join("\n\n---\n\n")}
         this.state.timer = void 0;
       }
     }
-    /** Test seam: expose the pending-flush timer depth. */
     get hasPendingFlush() {
-      return this.state.currentText.length > this.state.sentLength || this.state.timer !== void 0;
+      const state = this.state;
+      return state.needsFull || state.currentText.length > state.sentLength || state.timer !== void 0;
     }
   };
 
@@ -49282,7 +49715,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
           const sessionsDir = getSessionsDir(projectRoot2);
           CS.System.IO.Directory.CreateDirectory(sessionsDir);
           const tracePath = normalizePath4(CS.System.IO.Path.Combine(sessionsDir, `${trace.sessionId}.trace.json`));
-          CS.System.IO.File.WriteAllText(tracePath, JSON.stringify(trace, null, 2));
+          CS.System.IO.File.WriteAllText(tracePath, JSON.stringify(trace));
         }
       });
       this.projectRoot = projectRoot2;
@@ -49982,7 +50415,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
           case "message_start":
             if (messageRole(event.message) === "assistant") {
               host.runtimeChat.beginAssistant();
-              host.textDeltaSender?.beginAssistant();
+              host.textDeltaSender?.beginAssistant(host.runtimeChat.activeAssistantIdentity ?? void 0);
             }
             bridge2.sendToUnity("state_event", { name: "message_start", detail: `role=${messageRole(event.message)}` });
             break;
@@ -50320,7 +50753,23 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       }
       output[index] = built;
     }
-    return output;
+    return decorateSessionSyncPresentation(output);
+  }
+  function decorateSessionSyncPresentation(records) {
+    let clientTurnId = "";
+    let assistantOrdinal = 0;
+    return records.map((record2) => {
+      const role = String(record2.role || "assistant");
+      if (role === "user") {
+        clientTurnId = typeof record2.clientTurnId === "string" ? record2.clientTurnId : "";
+        assistantOrdinal = 0;
+        return record2;
+      }
+      if (role !== "assistant" || !clientTurnId) return record2;
+      const presentationItemId = `${clientTurnId}:assistant:${assistantOrdinal}`;
+      assistantOrdinal += 1;
+      return { ...record2, clientTurnId, presentationItemId };
+    });
   }
   function isContextIndependentSyncRecord(record2) {
     const usage = record2.usage;
@@ -50633,6 +51082,19 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     get activeClientTurnId() {
       return this.active?.clientTurnId || "";
     }
+    get activeAssistantItemId() {
+      return this.active?.assistantItemId || "";
+    }
+    get activeAssistantIdentity() {
+      const active = this.active;
+      if (!active) return null;
+      return {
+        sessionId: active.sessionId,
+        clientTurnId: active.clientTurnId,
+        itemId: active.assistantItemId,
+        startedAt: active.startedAt
+      };
+    }
     get hadToolActivity() {
       return this.active?.hadToolActivity === true;
     }
@@ -50677,40 +51139,22 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }
     beginAssistant(timestamp = Date.now()) {
       const active = this.active;
-      if (!active) return;
+      if (!active) return "";
       active.assistantIndex += 1;
       active.assistantItemId = `${active.clientTurnId}:assistant:${active.assistantIndex}`;
       active.assistantLastUpdate = null;
       void timestamp;
+      return active.assistantItemId;
     }
     updateAssistant(text, timestamp = Date.now()) {
       const active = this.active;
       if (!active) return;
       if (!active.assistantItemId) this.beginAssistant(timestamp);
+      void timestamp;
       const previous = active.assistantLastUpdate;
       const isTruncated = text.length > MAX_ASSISTANT_TEXT;
       if (previous && previous.isTruncated === isTruncated && (isTruncated ? text.startsWith(previous.text) : text === previous.text)) return;
-      const value = truncate2(text, MAX_ASSISTANT_TEXT);
-      const item = baseTimelineItem({
-        sessionId: active.sessionId,
-        clientTurnId: active.clientTurnId,
-        itemId: active.assistantItemId,
-        kind: "assistant",
-        status: "running",
-        timestamp: active.startedAt
-      });
-      item.updatedAt = timestamp;
-      item.text = value.value;
-      item.summary = summary(value.value);
-      item.isTruncated = value.truncated;
-      active.assistantLastUpdate = item;
-      try {
-        this.emitTimeline(item);
-      } catch (error) {
-        if (this.active === active && active.assistantItemId === item.itemId && active.assistantLastUpdate === item)
-          active.assistantLastUpdate = previous;
-        throw error;
-      }
+      active.assistantLastUpdate = { text, isTruncated };
     }
     endAssistant(message, timestamp = Date.now()) {
       const active = this.active;
@@ -50720,7 +51164,8 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       const stopReason = typeof metadata.stopReason === "string" ? metadata.stopReason : "";
       const errorText = typeof metadata.errorMessage === "string" ? metadata.errorMessage : "";
       const status = stopReason === "aborted" ? "aborted" : stopReason === "error" || errorText ? "failed" : "succeeded";
-      if (!text.value && !errorText) {
+      const hadVisibleText = Boolean(active.assistantLastUpdate?.text);
+      if (!text.value && !errorText && !hadVisibleText) {
         active.assistantItemId = "";
         return;
       }
@@ -51322,6 +51767,12 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
             case "resync_session":
               host.emitSessionSync(void 0, { full: true });
               break;
+            case "resync_presentation": {
+              const itemId = stringField(data2, "itemId");
+              if (!itemId || host.textDeltaSender?.activeItemId !== itemId) break;
+              host.textDeltaSender.resync(itemId);
+              break;
+            }
             case "reload_skills":
               host.rebuildAgentSurface();
               host.emitSkillsList();
@@ -52825,6 +53276,7 @@ ${initialAgentsFile}`);
     bridge,
     sessionTrace,
     todoTool,
+    textDeltaSender,
     applyModelSelectionSync,
     beginRuntimeChatTurn,
     preparePendingRuntimeChatAbort: runtimeChatTurns.preparePendingAbort.bind(runtimeChatTurns),

@@ -23,6 +23,9 @@ namespace Pie
         private string _assistantDeltaText = "";
         private long _runtimeRpcEventVersion;
         private readonly List<DevRpcMessagePayload> _devRpcMessages = new List<DevRpcMessagePayload>();
+        private readonly PiePresentationJournal _presentationJournal = new PiePresentationJournal();
+        private readonly Dictionary<string, int> _timelineItemIndices = new Dictionary<string, int>();
+        private PieSessionSnapshot _timelineIndexSession;
         private string _runtimeStatusText = "Idle";
         private bool _runtimeIsStreaming;
         private string _lastStructuredErrorMessage = "";
@@ -1034,11 +1037,69 @@ namespace Pie
                     LastSkillsListJson = json ?? "";
                     break;
                 }
+                case "presentation_journal":
+                {
+                    var frame = JsonUtility.FromJson<PiePresentationFrame>(json ?? "{}");
+                    var applied = _presentationJournal.Apply(frame, ActiveSessionId);
+                    if (applied.resyncRequired)
+                    {
+                        // itemId embeds the client-controlled clientTurnId; serialize
+                        // it instead of interpolating so quotes/backslashes cannot
+                        // corrupt the payload (see PieChatWindow's identical path).
+                        _bridge?.SendToJs("resync_presentation", JsonUtility.ToJson(new ResyncPresentationPayload { itemId = frame.itemId, lastSeq = frame.seq - 1 }));
+                        break;
+                    }
+                    if (applied.accepted)
+                    {
+                        var text = applied.item.text ?? "";
+                        if (applied.terminal)
+                        {
+                            var previous = FindCurrentTimelineItem(applied.item.itemId)?.text ?? "";
+                            CommitCanonicalAssistantText(previous, text);
+                            UpsertCurrentTimelineItem(applied.item);
+                            OnTimelineItemChanged?.Invoke(applied.item);
+                            break;
+                        }
+                        _lastAssistantText = text;
+                        _assistantDeltaText = text;
+                        _runtimeIsStreaming = true;
+                        _runtimeStatusText = "Streaming";
+                        UpsertLatestAssistantMessage(text);
+                        OnAssistantMessage?.Invoke(text);
+                        if (applied.delta != null)
+                        {
+                            OnAssistantDelta?.Invoke(applied.delta);
+                        }
+                        else if (!string.Equals(applied.previousText, text, StringComparison.Ordinal))
+                        {
+                            if (!string.IsNullOrEmpty(applied.previousText) && text.StartsWith(applied.previousText, StringComparison.Ordinal))
+                                OnAssistantDelta?.Invoke(text.Substring(applied.previousText.Length));
+                            else if (!string.IsNullOrEmpty(text))
+                                OnAssistantDelta?.Invoke(text);
+                        }
+                        UpsertCurrentTimelineItem(applied.item);
+                        OnTimelineItemChanged?.Invoke(applied.item);
+                    }
+                    break;
+                }
                 case "timeline_item":
                 {
                     var item = JsonUtility.FromJson<PieTimelineItem>(json ?? "{}");
                     if (item != null)
                     {
+                        if (item.kind == "assistant" && item.status != "running")
+                        {
+                            var finalText = item.text ?? "";
+                            var previousText = FindCurrentTimelineItem(item.itemId)?.text ?? "";
+                            var needsRepair = _presentationJournal.NeedsTerminalText(item.itemId, finalText, item.isTruncated);
+                            // A bounded canonical summary must not replace a
+                            // complete live answer that already arrived.
+                            if (item.isTruncated && previousText.Length > finalText.Length
+                                && previousText.StartsWith(finalText, StringComparison.Ordinal))
+                                item.text = previousText;
+                            if (needsRepair) CommitCanonicalAssistantText(previousText, finalText);
+                            _presentationJournal.Retire(item.itemId, item.status, needsRepair);
+                        }
                         UpsertCurrentTimelineItem(item);
                         OnTimelineItemChanged?.Invoke(item);
                     }
@@ -1232,6 +1293,9 @@ namespace Pie
         private void ResetRuntimeRpcHistory()
         {
             _devRpcMessages.Clear();
+            _presentationJournal.Clear();
+            _timelineItemIndices.Clear();
+            _timelineIndexSession = null;
             _lastAssistantText = "";
             _assistantDeltaText = "";
             _lastStructuredErrorMessage = "";
@@ -1298,26 +1362,71 @@ namespace Pie
             _devRpcMessages.RemoveRange(0, _devRpcMessages.Count - maxMessages);
         }
 
+        private PieTimelineItem FindCurrentTimelineItem(string itemId)
+        {
+            var items = CurrentSession?.timelineItems;
+            if (items == null || string.IsNullOrEmpty(itemId)) return null;
+            for (var i = items.Length - 1; i >= 0; i--)
+            {
+                if (items[i] != null && string.Equals(items[i].itemId, itemId, StringComparison.Ordinal))
+                    return items[i];
+            }
+            return null;
+        }
+
+        private void CommitCanonicalAssistantText(string previousText, string finalText)
+        {
+            previousText ??= "";
+            finalText ??= "";
+            if (string.Equals(previousText, finalText, StringComparison.Ordinal)) return;
+            _lastAssistantText = finalText;
+            _assistantDeltaText = finalText;
+            UpsertLatestAssistantMessage(finalText);
+            OnAssistantMessage?.Invoke(finalText);
+            var delta = PiePresentationJournal.TerminalDelta(previousText, finalText);
+            if (delta != null) OnAssistantDelta?.Invoke(delta);
+        }
+
         private void UpsertCurrentTimelineItem(PieTimelineItem item)
         {
-            if (CurrentSession == null || item == null)
+            if (CurrentSession == null || item == null || string.IsNullOrWhiteSpace(item.itemId))
                 return;
 
             var items = CurrentSession.timelineItems ?? Array.Empty<PieTimelineItem>();
+            if (!ReferenceEquals(_timelineIndexSession, CurrentSession) || _timelineItemIndices.Count != items.Length)
+            {
+                _timelineItemIndices.Clear();
+                for (var i = 0; i < items.Length; i++)
+                {
+                    if (items[i] != null) _timelineItemIndices[items[i].itemId] = i;
+                }
+                _timelineIndexSession = CurrentSession;
+            }
+            if (_timelineItemIndices.TryGetValue(item.itemId, out var index)
+                && index >= 0 && index < items.Length
+                && items[index] != null
+                && string.Equals(items[index].itemId, item.itemId, StringComparison.Ordinal))
+            {
+                items[index] = item;
+                CurrentSession.timelineItems = items;
+                return;
+            }
+            // A same-length replacement/reorder is invisible to count-based
+            // invalidation. Verify by identity before declaring it a new item.
             for (var i = 0; i < items.Length; i++)
             {
-                if (items[i] != null && string.Equals(items[i].itemId, item.itemId, StringComparison.Ordinal))
-                {
-                    items[i] = item;
-                    CurrentSession.timelineItems = items;
-                    return;
-                }
+                if (items[i] == null || !string.Equals(items[i].itemId, item.itemId, StringComparison.Ordinal)) continue;
+                items[i] = item;
+                _timelineItemIndices[item.itemId] = i;
+                CurrentSession.timelineItems = items;
+                return;
             }
 
             var expanded = new PieTimelineItem[items.Length + 1];
             Array.Copy(items, expanded, items.Length);
             expanded[items.Length] = item;
             CurrentSession.timelineItems = expanded;
+            _timelineItemIndices[item.itemId] = expanded.Length - 1;
         }
 
         [Serializable]
@@ -1326,6 +1435,13 @@ namespace Pie
             public string requestId;
             public string sessionId;
             public bool recoverInterrupted;
+        }
+
+        [Serializable]
+        private sealed class ResyncPresentationPayload
+        {
+            public string itemId;
+            public long lastSeq;
         }
 
         private static string EscapeJsonString(string value)
