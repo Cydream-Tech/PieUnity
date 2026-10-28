@@ -1588,10 +1588,14 @@ namespace Pie.Editor
         {
             if (_bridge?.IsInitialized != true || string.IsNullOrEmpty(clientTurnId)) return;
             var action = fork ? "fork_turn" : "rewind_turn";
-            var escaped = clientTurnId.Replace("\\", "\\\\").Replace("\"", "\\\"");
             _statusText = fork ? "Forking…" : "Rewinding…";
             PieDiagnostics.Verbose($"[PieChatWindow] {action} {clientTurnId}");
-            _bridge.SendToJs(action, $"{{\"clientTurnId\":\"{escaped}\"}}");
+            if (!_bridge.SendToJs(action, JsonUtility.ToJson(new TurnRefPayload { clientTurnId = clientTurnId })))
+            {
+                _statusText = fork ? "Fork failed — bridge rejected the request" : "Rewind failed — bridge rejected the request";
+                AddSystemMessage($"⚠ {(fork ? "Fork" : "Rewind")} was not delivered (bridge rejected it — see Console).");
+                return;
+            }
             RefreshSessions();
         }
 
@@ -2063,16 +2067,17 @@ namespace Pie.Editor
                 : text;
             AddMessage("user", displayText);
 
-            var escaped = text.Replace("\\", "\\\\").Replace("\"", "\\\"")
-                              .Replace("\n", "\\n").Replace("\r", "\\r");
-            var json = $"{{\"content\":\"{escaped}\"";
-            if (attachments.Count > 0)
+            var json = JsonUtility.ToJson(new SendMessagePayload
             {
-                json += ",\"images\":";
-                json += "[" + string.Join(",", attachments.ConvertAll(a =>
-                    $"{{\"data\":\"{a.base64}\",\"mimeType\":\"{a.mimeType}\",\"width\":{a.width},\"height\":{a.height}}}")) + "]";
-            }
-            json += "}";
+                content = text,
+                images = attachments.Count > 0 ? attachments.ConvertAll(a => new SendMessageImage
+                {
+                    data = a.base64,
+                    mimeType = a.mimeType,
+                    width = a.width,
+                    height = a.height,
+                }).ToArray() : null,
+            });
 
             _isStreaming = true;
             _statusText = "Thinking...";
@@ -2083,7 +2088,18 @@ namespace Pie.Editor
             {
                 IsRunning = true,
             });
-            _bridge.SendToJs("send_message", json);
+            if (!_bridge.SendToJs("send_message", json))
+            {
+                // Transport rejected the payload (bridge down / invalid JSON):
+                // undo the streaming state instead of leaving a stuck placeholder
+                // and a cleared input with the prompt gone.
+                _isStreaming = false;
+                ClearRunningMessages();
+                _statusText = "Send failed — bridge rejected the message (see Console)";
+                AddSystemMessage("⚠ Your message was not delivered (the bridge rejected it — see Console). Reconnect the bridge and try again.");
+                _inputText = text; // restore the draft so nothing is lost
+                return;
+            }
             _inputText = "";
             ScrollToBottomSoon();
         }
@@ -3031,20 +3047,34 @@ namespace Pie.Editor
         {
             if (_bridge?.IsInitialized != true) return;
 
-            var escaped = _apiKey.Replace("\\", "\\\\").Replace("\"", "\\\"");
-            var escapedBaseUrl = _baseUrl.Replace("\\", "\\\\").Replace("\"", "\\\"");
-            var escapedWebSearchMode = (_webSearchMode ?? "auto").Replace("\\", "\\\\").Replace("\"", "\\\"");
-            var verboseLogs = _verboseLogs ? "true" : "false";
-            var json = $"{{\"apiKey\":\"{escaped}\",\"provider\":\"{_provider}\",\"model\":\"{_model}\",\"baseUrl\":\"{escapedBaseUrl}\",\"webSearchMode\":\"{escapedWebSearchMode}\",\"verboseLogs\":{verboseLogs}}}";
+            var json = JsonUtility.ToJson(new SetConfigPayload
+            {
+                apiKey = _apiKey,
+                provider = _provider,
+                model = _model,
+                baseUrl = _baseUrl,
+                webSearchMode = _webSearchMode ?? "auto",
+                verboseLogs = _verboseLogs,
+            });
             _bridge.SendToJs("set_config", json);
         }
 
         private void SendCommand(string command)
         {
             if (_bridge?.IsInitialized != true) return;
-            var escaped = command.Replace("\\", "\\\\").Replace("\"", "\\\"");
-            _bridge.SendToJs("send_message", $"{{\"content\":\"{escaped}\"}}");
+            if (!SendUserMessage(command)) return;
             RefreshSessions();
+        }
+
+        /** Returns true when the bridge accepted the payload; the caller
+         *  decides follow-ups. Uses the same typed payload as SendMessage so
+         *  control characters cannot corrupt the JSON. */
+        private bool SendUserMessage(string text)
+        {
+            if (_bridge?.IsInitialized != true) return false;
+            var accepted = _bridge.SendToJs("send_message", JsonUtility.ToJson(new SendMessagePayload { content = text }));
+            if (!accepted) AddSystemMessage("⚠ Command was not delivered (bridge rejected it — see Console).");
+            return accepted;
         }
 
         private void SendRecoveryResume(PieChatSessionRecovery.Snapshot snapshot)
@@ -3617,8 +3647,11 @@ namespace Pie.Editor
             if (!string.IsNullOrEmpty(sessionId))
                 PieChatSessionRecovery.SetAutoResendSessionId(sessionId);
             AddSystemMessage($"↻ Auto-resending interrupted prompt: {TruncateForSystem(text)}");
-            var escaped = text.Replace("\\", "\\\\").Replace("\"", "\\\"");
-            _bridge.SendToJs("send_message", $"{{\"content\":\"{escaped}\"}}");
+            if (!SendUserMessage(text))
+            {
+                PieChatSessionRecovery.SetAutoResendSessionId(sessionId); // retry next window open
+                return;
+            }
             RefreshSessions();
         }
 
@@ -3873,6 +3906,43 @@ namespace Pie.Editor
         {
             public string itemId;
             public long lastSeq;
+        }
+
+        // Hand-rolled JSON escaping (backslash/quote/LF/CR only) cannot carry
+        // TAB or other control characters: JSON.parse then rejects the whole
+        // payload and the prompt is silently lost. Serialize typed payloads
+        // with JsonUtility instead of interpolating strings.
+        [Serializable]
+        private class SendMessagePayload
+        {
+            public string content;
+            public SendMessageImage[] images;
+        }
+
+        [Serializable]
+        private class SendMessageImage
+        {
+            public string data;
+            public string mimeType;
+            public int width;
+            public int height;
+        }
+
+        [Serializable]
+        private class TurnRefPayload
+        {
+            public string clientTurnId;
+        }
+
+        [Serializable]
+        private class SetConfigPayload
+        {
+            public string apiKey;
+            public string provider;
+            public string model;
+            public string baseUrl;
+            public string webSearchMode;
+            public bool verboseLogs;
         }
 
         [Serializable]

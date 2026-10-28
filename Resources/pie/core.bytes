@@ -25770,6 +25770,13 @@ ${summary2}`;
       if (this.cachedSessionId === sessionId && this.cachedController) {
         return this.cachedController;
       }
+      const pending = this.pendingFlushes.get(sessionId);
+      if (pending) {
+        this.flush();
+        this.cachedSessionId = sessionId;
+        this.cachedController = pending;
+        return pending;
+      }
       this.flush();
       let controller;
       try {
