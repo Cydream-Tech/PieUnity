@@ -5013,7 +5013,7 @@ var _PieAgent = (() => {
     return CS.System.IO;
   }
   function looksLikeBase64(value) {
-    return value.length > 0 && value.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(value);
+    return value.length === 0 || value.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(value);
   }
   function getPieFileBridge() {
     if (typeof CS === "undefined" || !CS?.Pie?.PieFileBridge) {
@@ -18658,6 +18658,7 @@ ${delta}`;
         convertToLlm: this.convertToLlm,
         transformContext: this.transformContext,
         beforeToolContinuation: beforeToolContinuation ? async () => {
+          if (!ownsRun() || runController.signal.aborted) throw new Error("Request was aborted");
           await new Promise((resolve2) => {
             acknowledgeToolTurn = resolve2;
           });
@@ -48679,6 +48680,14 @@ ${extensionSection.join("\n\n---\n\n")}
 
   // src/session-store.ts
   var REBUILD_BATCH_MESSAGES = 64;
+  var REBUILD_STAGING_PREFIX = "__pie-staging-rebuild-new-";
+  var REBUILD_BACKUP_PREFIX = "__pie-staging-rebuild-backup-";
+  function rebuildStagingId(sessionId) {
+    return `${REBUILD_STAGING_PREFIX}${sessionId}`;
+  }
+  function rebuildBackupId(sessionId) {
+    return `${REBUILD_BACKUP_PREFIX}${sessionId}`;
+  }
   function getSessionsDir(projectRoot2) {
     const fromBridge = globalThis.pieBridge?.getSessionsDirectory?.();
     if (typeof fromBridge === "string" && fromBridge.length > 0) {
@@ -48706,7 +48715,13 @@ ${extensionSection.join("\n\n---\n\n")}
       if (!gateway.exists(dir)) {
         gateway.mkdir(dir, { recursive: true });
       }
-      (knownSessionsDirs ??= /* @__PURE__ */ new Set()).add(dir);
+      try {
+        recoverInterruptedRebuilds(projectRoot2, dir);
+      } catch (error) {
+        console.warn(`[pie] session rebuild recovery skipped: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        (knownSessionsDirs ??= /* @__PURE__ */ new Set()).add(dir);
+      }
     }
     return dir;
   }
@@ -48832,6 +48847,47 @@ ${extensionSection.join("\n\n---\n\n")}
     }
     return result;
   }
+  function recoverInterruptedRebuildForSession(projectRoot2, sessionsDir, sessionId, store) {
+    const gateway = getSessionGateway(projectRoot2);
+    const backupId = rebuildBackupId(sessionId);
+    const backupDir = gateway.join(sessionsDir, backupId);
+    if (!gateway.exists(backupDir)) return;
+    const targetDir = gateway.join(sessionsDir, sessionId);
+    if (gateway.exists(targetDir)) {
+      if (store.exists(sessionId)) store.delete(backupId);
+      return;
+    }
+    if (!store.exists(backupId)) return;
+    store.moveSession(backupId, sessionId);
+    const stagingId = rebuildStagingId(sessionId);
+    if (gateway.exists(gateway.join(sessionsDir, stagingId))) {
+      try {
+        store.delete(stagingId);
+      } catch {
+      }
+    }
+  }
+  function recoverInterruptedRebuilds(projectRoot2, sessionsDir) {
+    const gateway = getSessionGateway(projectRoot2);
+    const store = new FileSessionStore(sessionsDir);
+    let names;
+    try {
+      names = gateway.readdir(sessionsDir);
+    } catch (error) {
+      console.warn(`[pie] session rebuild recovery could not enumerate backups: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    for (const name of names) {
+      if (!name.startsWith(REBUILD_BACKUP_PREFIX)) continue;
+      try {
+        const sessionId = name.slice(REBUILD_BACKUP_PREFIX.length);
+        if (!sessionId) continue;
+        recoverInterruptedRebuildForSession(projectRoot2, sessionsDir, sessionId, store);
+      } catch (error) {
+        console.warn(`[pie] session rebuild recovery skipped for ${name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
   function createManager(projectRoot2) {
     return createSessionManager({
       sessionsDir: getSessionsDir(projectRoot2),
@@ -48882,6 +48938,7 @@ ${extensionSection.join("\n\n---\n\n")}
     return resident;
   }
   async function loadResidentManager(projectRoot2, sessionId, title, options) {
+    recoverInterruptedRebuildForSession(projectRoot2, getSessionsDir(projectRoot2), sessionId, new FileSessionStore(getSessionsDir(projectRoot2)));
     const existing = takeResidentManager(projectRoot2, sessionId);
     if (existing) return existing;
     const manager = createManager(projectRoot2);
@@ -48936,6 +48993,84 @@ ${extensionSection.join("\n\n---\n\n")}
     }
     return serializeSave(normalized.id, () => saveSessionLocked(projectRoot2, normalized));
   }
+  async function rebuildSessionLocked(projectRoot2, normalized, resident) {
+    const sessionsDir = getSessionsDir(projectRoot2);
+    const gateway = getSessionGateway(projectRoot2);
+    const store = new FileSessionStore(sessionsDir);
+    const stagingId = rebuildStagingId(normalized.id);
+    const backupId = rebuildBackupId(normalized.id);
+    const stagingDir = gateway.join(sessionsDir, stagingId);
+    const targetDir = gateway.join(sessionsDir, normalized.id);
+    recoverInterruptedRebuildForSession(projectRoot2, sessionsDir, normalized.id, store);
+    if (gateway.exists(stagingDir)) store.delete(stagingId);
+    const stagingManager = createManager(projectRoot2);
+    let originalMoved = false;
+    let published = false;
+    try {
+      await stagingManager.createSession(normalized.title, void 0, stagingId);
+      for (let start = 0; start < normalized.messages.length; start += REBUILD_BATCH_MESSAGES) {
+        if (start > 0) {
+          await yieldToNextTick();
+          if (resident.manager.getActiveSessionId() !== normalized.id) {
+            throw new Error(`Session ${normalized.id} changed during sliced rebuild`);
+          }
+        }
+        const batch = normalized.messages.slice(start, start + REBUILD_BATCH_MESSAGES);
+        for (const message of batch) stagingManager.addMessage(message);
+        await stagingManager.save();
+      }
+      const stagedSession = stagingManager.getActiveSession();
+      if (!stagedSession) throw new Error(`Failed to stage session ${normalized.id}`);
+      const metadata = stagedSession.metadata;
+      metadata.name = deriveSessionTitle(normalized.messages);
+      metadata.createdAt = toTimestamp(normalized.createdAt, Date.now());
+      metadata.parentSessionId = normalized.parentSessionId;
+      metadata.provider = normalized.provider;
+      metadata.modelId = normalized.modelId;
+      metadata.todoState = normalizeTodoState(normalized.todoState);
+      metadata.executionState = normalized.executionState ? restoreExecutionState(normalized.executionState) : void 0;
+      await stagingManager.save();
+      if (gateway.exists(targetDir)) {
+        store.moveSession(normalized.id, backupId);
+        originalMoved = true;
+      }
+      try {
+        store.moveSession(stagingId, normalized.id);
+        published = true;
+      } catch (error) {
+        if (originalMoved && !gateway.exists(targetDir) && store.exists(backupId)) {
+          store.moveSession(backupId, normalized.id);
+        }
+        throw error;
+      }
+      if (originalMoved) {
+        try {
+          store.delete(backupId);
+        } catch {
+        }
+      }
+    } catch (error) {
+      if (!published && gateway.exists(stagingDir)) {
+        try {
+          store.delete(stagingId);
+        } catch {
+        }
+      }
+      throw error;
+    } finally {
+      stagingManager.dispose();
+    }
+    dropResidentManager(projectRoot2, normalized.id);
+    const fresh = createManager(projectRoot2);
+    try {
+      const loaded = await fresh.loadSession(normalized.id, { warnIfMissing: false });
+      if (!loaded) throw new Error(`Published session ${normalized.id} could not be reloaded`);
+      registerResident({ manager: fresh, committedMessages: normalized.messages.slice(), sessionId: normalized.id }, projectRoot2);
+    } catch (error) {
+      fresh.dispose();
+      throw error;
+    }
+  }
   async function saveSessionLocked(projectRoot2, normalized) {
     const resident = await loadResidentManager(projectRoot2, normalized.id, normalized.title);
     if (!resident) {
@@ -48946,24 +49081,8 @@ ${extensionSection.join("\n\n---\n\n")}
       const committed = resident.committedMessages;
       const isPrefix = committed.length <= normalized.messages.length && committed.every((message, index) => message === normalized.messages[index]);
       if (!isPrefix) {
-        await manager.deleteSession(normalized.id);
-        await manager.createSession(normalized.title, void 0, normalized.id);
-        resident.committedMessages = [];
-        const totalMessages = normalized.messages.length;
-        for (let start = 0; start < totalMessages; start += REBUILD_BATCH_MESSAGES) {
-          if (start > 0) {
-            await yieldToNextTick();
-            if (manager.getActiveSessionId() !== normalized.id) {
-              throw new Error(`Session ${normalized.id} changed during sliced rebuild`);
-            }
-          }
-          const batch = normalized.messages.slice(start, start + REBUILD_BATCH_MESSAGES);
-          for (const message of batch) {
-            manager.addMessage(message);
-          }
-          await manager.save();
-          resident.committedMessages = normalized.messages.slice(0, Math.min(start + REBUILD_BATCH_MESSAGES, totalMessages));
-        }
+        await rebuildSessionLocked(projectRoot2, normalized, resident);
+        return normalized;
       } else {
         const tailLength = normalized.messages.length - committed.length;
         if (tailLength > REBUILD_BATCH_MESSAGES) {
@@ -49010,9 +49129,17 @@ ${extensionSection.join("\n\n---\n\n")}
     return normalized;
   }
   async function deleteSession(projectRoot2, sessionId) {
+    ensureSessionsDir(projectRoot2);
     await serializeSave(sessionId, () => deleteSessionLocked(projectRoot2, sessionId));
   }
   async function deleteSessionLocked(projectRoot2, sessionId) {
+    const sessionsDir = getSessionsDir(projectRoot2);
+    const gateway = getSessionGateway(projectRoot2);
+    const store = new FileSessionStore(sessionsDir);
+    for (const internalId of [rebuildBackupId(sessionId), rebuildStagingId(sessionId)]) {
+      if (!gateway.exists(gateway.join(sessionsDir, internalId))) continue;
+      if (!store.delete(internalId)) throw new Error(`Failed to delete rebuild artifact ${internalId}`);
+    }
     dropResidentManager(projectRoot2, sessionId);
     const manager = createManager(projectRoot2);
     try {
@@ -49022,6 +49149,7 @@ ${extensionSection.join("\n\n---\n\n")}
     }
   }
   async function loadSession(projectRoot2, sessionId) {
+    ensureSessionsDir(projectRoot2);
     const resident = await loadResidentManager(projectRoot2, sessionId, "", { createIfMissing: false });
     if (!resident) {
       return null;
@@ -49055,6 +49183,7 @@ ${extensionSection.join("\n\n---\n\n")}
     };
   }
   async function listSessions(projectRoot2) {
+    ensureSessionsDir(projectRoot2);
     const manager = createManager(projectRoot2);
     try {
       const sessions = await manager.listSessions();

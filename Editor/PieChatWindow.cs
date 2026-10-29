@@ -2043,10 +2043,12 @@ namespace Pie.Editor
             if (string.IsNullOrWhiteSpace(_inputText) && _pendingImagePaths.Count == 0) return;
             if (_bridge?.IsInitialized != true) return;
 
+            var draftText = _inputText;
             var text = string.IsNullOrWhiteSpace(_inputText) ? "(see attached images)" : _inputText.Trim();
+            var pendingImagePaths = new List<string>(_pendingImagePaths);
             var attachments = new List<ImageAttachment>();
             var failedAttachments = 0;
-            foreach (var path in _pendingImagePaths)
+            foreach (var path in pendingImagePaths)
             {
                 try
                 {
@@ -2065,6 +2067,7 @@ namespace Pie.Editor
             var displayText = attachments.Count > 0
                 ? $"{text}\n📎 {attachments.Count} image(s) attached"
                 : text;
+            var transcriptCountBeforeSend = _messages.Count;
             AddMessage("user", displayText);
 
             var json = JsonUtility.ToJson(new SendMessagePayload
@@ -2081,6 +2084,7 @@ namespace Pie.Editor
 
             _isStreaming = true;
             _statusText = "Thinking...";
+            var previousLastSubmittedInputText = _lastSubmittedInputText;
             _lastSubmittedInputText = text;
 
             // Placeholder
@@ -2090,14 +2094,18 @@ namespace Pie.Editor
             });
             if (!_bridge.SendToJs("send_message", json))
             {
-                // Transport rejected the payload (bridge down / invalid JSON):
-                // undo the streaming state instead of leaving a stuck placeholder
-                // and a cleared input with the prompt gone.
+                // Transport rejected the payload before ownership crossed the
+                // bridge. Roll back this attempt exactly: no phantom transcript,
+                // no lost attachment selection, and no synthetic image-only draft.
                 _isStreaming = false;
-                ClearRunningMessages();
+                if (_messages.Count > transcriptCountBeforeSend)
+                    _messages.RemoveRange(transcriptCountBeforeSend, _messages.Count - transcriptCountBeforeSend);
+                _pendingImagePaths.Clear();
+                _pendingImagePaths.AddRange(pendingImagePaths);
+                _lastSubmittedInputText = previousLastSubmittedInputText;
                 _statusText = "Send failed — bridge rejected the message (see Console)";
                 AddSystemMessage("⚠ Your message was not delivered (the bridge rejected it — see Console). Reconnect the bridge and try again.");
-                _inputText = text; // restore the draft so nothing is lost
+                _inputText = draftText;
                 return;
             }
             _inputText = "";
@@ -2641,12 +2649,12 @@ namespace Pie.Editor
                     ApplyIncrementalSessionSync(payload, payloadTodoCount);
                     return;
                 }
-                if (payload != null
-                    && payload.baseMessageCount > 0
-                    && !(string.Equals(payload.id, _lastSessionSyncId, StringComparison.Ordinal)
-                        && payload.baseMessageCount == _lastSessionSyncMessageCount))
+                if (payload != null && payload.baseMessageCount > 0)
                 {
-                    // Incremental frame we cannot apply: ask for a full one.
+                    // Any remaining incremental frame is not safely applicable:
+                    // mismatched base/session AND an empty rendered transcript
+                    // must all request a full frame instead of replacing history
+                    // with a suffix.
                     RequestSessionResync();
                     return;
                 }
@@ -2815,7 +2823,8 @@ namespace Pie.Editor
         /// appending — otherwise every tool card and assistant text renders
         /// twice. _syncedBubbleCount is the rendered counterpart of the
         /// producer's verified baseMessageCount: everything before it is
-        /// canonical history, and only the unsynchronized live tail is replaced.
+        /// canonical history, and only the unsynchronized live non-system tail
+        /// is replaced. Local system notices are preserved across the sync.
         /// A metadata-only empty suffix never deletes that tail.
         /// </summary>
         private void ApplyIncrementalSessionSync(SessionSyncPayload payload, int payloadTodoCount)
@@ -2838,8 +2847,13 @@ namespace Pie.Editor
                 RequestSessionResync();
                 return;
             }
-            if (_syncedBubbleCount < _messages.Count)
-                _messages.RemoveRange(_syncedBubbleCount, _messages.Count - _syncedBubbleCount);
+            for (var i = _messages.Count - 1; i >= _syncedBubbleCount; i--)
+            {
+                // System bubbles are host-local notices, not an unsynchronized
+                // assistant/tool tail. Keep them instead of deleting warnings
+                // and recovery guidance as though they were duplicate history.
+                if (_messages[i].Role != "system") _messages.RemoveAt(i);
+            }
 
             AppendSyncMessages(suffix);
             _syncedBubbleCount = _messages.Count;
@@ -3644,14 +3658,18 @@ namespace Pie.Editor
             _pendingAutoResendText = null;
             _autoResendArmed = false;
             _pendingAutoResendSessionId = null;
-            if (!string.IsNullOrEmpty(sessionId))
-                PieChatSessionRecovery.SetAutoResendSessionId(sessionId);
             AddSystemMessage($"↻ Auto-resending interrupted prompt: {TruncateForSystem(text)}");
             if (!SendUserMessage(text))
             {
-                PieChatSessionRecovery.SetAutoResendSessionId(sessionId); // retry next window open
+                // A rejected payload never consumed the one automatic resend.
+                // Restore the only remaining copy and let the user retry rather
+                // than marking the session as resent or looping on a down bridge.
+                _inputText = text;
+                AddSystemMessage("Interrupted prompt restored to the input box because auto-resend was not delivered.");
                 return;
             }
+            if (!string.IsNullOrEmpty(sessionId))
+                PieChatSessionRecovery.SetAutoResendSessionId(sessionId);
             RefreshSessions();
         }
 

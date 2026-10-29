@@ -11,13 +11,14 @@ namespace Pie.Unity.Capabilities
     {
         // Deliberately exclude Editor (including play mode/domain reload) and
         // batch contexts. Unsupported is decided BEFORE any capture/submission.
+        private static bool gpuReadbackFaulted;
         private static bool CanUseGpuReadback()
         {
 #if UNITY_EDITOR || UNITY_WEBGL
             return false;
 #else
             var format = IsLinearColorSpace() ? GraphicsFormat.R8G8B8A8_SRGB : GraphicsFormat.R8G8B8A8_UNorm;
-            return Application.isPlaying && !Application.isBatchMode && SystemInfo.supportsAsyncGPUReadback
+            return !gpuReadbackFaulted && Application.isPlaying && !Application.isBatchMode && SystemInfo.supportsAsyncGPUReadback
                 && SystemInfo.IsFormatSupported(format, FormatUsage.Render)
                 && SystemInfo.IsFormatSupported(format, FormatUsage.ReadPixels)
                 && SystemInfo.IsFormatSupported(GraphicsFormat.R8G8B8A8_UNorm, FormatUsage.Render);
@@ -28,41 +29,47 @@ namespace Pie.Unity.Capabilities
             int width, int height, string destination, string root)
         {
             var capture = new GpuCapture(owner, payload, width, height, destination, root);
-            if (string.IsNullOrWhiteSpace(payload.cameraName) && payload.includeUI)
+            // Every GPU submission gets a main-thread supervisor. Besides EOF
+            // scheduling and queued cancellation, it reclaims a submitted capture
+            // whose deadline expired without a readback callback.
+            var go = new GameObject("Pie screenshot readback") { hideFlags = HideFlags.HideAndDontSave };
+            try
             {
-                // A screenshot-specific owner, not the bridge, drives EOF and
-                // queued cancellation without requiring any poll RPCs.
-                var go = new GameObject("Pie screenshot readback") { hideFlags = HideFlags.HideAndDontSave };
-                try
-                {
-                    global::UnityEngine.Object.DontDestroyOnLoad(go);
-                    go.AddComponent<ScreenshotPump>().Queue(capture);
-                }
-                catch { global::UnityEngine.Object.Destroy(go); capture.AbortQueued(); throw; }
+                global::UnityEngine.Object.DontDestroyOnLoad(go);
+                var pump = go.AddComponent<ScreenshotPump>();
+                var waitForEndOfFrame = string.IsNullOrWhiteSpace(payload.cameraName) && payload.includeUI;
+                pump.Queue(capture, waitForEndOfFrame);
+                if (!waitForEndOfFrame) capture.Submit(); // Explicit cameras retain fresh Render semantics.
             }
-            else capture.Submit(); // Explicit cameras retain fresh Render semantics.
+            catch { global::UnityEngine.Object.Destroy(go); capture.AbortQueued(); throw; }
         }
 
         private sealed class ScreenshotPump : MonoBehaviour
         {
             private GpuCapture capture;
-            internal void Queue(GpuCapture value) { capture = value; StartCoroutine(EndOfFrame()); }
+            internal void Queue(GpuCapture value, bool waitForEndOfFrame)
+            {
+                capture = value;
+                if (waitForEndOfFrame) StartCoroutine(EndOfFrame());
+            }
             private IEnumerator EndOfFrame()
             {
                 yield return new WaitForEndOfFrame();
-                var value = capture;
-                capture = null; // Callback state, not this component, owns submitted work.
-                try { value?.Submit(); }
-                finally { global::UnityEngine.Object.Destroy(gameObject); }
+                capture?.Submit(); // Keep supervising until callback/terminal cleanup.
             }
             private void Update()
             {
-                if (capture != null && !capture.Owner.Pending)
+                if (capture == null) return;
+                capture.PollQuarantined();
+                if (capture.IsRetired)
                 {
-                    capture.AbortQueued(); capture = null;
+                    capture = null;
                     StopAllCoroutines();
                     global::UnityEngine.Object.Destroy(gameObject);
+                    return;
                 }
+                if (capture.Owner.Pending || !capture.TerminalSupervisionDue) return;
+                capture.RetireTerminal();
             }
             private void OnDestroy() { capture?.AbortQueued(); capture = null; }
         }
@@ -74,7 +81,12 @@ namespace Pie.Unity.Capabilities
             private readonly int width, height;
             private readonly string destination, root;
             private RenderTexture source, bounce;
-            private bool submitted, completed, flipRows;
+            private AsyncGPUReadbackRequest request;
+            private DateTime submittedAtUtc;
+            private bool submitted, completed, quarantined, flipRows;
+            internal bool IsRetired => completed && !quarantined;
+            internal bool TerminalSupervisionDue => !submitted || Owner.Job.Read().Status == "timed_out"
+                || (DateTime.UtcNow - submittedAtUtc).TotalMilliseconds >= Owner.DeadlineMs;
             internal GpuCapture(PieScreenshotJobs.CaptureOwner owner, ScreenshotPayload payload,
                 int width, int height, string destination, string root)
             { Owner = owner; this.payload = payload; this.width = width; this.height = height; this.destination = destination; this.root = root; }
@@ -84,6 +96,36 @@ namespace Pie.Unity.Capabilities
                 if (submitted || completed) return;
                 completed = true;
                 Owner.Fail(new InvalidOperationException("Screenshot end-of-frame owner stopped."));
+            }
+            internal void RetireTerminal()
+            {
+                if (completed) return;
+                if (!submitted) { AbortQueued(); return; }
+                try { request.Update(); } catch { /* Unknown native state stays quarantined. */ }
+                if (request.done)
+                {
+                    // Only native completion makes temporary-RT release safe.
+                    completed = true;
+                    try { Cleanup(); }
+                    finally { Owner.Release(); }
+                    return;
+                }
+                // The GPU still owns these RTs. Quarantine instead of returning
+                // them to the pool, release only the logical job slot, and disable
+                // future GPU submissions so later screenshots use the CPU path.
+                // At most one failed native request is retained this way.
+                quarantined = true;
+                completed = true;
+                gpuReadbackFaulted = true;
+                Owner.Release();
+            }
+            internal void PollQuarantined()
+            {
+                if (!quarantined) return;
+                try { request.Update(); } catch { return; }
+                if (!request.done) return;
+                Cleanup();
+                quarantined = false;
             }
             private static RenderTexture Allocate(int w, int h, int depth, bool srgb)
             {
@@ -180,7 +222,8 @@ namespace Pie.Unity.Capabilities
                     try
                     {
                         submitted = true;
-                        AsyncGPUReadback.Request(bounce, 0, Complete);
+                        submittedAtUtc = DateTime.UtcNow;
+                        request = AsyncGPUReadback.Request(bounce, 0, Complete);
                     }
                     catch (Exception ex)
                     {

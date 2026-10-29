@@ -195,7 +195,7 @@ namespace Pie
             }
 
             var wavBytes = PieWavEncoder.Encode(samples, clip.channels, clip.frequency);
-            UnityEngine.Debug.Log($"[PieVoice] encoded {wavBytes.Length} bytes ({durationSeconds:F1}s), uploading");
+            PieDiagnostics.Verbose($"[PieVoice] encoded {wavBytes.Length} bytes ({durationSeconds:F1}s), uploading");
             _state = RecordingState.Uploading;
             PieVoice.UploadBytes(
                 _request,
@@ -234,7 +234,7 @@ namespace Pie
             if (Interlocked.Exchange(ref _terminal, 1) != 0)
                 return;
 
-            UnityEngine.Debug.Log($"[PieVoice] complete ok={result?.Ok} err={result?.ErrorCode} msg={result?.ErrorMessage}");
+            PieDiagnostics.Verbose($"[PieVoice] complete ok={result?.Ok} err={result?.ErrorCode} msg={result?.ErrorMessage}");
 
             PieVoiceRuntimePump.Untrack(this);
             if (result != null && result.Ok)

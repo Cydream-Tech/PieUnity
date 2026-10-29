@@ -58,6 +58,7 @@ namespace Pie.Unity.Capabilities
             private int handedOff;
             internal CaptureOwner(PieScreenshotJobs manager, Job job) { this.manager = manager; Job = job; }
             internal bool Pending => ReferenceEquals(Job.Read(), Job.Pending);
+            internal int DeadlineMs => manager.deadlineMs;
             internal void Submit(Func<Output> work)
             {
                 if (Interlocked.Exchange(ref handedOff, 1) != 0) return;

@@ -172,7 +172,7 @@ namespace Pie
             CancellationToken cancellationToken,
             Action<PieVoiceResult> callback)
         {
-            UnityEngine.Debug.Log($"[PieVoice] upload start {audioBytes?.Length ?? 0} bytes -> {BuildUploadLogUrl(options)}");
+            PieDiagnostics.Verbose($"[PieVoice] upload start {audioBytes?.Length ?? 0} bytes -> {BuildUploadLogUrl(options)}");
             Task.Run(async () =>
             {
                 try
