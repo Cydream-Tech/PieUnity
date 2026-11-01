@@ -139,6 +139,40 @@ namespace Pie
                 return InvokeMethod(request.method, request.argsJson ?? "{}", "pie.dev_rpc");
             }
 
+            /// <summary>
+            /// Dispatch ONLY against the legacy handler table, never against
+            /// PieUnityCapabilityRegistry. Manifest-backed registry wrappers that
+            /// forward to a PieDevRpc method MUST use this entry point: the
+            /// registry-aware InvokeMethod re-enters the registry dispatch for the
+            /// same method name, so a wrapper that calls InvokeMethod re-invokes
+            /// itself and overflows the native stack (observed live: perf.* calls
+            /// crashed the editor with EXC_BAD_ACCESS excessive recursion).
+            /// </summary>
+            public static string InvokeLegacyMethod(string method, string argsJson = "{}", string origin = null)
+            {
+                method = method ?? "";
+
+                if (string.IsNullOrWhiteSpace(method))
+                    return PieDevRpcResponse.Failure(method, "RPC method is required.");
+
+                if (!Methods.TryGetValue(method, out var handler))
+                {
+                    PieDiagnostics.Warning($"[PieDevRpc] RPC method not found{FormatOrigin(origin)}: {method}");
+                    return PieDevRpcResponse.Failure(method, $"RPC method not found: {method}");
+                }
+
+                try
+                {
+                    var resultJson = handler(argsJson ?? "{}");
+                    return PieDevRpcResponse.Success(method, resultJson);
+                }
+                catch (Exception ex)
+                {
+                    PieDiagnostics.Warning($"[PieDevRpc] {method} failed{FormatOrigin(origin)}: {ex.Message}");
+                    return PieDevRpcResponse.Failure(method, ex.Message);
+                }
+            }
+
             public static string InvokeMethod(string method, string argsJson = "{}", string origin = null)
             {
                 method = method ?? "";
@@ -507,8 +541,10 @@ namespace Pie
                         var toolName = Uri.UnescapeDataString(path.Substring("/tool/".Length));
                         var toolBody = ReadRequestBody(request);
                         var toolResponse = string.Equals(toolName, "unity_script_run", StringComparison.Ordinal)
-                            ? HandleUnityScriptRunTool(toolBody, _cts != null ? _cts.Token : CancellationToken.None)
-                            : PieDevRpcDispatcher.InvokeSync(() => BuildCapabilityEnvelope("tool", toolName, toolBody));
+                            ? HandleScriptTaskTool("unity_script_run", argsJson => PieUnityCapabilitiesBootstrap.StartUnityScriptRun(argsJson), toolBody, _cts != null ? _cts.Token : CancellationToken.None)
+                            : string.Equals(toolName, "game_use_run", StringComparison.Ordinal)
+                                ? HandleScriptTaskTool("game_use_run", argsJson => PieUnityCapabilitiesBootstrap.StartGameUseRun(argsJson), toolBody, _cts != null ? _cts.Token : CancellationToken.None)
+                                : PieDevRpcDispatcher.InvokeSync(() => BuildCapabilityEnvelope("tool", toolName, toolBody));
                         WriteJson(context.Response, 200, toolResponse);
                         return;
                     }
@@ -723,13 +759,17 @@ namespace Pie
                 return BuildEnvelope(kind, name, ok, resultJson, ok ? "" : (error ?? "Unknown error"));
             }
 
-            private static string HandleUnityScriptRunTool(string argsJson, CancellationToken token)
+            // Shared long-poll path for script-task-backed tools (unity_script_run,
+            // game_use_run): start on the main thread, poll status, stop on
+            // completion/cancellation. game_use_run rides the same channel so Chat
+            // and RPC clients observe identical frame gates and cancellation.
+            private static string HandleScriptTaskTool(string toolName, Func<string, string> start, string argsJson, CancellationToken token)
             {
                 var taskId = "";
                 try
                 {
                     var statusJson = PieDevRpcDispatcher.InvokeSync(
-                        () => PieUnityCapabilitiesBootstrap.StartUnityScriptRun(argsJson),
+                        () => start(argsJson),
                         ScriptRunMainThreadTimeoutMs);
 
                     var watchdog = System.Diagnostics.Stopwatch.StartNew();
@@ -748,13 +788,13 @@ namespace Pie
                         {
                             var ok = string.Equals(status.status, "completed", StringComparison.Ordinal);
                             var error = ok ? "" : (status.errorMessage ?? status.status ?? "Unity script run failed.");
-                            return BuildEnvelopeOnMainThread("tool", "unity_script_run", ok, statusJson, error);
+                            return BuildEnvelopeOnMainThread("tool", toolName, ok, statusJson, error);
                         }
 
                         if (token.IsCancellationRequested)
                         {
                             TryCancelUnityScriptRun(taskId, "Dev RPC server is stopping.");
-                            return BuildScriptRunFailure(taskId, "cancelled", "CANCELLED", "Dev RPC server is stopping.");
+                            return BuildScriptRunFailure(toolName, taskId, "cancelled", "CANCELLED", "Dev RPC server is stopping.");
                         }
 
                         Thread.Sleep(ScriptRunPollIntervalMs);
@@ -766,16 +806,16 @@ namespace Pie
                 catch (Exception ex)
                 {
                     TryCancelUnityScriptRun(taskId, ex.Message);
-                    return BuildScriptRunFailure(taskId, "failed", ex is TimeoutException ? "HOST_TIMEOUT" : "HOST_ERROR", ex.Message);
+                    return BuildScriptRunFailure(toolName, taskId, "failed", ex is TimeoutException ? "HOST_TIMEOUT" : "HOST_ERROR", ex.Message);
                 }
             }
 
             // Transport terminal state must not call Unity, PuerTS, or the main-thread dispatcher.
-            private static string BuildScriptRunFailure(string taskId, string status, string code, string message)
+            private static string BuildScriptRunFailure(string toolName, string taskId, string status, string code, string message)
             {
                 var result = "{\"taskId\":\"" + EscapeJson(taskId ?? "") + "\",\"done\":true,\"status\":\"" + status
                     + "\",\"errorCode\":\"" + code + "\",\"errorMessage\":\"" + EscapeJson(message ?? "") + "\",\"executionStateUnknown\":true}";
-                return "{\"ok\":false,\"kind\":\"tool\",\"name\":\"unity_script_run\",\"result\":\"" + EscapeJson(result)
+                return "{\"ok\":false,\"kind\":\"tool\",\"name\":\"" + EscapeJson(toolName ?? "") + "\",\"result\":\"" + EscapeJson(result)
                     + "\",\"errorCode\":\"" + code + "\",\"error\":\"" + EscapeJson(message ?? "") + "\"}";
             }
 
@@ -1175,6 +1215,15 @@ namespace Pie
                     new PieUnityParameterDescriptor[0],
                     _ => BuildRpcListJson());
 
+                // The live PieBridge owns tick-probe data and registers legacy
+                // PieDevRpc methods. Mirror those methods in the manifest-backed
+                // registry as well: HTTP clients (pie-unity-rpc) select candidates by
+                // manifest capability before issuing /rpc/<method>, so legacy-only
+                // registrations are unreachable and surface as the historical
+                // "Capability not found: perf.*" retry storms. Dispatch stays in
+                // PieBridge/PieDevRpc; these wrappers only forward method/name and args.
+                RegisterTickPerformanceCapabilities();
+
                 PieUnityCapabilityRegistry.RegisterTool(
                     "unity_project_inspect",
                     "unity",
@@ -1292,6 +1341,96 @@ namespace Pie
 
                 RegisterScriptCapabilities();
                 PieBehaviorTreeBootstrap.RegisterCapabilities(isEditor);
+            }
+
+            private static void RegisterTickPerformanceCapabilities()
+            {
+                // Registry handlers must return the RAW result JSON of the wrapped
+                // legacy method, not its {ok,method,resultJson,error} envelope: the
+                // registry/server layers treat any returned string as success, so a
+                // failing or missing legacy handler would otherwise hide behind an
+                // outer success. Throw on envelope failure so dispatch records a
+                // handler failure (handlerInvoked=true) instead of falling through
+                // or re-running side effects.
+                Func<string, string> forward(string method)
+                {
+                    return argsJson =>
+                    {
+                        var envelopeJson = PieDevRpc.InvokeLegacyMethod(method, argsJson, "perf.capability");
+                        var envelope = JsonUtility.FromJson<PieDevRpcEnvelope>(envelopeJson);
+                        if (envelope == null || !envelope.ok)
+                            throw new Exception(string.IsNullOrEmpty(envelope?.error) ? $"{method} failed" : envelope.error);
+                        return string.IsNullOrEmpty(envelope.resultJson) ? "null" : envelope.resultJson;
+                    };
+                }
+
+                PieUnityCapabilityRegistry.RegisterRpc(
+                    "perf.set_enabled",
+                    "perf",
+                    "Enable or disable Pie tick performance probes on the live bridge owner.",
+                    "editor+runtime",
+                    false,
+                    false,
+                    null,
+                    new[] { new PieUnityParameterDescriptor { name = "enabled", type = "boolean", required = true } },
+                    forward("perf.set_enabled"),
+                    requiresMainThread: true);
+
+                PieUnityCapabilityRegistry.RegisterRpc(
+                    "perf.get_report",
+                    "perf",
+                    "Read the live bridge owner's tick performance report.",
+                    "editor+runtime",
+                    true,
+                    false,
+                    null,
+                    new PieUnityParameterDescriptor[0],
+                    forward("perf.get_report"),
+                    requiresMainThread: true);
+
+                PieUnityCapabilityRegistry.RegisterRpc(
+                    "perf.frames.get_report",
+                    "perf",
+                    "Read the bounded native-frame performance report.",
+                    "editor+runtime",
+                    true,
+                    false,
+                    null,
+                    new PieUnityParameterDescriptor[0],
+                    forward("perf.frames.get_report"),
+                    requiresMainThread: true);
+
+                PieUnityCapabilityRegistry.RegisterRpc(
+                    "perf.frames.get_summary",
+                    "perf",
+                    "Read the bounded native-frame performance summary.",
+                    "editor+runtime",
+                    true,
+                    false,
+                    null,
+                    new PieUnityParameterDescriptor[0],
+                    forward("perf.frames.get_summary"),
+                    requiresMainThread: true);
+
+                PieUnityCapabilityRegistry.RegisterRpc(
+                    "perf.reset",
+                    "perf",
+                    "Reset tick performance probes on the live bridge owner.",
+                    "editor+runtime",
+                    false,
+                    false,
+                    null,
+                    new PieUnityParameterDescriptor[0],
+                    forward("perf.reset"),
+                    requiresMainThread: true);
+            }
+
+            [Serializable]
+            private sealed class PieDevRpcEnvelope
+            {
+                public bool ok;
+                public string resultJson;
+                public string error;
             }
 
             private static void RegisterRuntimeCapabilities(PieRunner runner, string projectPath)
@@ -1523,6 +1662,29 @@ namespace Pie
                     },
                     InvokeScriptHostRunUnavailable,
                     capabilityKind: "script");
+                PieUnityCapabilityRegistry.RegisterTool(
+                    "game_use_run",
+                    "unity.script",
+                    "Run a game-use episode: play the live game toward a goal with a researcher-authored harness (goal/observe/options/status) and a decider (scripted policy or Jev). Returns the episode outcome, evidence and the decision trail.",
+                    "editor+runtime",
+                    false,
+                    false,
+                    null,
+                    new[]
+                    {
+                        new PieUnityParameterDescriptor { name = "harnessSource", type = "string", required = true },
+                        new PieUnityParameterDescriptor { name = "readPath", type = "string", required = true },
+                        new PieUnityParameterDescriptor { name = "resetPath", type = "string", required = false },
+                        new PieUnityParameterDescriptor { name = "runInBackground", type = "boolean", required = false },
+                        new PieUnityParameterDescriptor { name = "policySource", type = "string", required = false },
+                        new PieUnityParameterDescriptor { name = "jev", type = "object", required = false },
+                        new PieUnityParameterDescriptor { name = "maxSeconds", type = "number", required = false },
+                        new PieUnityParameterDescriptor { name = "totalTimeoutMs", type = "number", required = false },
+                        new PieUnityParameterDescriptor { name = "perStepTimeoutMs", type = "number", required = false },
+                        new PieUnityParameterDescriptor { name = "maxFrames", type = "number", required = false },
+                    },
+                    InvokeGameUseRunUnavailable,
+                    capabilityKind: "script");
             }
 
             private static ScriptTaskPayload ReadScriptTaskPayload(string argsJson)
@@ -1557,9 +1719,19 @@ namespace Pie
                 throw new InvalidOperationException("unity_script_run is asynchronous and must be executed through the dev RPC server or the embedded JS tool surface.");
             }
 
+            private static string InvokeGameUseRunUnavailable(string argsJson)
+            {
+                throw new InvalidOperationException("game_use_run is asynchronous and must be executed through the dev RPC server or the embedded JS tool surface.");
+            }
+
             public static string StartUnityScriptRun(string argsJson)
             {
                 return InvokeScriptHost("run_start", argsJson);
+            }
+
+            public static string StartGameUseRun(string argsJson)
+            {
+                return InvokeScriptHost("game_use_start", argsJson);
             }
 
             public static string GetUnityScriptRunStatus(string taskId)
@@ -1846,7 +2018,7 @@ namespace Pie
     // Merged from Runtime/UnityCapabilities/PieUnityCapabilitiesConstants.cs
     public static class PieUnityCapabilitiesConstants
         {
-            public const string Version = "0.1.48";
+            public const string Version = "0.1.49";
             public const string ManifestSchemaVersion = "2";
             public const string SkillProtocolVersion = "pie-unity-rpc/2";
             public const int DefaultPort = 8091;

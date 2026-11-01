@@ -81,6 +81,40 @@ namespace Pie
             return InvokeMethod(request.method, request.argsJson ?? "{}", "pie.dev_rpc");
         }
 
+        /// <summary>
+        /// Dispatch ONLY against the legacy handler table, never against
+        /// PieUnityCapabilityRegistry. Manifest-backed registry wrappers that
+        /// forward to a PieDevRpc method MUST use this entry point: the
+        /// registry-aware InvokeMethod re-enters the registry dispatch for the
+        /// same method name, so a wrapper that calls InvokeMethod re-invokes
+        /// itself and overflows the native stack (observed live: perf.* calls
+        /// crashed the editor with EXC_BAD_ACCESS excessive recursion).
+        /// </summary>
+        public static string InvokeLegacyMethod(string method, string argsJson = "{}", string origin = null)
+        {
+            method = method ?? "";
+
+            if (string.IsNullOrWhiteSpace(method))
+                return PieDevRpcResponse.Failure(method, "RPC method is required.");
+
+            if (!Methods.TryGetValue(method, out var handler))
+            {
+                PieDiagnostics.Warning($"[PieDevRpc] RPC method not found{FormatOrigin(origin)}: {method}");
+                return PieDevRpcResponse.Failure(method, $"RPC method not found: {method}");
+            }
+
+            try
+            {
+                var resultJson = handler(argsJson ?? "{}");
+                return PieDevRpcResponse.Success(method, resultJson);
+            }
+            catch (Exception ex)
+            {
+                PieDiagnostics.Warning($"[PieDevRpc] {method} failed{FormatOrigin(origin)}: {ex.Message}");
+                return PieDevRpcResponse.Failure(method, ex.Message);
+            }
+        }
+
         public static string InvokeMethod(string method, string argsJson = "{}", string origin = null)
         {
             method = method ?? "";

@@ -181,6 +181,15 @@ namespace Pie
                 new PieUnityParameterDescriptor[0],
                 _ => BuildRpcListJson());
 
+            // The live PieBridge owns tick-probe data and registers legacy
+            // PieDevRpc methods. Mirror those methods in the manifest-backed
+            // registry as well: HTTP clients (pie-unity-rpc) select candidates by
+            // manifest capability before issuing /rpc/<method>, so legacy-only
+            // registrations are unreachable and surface as the historical
+            // "Capability not found: perf.*" retry storms. Dispatch stays in
+            // PieBridge/PieDevRpc; these wrappers only forward method/name and args.
+            RegisterTickPerformanceCapabilities();
+
             PieUnityCapabilityRegistry.RegisterTool(
                 "unity_project_inspect",
                 "unity",
@@ -298,6 +307,96 @@ namespace Pie
 
             RegisterScriptCapabilities();
             PieBehaviorTreeBootstrap.RegisterCapabilities(isEditor);
+        }
+
+        private static void RegisterTickPerformanceCapabilities()
+        {
+            // Registry handlers must return the RAW result JSON of the wrapped
+            // legacy method, not its {ok,method,resultJson,error} envelope: the
+            // registry/server layers treat any returned string as success, so a
+            // failing or missing legacy handler would otherwise hide behind an
+            // outer success. Throw on envelope failure so dispatch records a
+            // handler failure (handlerInvoked=true) instead of falling through
+            // or re-running side effects.
+            Func<string, string> forward(string method)
+            {
+                return argsJson =>
+                {
+                    var envelopeJson = PieDevRpc.InvokeLegacyMethod(method, argsJson, "perf.capability");
+                    var envelope = JsonUtility.FromJson<PieDevRpcEnvelope>(envelopeJson);
+                    if (envelope == null || !envelope.ok)
+                        throw new Exception(string.IsNullOrEmpty(envelope?.error) ? $"{method} failed" : envelope.error);
+                    return string.IsNullOrEmpty(envelope.resultJson) ? "null" : envelope.resultJson;
+                };
+            }
+
+            PieUnityCapabilityRegistry.RegisterRpc(
+                "perf.set_enabled",
+                "perf",
+                "Enable or disable Pie tick performance probes on the live bridge owner.",
+                "editor+runtime",
+                false,
+                false,
+                null,
+                new[] { new PieUnityParameterDescriptor { name = "enabled", type = "boolean", required = true } },
+                forward("perf.set_enabled"),
+                requiresMainThread: true);
+
+            PieUnityCapabilityRegistry.RegisterRpc(
+                "perf.get_report",
+                "perf",
+                "Read the live bridge owner's tick performance report.",
+                "editor+runtime",
+                true,
+                false,
+                null,
+                new PieUnityParameterDescriptor[0],
+                forward("perf.get_report"),
+                requiresMainThread: true);
+
+            PieUnityCapabilityRegistry.RegisterRpc(
+                "perf.frames.get_report",
+                "perf",
+                "Read the bounded native-frame performance report.",
+                "editor+runtime",
+                true,
+                false,
+                null,
+                new PieUnityParameterDescriptor[0],
+                forward("perf.frames.get_report"),
+                requiresMainThread: true);
+
+            PieUnityCapabilityRegistry.RegisterRpc(
+                "perf.frames.get_summary",
+                "perf",
+                "Read the bounded native-frame performance summary.",
+                "editor+runtime",
+                true,
+                false,
+                null,
+                new PieUnityParameterDescriptor[0],
+                forward("perf.frames.get_summary"),
+                requiresMainThread: true);
+
+            PieUnityCapabilityRegistry.RegisterRpc(
+                "perf.reset",
+                "perf",
+                "Reset tick performance probes on the live bridge owner.",
+                "editor+runtime",
+                false,
+                false,
+                null,
+                new PieUnityParameterDescriptor[0],
+                forward("perf.reset"),
+                requiresMainThread: true);
+        }
+
+        [Serializable]
+        private sealed class PieDevRpcEnvelope
+        {
+            public bool ok;
+            public string resultJson;
+            public string error;
         }
 
         private static void RegisterRuntimeCapabilities(PieRunner runner, string projectPath)

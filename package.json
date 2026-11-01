@@ -1,6 +1,6 @@
 {
   "name": "com.pie.agent",
-  "version": "0.1.48",
+  "version": "0.1.49",
   "displayName": "Pie AI Agent",
   "description": "Platform for Intelligent Engineering - runtime-first AI agent framework for Unity.",
   "unity": "2022.3",
@@ -18,13 +18,19 @@
   "dependencies": {
     "com.tencent.puerts.core": "2.2.2",
     "com.unity.modules.ai": "1.0.0",
-    "com.unity.modules.audio": "1.0.0"
+    "com.unity.modules.audio": "1.0.0",
+    "com.unity.inputsystem": "1.11.2"
   },
   "samples": [
     {
       "displayName": "Extension Demo",
       "description": "Demonstrates TS-first project extensions, host bridge calls, and automatic sample extension installation.",
       "path": "Samples~/Extension Demo"
+    },
+    {
+      "displayName": "Game Use Harness",
+      "description": "The input-only reference harness for game_use_run: facts pipeline, option space and status rule for Three Sparks; adapt the shape to your own game.",
+      "path": "Samples~/Game Use Harness"
     }
   ],
   "repository": {

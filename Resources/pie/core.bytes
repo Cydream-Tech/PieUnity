@@ -5651,8 +5651,15 @@ var _PieAgent = (() => {
   }
   var nodeHttps = null;
   var nodeHttp = null;
+  var nodeTls = null;
   var nodeUrl = null;
   var nodeStringDecoder = null;
+  function getNodeTls() {
+    if (!nodeTls) {
+      nodeTls = require3("tls");
+    }
+    return nodeTls;
+  }
   function getNodeHttps() {
     if (!nodeHttps) {
       nodeHttps = require3("https");
@@ -5679,6 +5686,7 @@ var _PieAgent = (() => {
   }
   var globalHttpsAgent = null;
   var globalHttpAgent = null;
+  var globalProxyTunnels = /* @__PURE__ */ new Map();
   var agentStats = {
     httpsRequests: 0,
     httpsReusedConnections: 0,
@@ -5721,6 +5729,52 @@ var _PieAgent = (() => {
     }
     return globalHttpAgent;
   }
+  function getProxyTunnelAgent(targetHost) {
+    const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.ALL_PROXY || process.env.all_proxy || "";
+    if (!proxy || !/^https?:\/\//i.test(proxy)) return null;
+    const noProxy = (process.env.NO_PROXY || process.env.no_proxy || "").split(",").map((s) => s.trim().toLowerCase());
+    if (noProxy.some((entry) => entry && (targetHost.toLowerCase() === entry || targetHost.toLowerCase().endsWith(`.${entry}`)))) {
+      return null;
+    }
+    let agent2 = globalProxyTunnels.get(proxy);
+    if (agent2) return agent2;
+    const https = getNodeHttps();
+    const parsed = new (getNodeUrl()).URL(proxy);
+    const createConnection = (options, callback) => {
+      const http = getNodeHttp();
+      const connect = http.request({
+        host: parsed.hostname,
+        port: Number(parsed.port) || 80,
+        method: "CONNECT",
+        path: `${options.host}:${options.port}`,
+        timeout: 15e3,
+        headers: parsed.username ? { "proxy-authorization": `Basic ${Buffer.from(`${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`).toString("base64")}` } : {}
+      });
+      connect.on("connect", (res, socket) => {
+        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+          callback(new Error(`proxy CONNECT failed with ${res.statusCode}`));
+          return;
+        }
+        const tls = getNodeTls();
+        const tlsSocket = tls.connect(
+          { socket, servername: options.servername || options.host },
+          () => callback(null, tlsSocket)
+        );
+        tlsSocket.once("error", (error) => callback(error));
+      });
+      connect.on("timeout", () => connect.destroy(new Error("proxy CONNECT timed out")));
+      connect.on("error", (error) => callback(error));
+      connect.end();
+    };
+    agent2 = new https.Agent({
+      keepAlive: true,
+      maxSockets: 10
+    });
+    agent2.createConnection = createConnection;
+    globalProxyTunnels.set(proxy, agent2);
+    logHttp("INFO", `Proxy tunnel agent created for ${parsed.host} (HTTPS_PROXY)`);
+    return agent2;
+  }
   var NodeHttpClient = class {
     /** The Node client never re-sends a request: one `request()` call is one submission. */
     transportCapabilities = { singleAttempt: true };
@@ -5755,7 +5809,7 @@ var _PieAgent = (() => {
         const parsedUrl = new (getNodeUrl()).URL(url);
         const isHttps = parsedUrl.protocol === "https:";
         const lib = isHttps ? getNodeHttps() : getNodeHttp();
-        const agent2 = isHttps ? getHttpsAgent() : getHttpAgent();
+        const agent2 = (isHttps ? getProxyTunnelAgent(parsedUrl.hostname) : null) ?? (isHttps ? getHttpsAgent() : getHttpAgent());
         if (isHttps) {
           agentStats.httpsRequests++;
         } else {
@@ -6080,6 +6134,13 @@ var _PieAgent = (() => {
       });
     }
   };
+  function scheduleNextTick(callback, _delayMs) {
+    if (typeof setTimeout === "function") {
+      setTimeout(callback, _delayMs);
+      return;
+    }
+    Promise.resolve().then(callback);
+  }
   var PuerTSHttpClient = class {
     /** No internal re-send: each call starts exactly one bridge request. */
     transportCapabilities = { singleAttempt: true };
@@ -6088,7 +6149,14 @@ var _PieAgent = (() => {
         url: url.slice(0, 100),
         method: options.method || "GET"
       });
-      if (typeof CS !== "undefined" && CS?.AgentBridge?.HttpPostAsyncStart && CS?.AgentBridge?.HttpPostAsyncPoll) {
+      void scheduleNextTick;
+      let legacyBridge = false;
+      try {
+        legacyBridge = typeof CS !== "undefined" && !!CS?.AgentBridge && typeof CS.AgentBridge.HttpPostAsyncStart === "function";
+      } catch {
+        legacyBridge = false;
+      }
+      if (legacyBridge) {
         const method2 = options.method || "GET";
         const body2 = options.body || "";
         const auth = options.headers?.Authorization || options.headers?.authorization || "";
@@ -6158,9 +6226,42 @@ var _PieAgent = (() => {
           request.SetRequestHeader(key, value);
         }
         if (body && ["POST", "PUT", "PATCH"].includes(method.toUpperCase())) {
-          const encoder = new TextEncoder();
-          const bodyData = encoder.encode(body);
-          request.uploadHandler = new UnityEngine.Networking.UploadHandlerRaw(bodyData);
+          const encodeUtf84 = (text) => {
+            const out = [];
+            for (let i2 = 0; i2 < text.length; i2++) {
+              let code = text.charCodeAt(i2);
+              if (code < 128) out.push(code);
+              else {
+                if (code >= 55296 && code <= 56319 && i2 + 1 < text.length) {
+                  const low = text.charCodeAt(i2 + 1);
+                  if (low >= 56320 && low <= 57343) {
+                    code = 65536 + (code - 55296 << 10) + (low - 56320);
+                    i2++;
+                  }
+                }
+                if (code < 2048) out.push(192 | code >> 6, 128 | code & 63);
+                else if (code < 65536) out.push(224 | code >> 12, 128 | code >> 6 & 63, 128 | code & 63);
+                else out.push(240 | code >> 18, 128 | code >> 12 & 63, 128 | code >> 6 & 63, 128 | code & 63);
+              }
+            }
+            return new Uint8Array(out);
+          };
+          const base64 = (bytes) => {
+            let binary = "";
+            const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            for (let i2 = 0; i2 < bytes.length; i2 += 3) {
+              const b0 = bytes[i2], b1 = bytes[i2 + 1], b2 = bytes[i2 + 2];
+              binary += table[b0 >> 2] + table[(b0 & 3) << 4 | (b1 ?? 0) >> 4];
+              if (b1 === void 0) break;
+              binary += table[(b1 & 15) << 2 | (b2 ?? 0) >> 6];
+              if (b2 === void 0) break;
+              binary += table[b2 & 63];
+            }
+            const pad = bytes.length % 3;
+            return binary + (pad === 1 ? "==" : pad === 2 ? "=" : "");
+          };
+          const bodyBytes = CS.System.Convert.FromBase64String(base64(encodeUtf84(body)));
+          request.uploadHandler = new UnityEngine.Networking.UploadHandlerRaw(bodyBytes);
         }
         request.downloadHandler = new UnityEngine.Networking.DownloadHandlerBuffer();
         let aborted2 = false;
@@ -6173,6 +6274,12 @@ var _PieAgent = (() => {
           options.signal.addEventListener("abort", onAbort, { once: true });
         }
         const asyncOp = request.SendWebRequest();
+        const completed = new Promise((resolveCompleted) => {
+          try {
+            asyncOp.add_completed(() => resolveCompleted());
+          } catch {
+          }
+        });
         const checkComplete = () => {
           if (aborted2) return;
           if (asyncOp.isDone) {
@@ -6218,26 +6325,10 @@ var _PieAgent = (() => {
               }
             });
           } else {
-            if (typeof setTimeout !== "undefined") {
-              setTimeout(checkComplete, 10);
-            } else {
-              const startWait = Date.now();
-              const wait2 = () => {
-                if (!asyncOp.isDone && Date.now() - startWait < 3e4) {
-                  if (typeof setImmediate !== "undefined") {
-                    setImmediate(wait2);
-                  } else {
-                    checkComplete();
-                  }
-                } else {
-                  checkComplete();
-                }
-              };
-              wait2();
-            }
+            void completed.then(() => checkComplete());
           }
         };
-        checkComplete();
+        scheduleNextTick(checkComplete, 0);
       });
     }
   };
@@ -26297,12 +26388,18 @@ ${summary2}`;
     }
   }
   function normalizeStep(step, index) {
-    return {
+    const normalized = {
       id: Number.isInteger(step.id) && step.id > 0 ? step.id : index + 1,
       title: typeof step.title === "string" && step.title.trim().length > 0 ? step.title.trim() : `Step ${index + 1}`,
       description: typeof step.description === "string" ? step.description : "",
       status: normalizeTodoStatus(String(step.status || "not-started"))
     };
+    if (typeof step.verify === "string" && step.verify.trim()) normalized.verify = step.verify.trim();
+    if (Array.isArray(step.files) && step.files.length > 0) {
+      const files = step.files.map((file) => String(file ?? "").trim()).filter(Boolean);
+      if (files.length > 0) normalized.files = files;
+    }
+    return normalized;
   }
   function normalizeSteps(steps) {
     return (Array.isArray(steps) ? steps : []).map((step, index) => ({
@@ -26347,7 +26444,11 @@ ${summary2}`;
   function cloneExecutionState(state) {
     return {
       ...state,
-      steps: state.steps.map((step) => ({ ...step })),
+      // Steps carry a nested files array (advisory scope): a shallow step
+      // clone would let snapshot consumers mutate store-internal state. Only
+      // materialize the key when the source has one — spreading
+      // files: undefined would add a key the source never had.
+      steps: state.steps.map((step) => step.files ? { ...step, files: [...step.files] } : { ...step }),
       loop: state.loop ? { ...state.loop, breakoutCondition: { ...state.loop.breakoutCondition }, successSignal: { ...state.loop.successSignal } } : null
     };
   }
@@ -26459,6 +26560,13 @@ ${summary2}`;
     const lines = ["<system-reminder>", "[Execution]"];
     if (currentStep) {
       lines.push(`Current: ${currentStep.title}`);
+      if (currentStep.verify) {
+        lines.push(`Verify: ${currentStep.verify}`);
+        lines.push("Rule: mark [DONE:n] only with [VERIFIED:n] once the criterion above actually held; on failure stop and report instead.");
+      }
+      if (currentStep.files?.length) {
+        lines.push(`Scope: ${currentStep.files.join(", ")}`);
+      }
     }
     if (nextSteps.length > 0) {
       lines.push(`Next: ${nextSteps.map((step) => step.title).join("; ")}`);
@@ -33192,17 +33300,17 @@ ${diffResult.diff}`);
         pushAll(parts, tail);
         return parts;
       }
-      const { pre, body, post } = m;
+      const { pre, body, post: post2 } = m;
       const p = pre.split(",");
       p[0] = carry + p[0];
       p[p.length - 1] += "{" + body + "}";
-      if (!post.length) {
+      if (!post2.length) {
         pushAll(parts, p);
         return parts;
       }
       carry = p.pop();
       pushAll(parts, p);
-      str = post;
+      str = post2;
     }
   }
   function expand(str, options = {}) {
@@ -40707,6 +40815,496 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
     };
   }
 
+  // ../../node_modules/@toon-format/toon/dist/index.mjs
+  var NULL_LITERAL = "null";
+  var DELIMITERS = {
+    comma: ",",
+    tab: "	",
+    pipe: "|"
+  };
+  var DEFAULT_DELIMITER = DELIMITERS.comma;
+  function escapeString(value) {
+    return value.replace(/\\/g, `\\\\`).replace(/"/g, `\\"`).replace(/\n/g, `\\n`).replace(/\r/g, `\\r`).replace(/\t/g, `\\t`).replace(/[\u0000-\u001F]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  }
+  function isBooleanOrNullLiteral(token) {
+    return token === "true" || token === "false" || token === "null";
+  }
+  function setOwnProperty(target, key, value) {
+    if (key === "__proto__") {
+      Object.defineProperty(target, key, {
+        value,
+        enumerable: true,
+        writable: true,
+        configurable: true
+      });
+      return;
+    }
+    target[key] = value;
+  }
+  var COMMENT_LINE_PATTERN = new RegExp(`(?:^\uFEFF?|\\n) *#`);
+  var RawString = class {
+    constructor(value) {
+      if (COMMENT_LINE_PATTERN.test(value)) throw new TypeError(`Raw string must not contain a line starting with "#": ${JSON.stringify(value)}`);
+      this.value = value;
+    }
+  };
+  function isRawString(value) {
+    return value instanceof RawString;
+  }
+  var SURROGATE_PATTERN = /[\uD800-\uDFFF]/;
+  function normalizeValue(value) {
+    if (value === null) return null;
+    if (isRawString(value)) return value;
+    if (typeof value === "object" && value !== null && "toJSON" in value && typeof value.toJSON === "function") {
+      const next = value.toJSON();
+      if (next !== value) return normalizeValue(next);
+    }
+    if (typeof value === "string") {
+      assertNoLoneSurrogate(value, "string value");
+      return value;
+    }
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") {
+      if (Object.is(value, -0)) return 0;
+      if (!Number.isFinite(value)) return null;
+      return value;
+    }
+    if (typeof value === "bigint") {
+      if (value >= Number.MIN_SAFE_INTEGER && value <= Number.MAX_SAFE_INTEGER) return Number(value);
+      return value.toString();
+    }
+    if (value instanceof Date) return value.toISOString();
+    if (Array.isArray(value)) return value.map(normalizeValue);
+    if (value instanceof Set) return Array.from(value).map(normalizeValue);
+    if (value instanceof Map) return Object.fromEntries(Array.from(value, ([k, v]) => [String(k), normalizeValue(v)]));
+    if (isPlainObject(value)) {
+      const encodedValues = {};
+      for (const key in value) if (Object.hasOwn(value, key)) {
+        assertNoLoneSurrogate(key, "object key");
+        setOwnProperty(encodedValues, key, normalizeValue(value[key]));
+      }
+      return encodedValues;
+    }
+    return null;
+  }
+  function assertNoLoneSurrogate(value, context) {
+    if (!SURROGATE_PATTERN.test(value)) return;
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index);
+      if (code < 55296 || code > 57343) continue;
+      const isHighSurrogate = code <= 56319;
+      const next = value.charCodeAt(index + 1);
+      if (isHighSurrogate && next >= 56320 && next <= 57343) {
+        index++;
+        continue;
+      }
+      throw new TypeError(`Cannot encode ${context} containing an unpaired surrogate U+${code.toString(16).toUpperCase()} at index ${index}`);
+    }
+  }
+  function isJsonPrimitive(value) {
+    return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+  }
+  function isEncodablePrimitive(value) {
+    return isJsonPrimitive(value) || isRawString(value);
+  }
+  function isJsonArray(value) {
+    return Array.isArray(value);
+  }
+  function isJsonObject(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value) && !isRawString(value);
+  }
+  function isEmptyObject(value) {
+    return Object.keys(value).length === 0;
+  }
+  function isPlainObject(value) {
+    if (value === null || typeof value !== "object") return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === null || prototype === Object.prototype;
+  }
+  function isArrayOfPrimitives(value) {
+    return value.length === 0 || value.every((item) => isEncodablePrimitive(item));
+  }
+  function isArrayOfArrays(value) {
+    return value.length === 0 || value.every((item) => isJsonArray(item));
+  }
+  function isArrayOfObjects(value) {
+    return value.length === 0 || value.every((item) => isJsonObject(item));
+  }
+  var NUMERIC_LIKE_PATTERN = /^[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i;
+  function assertValidDelimiter(delimiter) {
+    if (!Object.values(DELIMITERS).includes(delimiter)) throw new TypeError(`Invalid delimiter ${JSON.stringify(delimiter)}. Valid delimiters are: comma (,), tab (\\t), pipe (|)`);
+  }
+  function isValidUnquotedKey(key) {
+    return /^[A-Z_][\w.]*$/i.test(key);
+  }
+  function isSafeUnquoted(value, delimiter = DEFAULT_DELIMITER) {
+    if (!value) return false;
+    if (/^[ \t]|[ \t]$/.test(value)) return false;
+    if (isBooleanOrNullLiteral(value) || isNumericLike(value)) return false;
+    if (value.includes(":")) return false;
+    if (value.includes('"') || value.includes("\\")) return false;
+    if (/[[\]{}]/.test(value)) return false;
+    if (/[\u0000-\u001F]/.test(value)) return false;
+    if (value.includes(delimiter)) return false;
+    if (value.startsWith("-")) return false;
+    if (value.startsWith("#")) return false;
+    return true;
+  }
+  function isNumericLike(value) {
+    return NUMERIC_LIKE_PATTERN.test(value);
+  }
+  function encodePrimitive(value, delimiter) {
+    if (isRawString(value)) return value.value;
+    if (value === null) return NULL_LITERAL;
+    if (typeof value === "boolean") return String(value);
+    if (typeof value === "number") return String(value);
+    return encodeStringLiteral(value, delimiter);
+  }
+  function encodeStringLiteral(value, delimiter = DEFAULT_DELIMITER) {
+    if (isSafeUnquoted(value, delimiter)) return value;
+    return `"${escapeString(value)}"`;
+  }
+  function encodeKey(key) {
+    if (isValidUnquotedKey(key)) return key;
+    return `"${escapeString(key)}"`;
+  }
+  function encodeAndJoinPrimitives(values, delimiter = DEFAULT_DELIMITER) {
+    return values.map((v) => encodePrimitive(v, delimiter)).join(delimiter);
+  }
+  function formatHeader(length, options) {
+    const key = options?.key;
+    const fields = options?.fields;
+    const delimiter = options?.delimiter ?? ",";
+    let header = "";
+    if (key != null) header += encodeKey(key);
+    header += `[${length}${options?.keyed ? ":" : ""}${delimiter !== DEFAULT_DELIMITER ? delimiter : ""}]`;
+    if (fields) header += `{${formatFieldSegment(fields, delimiter)}}`;
+    header += ":";
+    return header;
+  }
+  function formatFieldSegment(fields, delimiter) {
+    return fields.map((field) => encodeKey(field.name) + (field.children ? `{${formatFieldSegment(field.children, delimiter)}}` : "")).join(delimiter);
+  }
+  function extractTabularFields(rows) {
+    if (rows.length === 0) return;
+    const firstKeys = Object.keys(rows[0]);
+    if (firstKeys.length === 0) return;
+    for (const row of rows) {
+      if (Object.keys(row).length !== firstKeys.length) return;
+      for (const key of firstKeys) if (!Object.hasOwn(row, key)) return;
+    }
+    const fieldNodes = [];
+    for (const key of firstKeys) {
+      const fieldNode = classifyColumn(key, rows.map((row) => row[key]));
+      if (!fieldNode) return;
+      fieldNodes.push(fieldNode);
+    }
+    return fieldNodes;
+  }
+  function extractKeyedTabularFields(value) {
+    const entryValues = Object.values(value);
+    if (entryValues.length < 2) return;
+    if (!entryValues.every((entryValue) => isJsonObject(entryValue) && !isEmptyObject(entryValue))) return;
+    return extractTabularFields(entryValues);
+  }
+  function collectRowLeaves(row, fields) {
+    const leaves = [];
+    collectLeafValues(row, fields, leaves);
+    return leaves;
+  }
+  function classifyColumn(name, values) {
+    if (values.every((value) => isEncodablePrimitive(value))) return { name };
+    if (!values.every((value) => isJsonObject(value) && !isEmptyObject(value))) return;
+    const children = extractTabularFields(values);
+    if (!children) return;
+    return {
+      name,
+      children
+    };
+  }
+  function collectLeafValues(row, fields, leaves) {
+    for (const field of fields) {
+      const value = row[field.name];
+      if (field.children) collectLeafValues(value, field.children, leaves);
+      else leaves.push(value);
+    }
+  }
+  function* encodeJsonValue(value, options, depth) {
+    if (isEncodablePrimitive(value)) {
+      const encodedPrimitive = encodePrimitive(value, options.delimiter);
+      if (encodedPrimitive !== "") yield encodedPrimitive;
+      return;
+    }
+    if (isJsonArray(value)) yield* encodeArrayLines(void 0, value, depth, options);
+    else if (isJsonObject(value)) {
+      const keyedFields = extractKeyedTabularFields(value);
+      if (keyedFields) {
+        yield* encodeKeyedObjectLines(void 0, value, keyedFields, depth, options);
+        return;
+      }
+      yield* encodeObjectLines(value, depth, options);
+    }
+  }
+  function* encodeObjectLines(value, depth, options) {
+    for (const [key, val] of Object.entries(value)) yield* encodeKeyValuePairLines(key, val, depth, options);
+  }
+  function* encodeKeyValuePairLines(key, value, depth, options) {
+    const encodedKey = encodeKey(key);
+    if (isEncodablePrimitive(value)) yield indentedLine(depth, `${encodedKey}: ${encodePrimitive(value, options.delimiter)}`, options.indentSize);
+    else if (isJsonArray(value)) yield* encodeArrayLines(key, value, depth, options);
+    else if (isJsonObject(value)) {
+      const keyedFields = extractKeyedTabularFields(value);
+      if (keyedFields) {
+        yield* encodeKeyedObjectLines(key, value, keyedFields, depth, options);
+        return;
+      }
+      yield indentedLine(depth, `${encodedKey}:`, options.indentSize);
+      if (!isEmptyObject(value)) yield* encodeObjectLines(value, depth + 1, options);
+    }
+  }
+  function* encodeKeyedObjectLines(key, value, fields, depth, options) {
+    const entries = Object.entries(value);
+    yield indentedLine(depth, formatHeader(entries.length, {
+      key,
+      fields,
+      delimiter: options.delimiter,
+      keyed: true
+    }), options.indentSize);
+    yield* encodeKeyedEntryRowsLines(entries, fields, depth + 1, options);
+  }
+  function* encodeKeyedEntryRowsLines(entries, fields, depth, options) {
+    for (const [entryKey, entryValue] of entries) {
+      const leaves = collectRowLeaves(entryValue, fields);
+      yield indentedLine(depth, `${encodeKey(entryKey)}: ${encodeAndJoinPrimitives(leaves, options.delimiter)}`, options.indentSize);
+    }
+  }
+  function* encodeArrayLines(key, value, depth, options) {
+    if (value.length === 0) {
+      yield indentedLine(depth, key != null ? `${encodeKey(key)}: []` : "[]", options.indentSize);
+      return;
+    }
+    if (isArrayOfPrimitives(value)) {
+      yield indentedLine(depth, encodeInlineArrayLine(value, options.delimiter, key), options.indentSize);
+      return;
+    }
+    if (isArrayOfArrays(value)) {
+      if (value.every((arr) => isArrayOfPrimitives(arr))) {
+        yield* encodeArrayOfArraysAsListItemsLines(key, value, depth, options);
+        return;
+      }
+    }
+    if (isArrayOfObjects(value)) {
+      const fields = extractTabularFields(value);
+      if (fields) yield* encodeArrayOfObjectsAsTabularLines(key, value, fields, depth, options);
+      else yield* encodeMixedArrayAsListItemsLines(key, value, depth, options);
+      return;
+    }
+    yield* encodeMixedArrayAsListItemsLines(key, value, depth, options);
+  }
+  function* encodeArrayOfArraysAsListItemsLines(prefix, values, depth, options) {
+    yield indentedLine(depth, formatHeader(values.length, {
+      key: prefix,
+      delimiter: options.delimiter
+    }), options.indentSize);
+    for (const arr of values) if (isArrayOfPrimitives(arr)) {
+      const arrayLine = encodeInlineArrayLine(arr, options.delimiter);
+      yield indentedListItem(depth + 1, arrayLine, options.indentSize);
+    }
+  }
+  function encodeInlineArrayLine(values, delimiter, prefix) {
+    const header = formatHeader(values.length, {
+      key: prefix,
+      delimiter
+    });
+    const joinedValue = encodeAndJoinPrimitives(values, delimiter);
+    if (values.length === 0) return header;
+    return `${header} ${joinedValue}`;
+  }
+  function* encodeArrayOfObjectsAsTabularLines(prefix, rows, fields, depth, options) {
+    yield indentedLine(depth, formatHeader(rows.length, {
+      key: prefix,
+      fields,
+      delimiter: options.delimiter
+    }), options.indentSize);
+    yield* writeTabularRowsLines(rows, fields, depth + 1, options);
+  }
+  function* writeTabularRowsLines(rows, fields, depth, options) {
+    for (const row of rows) yield indentedLine(depth, encodeAndJoinPrimitives(collectRowLeaves(row, fields), options.delimiter), options.indentSize);
+  }
+  function* encodeMixedArrayAsListItemsLines(prefix, items, depth, options) {
+    yield indentedLine(depth, formatHeader(items.length, {
+      key: prefix,
+      delimiter: options.delimiter
+    }), options.indentSize);
+    for (const item of items) yield* encodeListItemValueLines(item, depth + 1, options);
+  }
+  function* encodeObjectAsListItemLines(obj, depth, options) {
+    if (isEmptyObject(obj)) {
+      yield indentedLine(depth, "-", options.indentSize);
+      return;
+    }
+    const entries = Object.entries(obj);
+    const [firstKey, firstValue] = entries[0];
+    const restEntries = entries.slice(1);
+    if (isJsonArray(firstValue) && isArrayOfObjects(firstValue)) {
+      const fields = extractTabularFields(firstValue);
+      if (fields) {
+        yield indentedListItem(depth, formatHeader(firstValue.length, {
+          key: firstKey,
+          fields,
+          delimiter: options.delimiter
+        }), options.indentSize);
+        yield* writeTabularRowsLines(firstValue, fields, depth + 2, options);
+        if (restEntries.length > 0) yield* encodeObjectLines(Object.fromEntries(restEntries), depth + 1, options);
+        return;
+      }
+    }
+    if (isJsonObject(firstValue)) {
+      const keyedFields = extractKeyedTabularFields(firstValue);
+      if (keyedFields) {
+        const keyedEntries = Object.entries(firstValue);
+        yield indentedListItem(depth, formatHeader(keyedEntries.length, {
+          key: firstKey,
+          fields: keyedFields,
+          delimiter: options.delimiter,
+          keyed: true
+        }), options.indentSize);
+        yield* encodeKeyedEntryRowsLines(keyedEntries, keyedFields, depth + 2, options);
+        if (restEntries.length > 0) yield* encodeObjectLines(Object.fromEntries(restEntries), depth + 1, options);
+        return;
+      }
+    }
+    const encodedKey = encodeKey(firstKey);
+    if (isEncodablePrimitive(firstValue)) yield indentedListItem(depth, `${encodedKey}: ${encodePrimitive(firstValue, options.delimiter)}`, options.indentSize);
+    else if (isJsonArray(firstValue)) if (firstValue.length === 0) yield indentedListItem(depth, `${encodedKey}: []`, options.indentSize);
+    else if (isArrayOfPrimitives(firstValue)) yield indentedListItem(depth, `${encodedKey}${encodeInlineArrayLine(firstValue, options.delimiter)}`, options.indentSize);
+    else {
+      yield indentedListItem(depth, `${encodedKey}${formatHeader(firstValue.length, { delimiter: options.delimiter })}`, options.indentSize);
+      for (const item of firstValue) yield* encodeListItemValueLines(item, depth + 2, options);
+    }
+    else if (isJsonObject(firstValue)) {
+      yield indentedListItem(depth, `${encodedKey}:`, options.indentSize);
+      if (!isEmptyObject(firstValue)) yield* encodeObjectLines(firstValue, depth + 2, options);
+    }
+    if (restEntries.length > 0) yield* encodeObjectLines(Object.fromEntries(restEntries), depth + 1, options);
+  }
+  function* encodeListItemValueLines(value, depth, options) {
+    if (isEncodablePrimitive(value)) yield indentedListItem(depth, encodePrimitive(value, options.delimiter), options.indentSize);
+    else if (isJsonArray(value)) if (isArrayOfPrimitives(value)) yield indentedListItem(depth, encodeInlineArrayLine(value, options.delimiter), options.indentSize);
+    else {
+      yield indentedListItem(depth, formatHeader(value.length, { delimiter: options.delimiter }), options.indentSize);
+      for (const item of value) yield* encodeListItemValueLines(item, depth + 1, options);
+    }
+    else if (isJsonObject(value)) yield* encodeObjectAsListItemLines(value, depth, options);
+  }
+  function indentedLine(depth, content, indentSize) {
+    return " ".repeat(indentSize * depth) + content;
+  }
+  function indentedListItem(depth, content, indentSize) {
+    return indentedLine(depth, "- " + content, indentSize);
+  }
+  function applyReplacer(root, replacer) {
+    const replacedRoot = replacer("", root, []);
+    if (replacedRoot === void 0) return transformChildren(root, replacer, []);
+    return transformReplaced(root, replacedRoot, replacer, []);
+  }
+  function transformReplaced(original, replaced, replacer, path3) {
+    if (isRawString(replaced) && !isEncodablePrimitive(original)) return transformChildren(original, replacer, path3);
+    return transformChildren(normalizeValue(replaced), replacer, path3);
+  }
+  function transformChildren(value, replacer, path3) {
+    if (isJsonObject(value)) return transformObject(value, replacer, path3);
+    if (isJsonArray(value)) return transformArray(value, replacer, path3);
+    return value;
+  }
+  function transformObject(obj, replacer, path3) {
+    const result = {};
+    for (const [key, value] of Object.entries(obj)) {
+      const childPath = [...path3, key];
+      const replacedValue = replacer(key, value, childPath);
+      if (replacedValue === void 0) continue;
+      setOwnProperty(result, key, transformReplaced(value, replacedValue, replacer, childPath));
+    }
+    return result;
+  }
+  function transformArray(arr, replacer, path3) {
+    const result = [];
+    for (let i2 = 0; i2 < arr.length; i2++) {
+      const value = arr[i2];
+      const childPath = [...path3, i2];
+      const replacedValue = replacer(String(i2), value, childPath);
+      if (replacedValue === void 0) continue;
+      result.push(transformReplaced(value, replacedValue, replacer, childPath));
+    }
+    return result;
+  }
+  function encode(input, options) {
+    return Array.from(encodeLines(input, options)).join("\n");
+  }
+  function encodeLines(input, options) {
+    const normalizedValue = normalizeValue(input);
+    const resolvedOptions = resolveOptions(options);
+    return encodeJsonValue(resolvedOptions.replacer ? applyReplacer(normalizedValue, resolvedOptions.replacer) : normalizedValue, resolvedOptions, 0);
+  }
+  function resolveOptions(options) {
+    const delimiter = options?.delimiter ?? DEFAULT_DELIMITER;
+    assertValidDelimiter(delimiter);
+    return {
+      indentSize: options?.indentSize ?? options?.indent ?? 2,
+      delimiter,
+      replacer: options?.replacer
+    };
+  }
+
+  // src/agent-output.ts
+  function isRecord8(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  }
+  function compact(value, full, depth = 0) {
+    if (full || depth > 5) return value;
+    if (typeof value === "string") {
+      return value.length > 500 ? `${value.slice(0, 500)}\u2026 (truncated, ${value.length} chars total; request full output when needed)` : value;
+    }
+    if (Array.isArray(value)) {
+      const items = value.slice(0, 20).map((entry) => compact(entry, false, depth + 1));
+      return value.length > 20 ? { totalCount: value.length, shownCount: items.length, items, truncated: true } : items;
+    }
+    if (!isRecord8(value)) return value;
+    const out = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (key === "stack" || key === "rawResponse") continue;
+      out[key] = compact(entry, false, depth + 1);
+      if (Array.isArray(entry) && entry.length <= 20 && !Object.hasOwn(value, `${key}Count`)) out[`${key}Count`] = entry.length;
+    }
+    return out;
+  }
+  function recoveryHelp(record2, operation) {
+    const nested = isRecord8(record2.result) ? record2.result : {};
+    const code = String(nested.errorCode || record2.errorCode || record2.code || "");
+    if (record2.executionStateUnknown === true || nested.executionStateUnknown === true || code === "HOST_TIMEOUT") return ["Query current Unity state before retrying; prior scene edits may have applied."];
+    if (nested.partial === true || record2.partial === true) return ["Inspect appliedOperations and current Unity state before deciding whether to undo or continue."];
+    if (code === "SCRIPT_CONTRACT") return ["Use export async function run(ctx, args) and await host calls or frame waits."];
+    if (code === "RPC_UNAUTHORIZED") return ["Refresh the selected instance token and retry once."];
+    if (record2.ok === false) return [operation ? `Inspect ${operation} arguments and the host manifest before retrying.` : "Inspect the error code and host manifest before retrying."];
+    return [];
+  }
+  function formatAgentOutput(value, options = {}) {
+    const source = isRecord8(value) ? value : { result: value };
+    const body = compact(source, options.full === true);
+    const nested = isRecord8(source.result) ? source.result : {};
+    const failed = source.ok === false || nested.ok === false;
+    if (failed) {
+      const code = String(nested.errorCode || source.errorCode || source.code || "UNKNOWN_ERROR");
+      body.retryable = ["RPC_UNAUTHORIZED", "TEMPORARILY_UNAVAILABLE", "DOMAIN_RELOAD"].includes(code);
+      if (nested.errorCode && source.errorCode !== nested.errorCode) body.causeCode = nested.errorCode;
+    }
+    const help = recoveryHelp(source, options.operation);
+    if (help.length > 0 && !Object.hasOwn(body, "help")) body.help = help;
+    if (options.operation && !Object.hasOwn(body, "operation")) body.operation = options.operation;
+    if (Object.keys(body).length === 0) body.count = 0;
+    return encode(body);
+  }
+
   // ../../node_modules/acorn/dist/acorn.mjs
   var astralIdentifierCodes = [509, 0, 227, 0, 150, 4, 294, 9, 1368, 2, 2, 1, 6, 3, 41, 2, 5, 0, 166, 1, 574, 3, 9, 9, 7, 9, 32, 4, 318, 1, 78, 5, 71, 10, 50, 3, 123, 2, 54, 14, 32, 10, 3, 1, 11, 3, 46, 10, 8, 0, 46, 9, 7, 2, 37, 13, 2, 9, 6, 1, 45, 0, 13, 2, 49, 13, 9, 3, 2, 11, 83, 11, 7, 0, 3, 0, 158, 11, 6, 9, 7, 3, 56, 1, 2, 6, 3, 1, 3, 2, 10, 0, 11, 1, 3, 6, 4, 4, 68, 8, 2, 0, 3, 0, 2, 3, 2, 4, 2, 0, 15, 1, 83, 17, 10, 9, 5, 0, 82, 19, 13, 9, 214, 6, 3, 8, 28, 1, 83, 16, 16, 9, 82, 12, 9, 9, 7, 19, 58, 14, 5, 9, 243, 14, 166, 9, 71, 5, 2, 1, 3, 3, 2, 0, 2, 1, 13, 9, 120, 6, 3, 6, 4, 0, 29, 9, 41, 6, 2, 3, 9, 0, 10, 10, 47, 15, 199, 7, 137, 9, 54, 7, 2, 7, 17, 9, 57, 21, 2, 13, 123, 5, 4, 0, 2, 1, 2, 6, 2, 0, 9, 9, 49, 4, 2, 1, 2, 4, 9, 9, 55, 9, 266, 3, 10, 1, 2, 0, 49, 6, 4, 4, 14, 10, 5350, 0, 7, 14, 11465, 27, 2343, 9, 87, 9, 39, 4, 60, 6, 26, 9, 535, 9, 470, 0, 2, 54, 8, 3, 82, 0, 12, 1, 19628, 1, 4178, 9, 519, 45, 3, 22, 543, 4, 4, 5, 9, 7, 3, 6, 31, 3, 149, 2, 1418, 49, 513, 54, 5, 49, 9, 0, 15, 0, 23, 4, 2, 14, 1361, 6, 2, 16, 3, 6, 2, 1, 2, 4, 101, 0, 161, 6, 10, 9, 357, 0, 62, 13, 499, 13, 245, 1, 2, 9, 233, 0, 3, 0, 8, 1, 6, 0, 475, 6, 110, 6, 6, 9, 4759, 9, 787719, 239];
   var astralIdentifierStartCodes = [0, 11, 2, 25, 2, 18, 2, 1, 2, 14, 3, 13, 35, 122, 70, 52, 268, 28, 4, 48, 48, 31, 14, 29, 6, 37, 11, 29, 3, 35, 5, 7, 2, 4, 43, 157, 19, 35, 5, 35, 5, 39, 9, 51, 13, 10, 2, 14, 2, 6, 2, 1, 2, 10, 2, 14, 2, 6, 2, 1, 4, 51, 13, 310, 10, 21, 11, 7, 25, 5, 2, 41, 2, 8, 70, 5, 3, 0, 2, 43, 2, 1, 4, 0, 3, 22, 11, 22, 10, 30, 66, 18, 2, 1, 11, 21, 11, 25, 7, 25, 39, 55, 7, 1, 65, 0, 16, 3, 2, 2, 2, 28, 43, 28, 4, 28, 36, 7, 2, 27, 28, 53, 11, 21, 11, 18, 14, 17, 111, 72, 56, 50, 14, 50, 14, 35, 39, 27, 10, 22, 251, 41, 7, 1, 17, 5, 57, 28, 11, 0, 9, 21, 43, 17, 47, 20, 28, 22, 13, 52, 58, 1, 3, 0, 14, 44, 33, 24, 27, 35, 30, 0, 3, 0, 9, 34, 4, 0, 13, 47, 15, 3, 22, 0, 2, 0, 36, 17, 2, 24, 20, 1, 64, 6, 2, 0, 2, 3, 2, 14, 2, 9, 8, 46, 39, 7, 3, 1, 3, 21, 2, 6, 2, 1, 2, 4, 4, 0, 19, 0, 13, 4, 31, 9, 2, 0, 3, 0, 2, 37, 2, 0, 26, 0, 2, 0, 45, 52, 19, 3, 21, 2, 31, 47, 21, 1, 2, 0, 185, 46, 42, 3, 37, 47, 21, 0, 60, 42, 14, 0, 72, 26, 38, 6, 186, 43, 117, 63, 32, 7, 3, 0, 3, 7, 2, 1, 2, 23, 16, 0, 2, 0, 95, 7, 3, 38, 17, 0, 2, 0, 29, 0, 11, 39, 8, 0, 22, 0, 12, 45, 20, 0, 19, 72, 200, 32, 32, 8, 2, 36, 18, 0, 50, 29, 113, 6, 2, 1, 2, 37, 22, 0, 26, 5, 2, 1, 2, 31, 15, 0, 24, 43, 261, 18, 16, 0, 2, 12, 2, 33, 125, 0, 80, 921, 103, 110, 18, 195, 2637, 96, 16, 1071, 18, 5, 26, 3994, 6, 582, 6842, 29, 1763, 568, 8, 30, 18, 78, 18, 29, 19, 47, 17, 3, 32, 20, 6, 18, 433, 44, 212, 63, 33, 24, 3, 24, 45, 74, 6, 0, 67, 12, 65, 1, 2, 0, 15, 4, 10, 7381, 42, 31, 98, 114, 8702, 3, 2, 6, 2, 1, 2, 290, 16, 0, 30, 2, 3, 0, 15, 3, 9, 395, 2309, 106, 6, 12, 4, 8, 8, 9, 5991, 84, 2, 70, 2, 1, 3, 0, 3, 1, 3, 3, 2, 11, 2, 0, 2, 6, 2, 64, 2, 3, 3, 7, 2, 6, 2, 27, 2, 3, 2, 4, 2, 0, 4, 6, 2, 339, 3, 24, 2, 24, 2, 30, 2, 24, 2, 30, 2, 24, 2, 30, 2, 24, 2, 30, 2, 24, 2, 7, 1845, 30, 7, 5, 262, 61, 147, 44, 11, 6, 17, 0, 322, 29, 19, 43, 485, 27, 229, 29, 3, 0, 208, 30, 2, 2, 2, 1, 2, 6, 3, 4, 10, 1, 225, 6, 2, 3, 2, 1, 2, 14, 2, 196, 60, 67, 8, 0, 1205, 3, 2, 26, 2, 1, 2, 0, 3, 0, 2, 9, 2, 3, 2, 0, 2, 0, 7, 0, 5, 0, 2, 0, 2, 0, 2, 2, 2, 1, 2, 0, 3, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 1, 2, 0, 3, 3, 2, 6, 2, 3, 2, 3, 2, 0, 2, 9, 2, 16, 6, 2, 2, 4, 2, 16, 4421, 42719, 33, 4381, 3, 5773, 3, 7472, 16, 621, 2467, 541, 1507, 4938, 6, 8489];
@@ -46475,7 +47073,7 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
       { at: runExport.start, end: declarationStart, text: "" }
     ]);
   }
-  function compileUnityScriptEntry(script, onStep) {
+  function compileUnityScriptEntry(script, onStep, injected = {}) {
     const normalized = prepareUnityScriptSource(script);
     const module = { exports: {} };
     const exports = module.exports;
@@ -46484,13 +47082,14 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
       "exports",
       "console",
       "__pieStepGuard",
+      "__gameUse",
       `"use strict";
 const CS = undefined;
 const puer = undefined;
 ${normalized}
 return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports.run)), default: (module.exports.default || exports.default) };`
     );
-    const exported = executor(module, exports, console, onStep);
+    const exported = executor(module, exports, console, onStep, injected.gameUse);
     const entry = exported?.run;
     if (typeof entry !== "function") {
       throw createCompilerError("SCRIPT_CONTRACT", "Script must define export async function run(ctx, args).");
@@ -46511,35 +47110,41 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   };
   var unityWorkScheduler = new UnityWorkScheduler();
 
-  // src/unity-runtime-access.ts
-  function isRecord8(value) {
-    return !!value && typeof value === "object" && !Array.isArray(value);
-  }
-  function createRuntimeAccessError(code, message) {
-    const error = new Error(message);
-    error.code = code;
-    return error;
-  }
-  function summarizeValue(value) {
+  // src/safe-runtime-dto.ts
+  var MAX_SERIALIZED_DEPTH = 6;
+  var MAX_SERIALIZED_PROPERTIES = 64;
+  var MAX_SERIALIZED_ARRAY_ITEMS = 100;
+  var MAX_NATIVE_DTO_EXPANSION = 32;
+  var NON_EXPANDABLE_CONSTRUCTORS = /* @__PURE__ */ new Set([
+    Map,
+    Set,
+    WeakMap,
+    WeakSet,
+    Promise,
+    Error,
+    EvalError,
+    RangeError,
+    ReferenceError,
+    SyntaxError,
+    TypeError,
+    URIError
+  ]);
+  function summarizeRuntimeValue(value) {
     if (value === null) return "null";
     if (value === void 0) return "undefined";
     if (Array.isArray(value)) return `Array(${value.length})`;
+    if (typeof value === "function") return `Function(${value.name || "anonymous"})`;
     if (typeof value === "object") {
-      const keys = Object.keys(value);
-      return `Object(${keys.slice(0, 6).join(", ")})`;
+      try {
+        const keys = Object.getOwnPropertyNames(value);
+        const constructor = value.constructor;
+        const name = typeof constructor === "function" && constructor.name ? constructor.name : "Object";
+        return `${name}(${keys.slice(0, 6).join(", ")})`;
+      } catch {
+        return "Object()";
+      }
     }
     return String(value);
-  }
-  function parseRuntimePath(path3) {
-    const normalized = String(path3 || "").trim();
-    if (!normalized) {
-      throw createRuntimeAccessError("RUNTIME_PATH_NOT_FOUND", "Runtime path is required.");
-    }
-    const parts = normalized.split(".").map((part) => String(part || "").trim()).filter(Boolean);
-    if (parts.length === 0) {
-      throw createRuntimeAccessError("RUNTIME_PATH_NOT_FOUND", "Runtime path is required.");
-    }
-    return parts;
   }
   function collectRuntimeMemberNames(value) {
     if (value === null || value === void 0 || typeof value !== "object" && typeof value !== "function") {
@@ -46561,46 +47166,159 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     names.sort((left, right) => left.localeCompare(right));
     return names;
   }
-  function safeSerializeRuntimeValue(value) {
-    if (value === null || value === void 0) return value ?? null;
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
-    if (Array.isArray(value)) return value.map((item) => safeSerializeRuntimeValue(item));
-    if (typeof value === "function") {
+  function findPropertyDescriptor(value, name) {
+    let current2 = value;
+    for (let depth = 0; current2 !== null && current2 !== void 0 && depth < 3; depth += 1) {
+      if (typeof current2 !== "object" && typeof current2 !== "function") break;
+      const descriptor = Object.getOwnPropertyDescriptor(current2, name);
+      if (descriptor) return descriptor;
+      current2 = Object.getPrototypeOf(current2);
+    }
+    return void 0;
+  }
+  function describeRuntimeMember(target, name) {
+    const descriptor = findPropertyDescriptor(target, name);
+    if (!descriptor) {
+      return { name, type: "unknown", callable: false, summary: "unknown", value: null };
+    }
+    if ("value" in descriptor) {
+      const value = descriptor.value;
       return {
-        type: "function",
-        summary: String(value.name || "(anonymous)")
+        name,
+        type: value === null ? "null" : Array.isArray(value) ? "array" : typeof value,
+        callable: typeof value === "function",
+        summary: summarizeRuntimeValue(value),
+        value: safeSerializeRuntimeValue(value)
       };
     }
-    if (typeof value === "object") {
-      try {
-        return JSON.parse(JSON.stringify(value));
-      } catch {
-        return {
-          type: "object",
-          summary: summarizeValue(value),
-          members: collectRuntimeMemberNames(value).slice(0, 20)
-        };
+    return {
+      name,
+      type: "accessor",
+      callable: false,
+      summary: "accessor",
+      value: {
+        type: "accessor",
+        getter: typeof descriptor.get === "function",
+        setter: typeof descriptor.set === "function"
       }
-    }
-    return String(value);
+    };
   }
   function describeRuntimeValue(value) {
-    const type = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
     return {
-      type,
+      type: value === null ? "null" : Array.isArray(value) ? "array" : typeof value,
       callable: typeof value === "function",
-      summary: summarizeValue(value),
+      summary: summarizeRuntimeValue(value),
       value: safeSerializeRuntimeValue(value)
     };
   }
+  function accessorDto(descriptor) {
+    return {
+      type: "accessor",
+      getter: typeof descriptor.get === "function",
+      setter: typeof descriptor.set === "function"
+    };
+  }
+  function isPlainSerializableRecord(value) {
+    if (Array.isArray(value)) return true;
+    const constructor = value.constructor;
+    if (constructor !== void 0 && NON_EXPANDABLE_CONSTRUCTORS.has(constructor)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype === Object.prototype || prototype === null) return true;
+    try {
+      const names = Object.getOwnPropertyNames(value);
+      if (names.length > MAX_NATIVE_DTO_EXPANSION) return false;
+      return names.some((name) => Object.prototype.propertyIsEnumerable.call(value, name));
+    } catch {
+      return false;
+    }
+  }
+  function safeSerializeRuntimeValue(value, seen = /* @__PURE__ */ new Map(), depth = 0) {
+    return safeSerialize(value, seen, depth, false);
+  }
+  function safeSerializeScriptValue(value) {
+    return safeSerialize(value, /* @__PURE__ */ new Map(), 0, true);
+  }
+  function safeSerialize(value, seen, depth, preservePlainObjects) {
+    if (value === null || value === void 0) return value ?? null;
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+      return typeof value === "bigint" ? value.toString() : value;
+    }
+    if (typeof value === "function") {
+      return { type: "function", summary: value.name || "(anonymous)" };
+    }
+    if (typeof value !== "object") return String(value);
+    if (!isPlainSerializableRecord(value)) {
+      return { type: "object", summary: summarizeRuntimeValue(value) };
+    }
+    if (depth >= MAX_SERIALIZED_DEPTH) {
+      return { type: "object", summary: summarizeRuntimeValue(value), truncated: "depth" };
+    }
+    if (seen.has(value)) return { type: "object", summary: summarizeRuntimeValue(value), circular: true };
+    if (Array.isArray(value)) {
+      seen.set(value, true);
+      try {
+        return value.slice(0, MAX_SERIALIZED_ARRAY_ITEMS).map((item) => safeSerialize(item, seen, depth + 1, preservePlainObjects));
+      } finally {
+        seen.delete(value);
+      }
+    }
+    if (typeof value !== "object") return String(value);
+    seen.set(value, true);
+    try {
+      const keys = Reflect.ownKeys(value).slice(0, MAX_SERIALIZED_PROPERTIES);
+      const output = {};
+      let allPrimitives = true;
+      if (!preservePlainObjects && depth === 0) allPrimitives = false;
+      for (const key of keys) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor?.enumerable) continue;
+        const name = typeof key === "string" ? key : `[${String(key)}]`;
+        const serialized = "value" in descriptor ? safeSerialize(descriptor.value, seen, depth + 1, preservePlainObjects) : accessorDto(descriptor);
+        const plainSerialized = serialized !== null && typeof serialized === "object" && !Array.isArray(serialized) && Object.getPrototypeOf(serialized) === Object.prototype;
+        if (allPrimitives && !(serialized === null || typeof serialized === "string" || typeof serialized === "number" || typeof serialized === "boolean" || plainSerialized)) allPrimitives = false;
+        output[name] = serialized;
+      }
+      if (allPrimitives) return output;
+      return {
+        type: "object",
+        summary: summarizeRuntimeValue(value),
+        properties: output,
+        ...Reflect.ownKeys(value).length > MAX_SERIALIZED_PROPERTIES ? { truncated: "properties" } : {}
+      };
+    } finally {
+      seen.delete(value);
+    }
+  }
+
+  // src/unity-runtime-access.ts
+  function isRecord9(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  }
+  function createRuntimeAccessError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+  function parseRuntimePath(path3) {
+    const normalized = String(path3 || "").trim();
+    if (!normalized) {
+      throw createRuntimeAccessError("RUNTIME_PATH_NOT_FOUND", "Runtime path is required.");
+    }
+    const parts = normalized.split(".").map((part) => String(part || "").trim()).filter(Boolean);
+    if (parts.length === 0) {
+      throw createRuntimeAccessError("RUNTIME_PATH_NOT_FOUND", "Runtime path is required.");
+    }
+    return parts.join(".");
+  }
   function resolveRuntimePath(path3) {
-    const parts = parseRuntimePath(path3);
+    const fullPath = parseRuntimePath(path3);
     let parent = globalThis;
     let value = globalThis;
     const traversed = [];
+    const parts = fullPath.split(".");
     for (const segment of parts) {
       if (value === null || value === void 0 || typeof value !== "object" && typeof value !== "function") {
-        throw createRuntimeAccessError("RUNTIME_PATH_NOT_FOUND", `Runtime path not found: ${parts.join(".")}`);
+        throw createRuntimeAccessError("RUNTIME_PATH_NOT_FOUND", `Runtime path not found: ${fullPath}`);
       }
       parent = value;
       traversed.push(segment);
@@ -46610,7 +47328,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       }
     }
     return {
-      path: parts.join("."),
+      path: fullPath,
       parent,
       value
     };
@@ -46640,18 +47358,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       },
       members(path3 = "") {
         const target = String(path3 || "").trim() ? resolveRuntimePath(path3).value : globalThis;
-        return collectRuntimeMemberNames(target).map((name) => {
-          let value;
-          try {
-            value = target[name];
-          } catch {
-            value = void 0;
-          }
-          return {
-            name,
-            ...describeRuntimeValue(value)
-          };
-        });
+        return collectRuntimeMemberNames(target).map((name) => describeRuntimeMember(target, name));
       },
       call(path3, argsJson) {
         const resolved = resolveRuntimePath(path3);
@@ -46667,7 +47374,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
           }
           return safeSerializeRuntimeValue(result);
         } catch (error) {
-          if (isRecord8(error) && typeof error.code === "string") {
+          if (isRecord9(error) && typeof error.code === "string") {
             throw error;
           }
           throw createRuntimeAccessError("RUNTIME_CALL_FAILED", error instanceof Error ? error.message : String(error));
@@ -46696,13 +47403,808 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     };
   }
 
-  // src/unity-script-host.ts
-  var SOFT_SLICE_MS = 4;
-  var DEFAULT_TOTAL_TIMEOUT_MS = 3e4;
-  var DEFAULT_PER_STEP_TIMEOUT_MS = 100;
-  var DEFAULT_MAX_FRAMES = 1800;
-  var MAX_LOG_LINES = 200;
-  var STEP_TIMEOUT_ERROR_CODE = "STEP_TIMEOUT";
+  // src/game-use/decide/contract.ts
+  var DecideError = class extends Error {
+    constructor(message, retryable) {
+      super(message);
+      this.retryable = retryable;
+      this.name = "DecideError";
+    }
+    retryable;
+  };
+  function validChoice(request, choice) {
+    if (!Object.hasOwn(request.options, choice)) {
+      return `decider chose "${choice}", not one of [${Object.keys(request.options).join(", ")}]`;
+    }
+    return null;
+  }
+  function nowMs() {
+    return typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+  }
+
+  // src/game-use/loop/play-loop.ts
+  var DEFAULT_TEMPO = 2;
+  var DEFAULT_STALL_SECONDS = 90;
+  async function runEpisode(options) {
+    const { harness, decider, surface, clock } = options;
+    const episode = options.episode ?? "trace1";
+    const tempo = harness.tempo ?? DEFAULT_TEMPO;
+    const stallSeconds = harness.stallSeconds ?? DEFAULT_STALL_SECONDS;
+    const startedAt = clock.t;
+    let call = 0;
+    let running = null;
+    const recent = [];
+    let lastProgressAt = startedAt;
+    let lastSituation = "";
+    let cancelled = false;
+    let degradedDecisions = 0;
+    if (harness.setup) await harness.setup(surface);
+    for (; ; ) {
+      if (options.watch) await options.watch.sample();
+      const obs = await harness.observe(surface);
+      const status = harness.status(obs);
+      if (status.state !== "running") {
+        return await result(status.state === "done" ? "done" : "failed", status.note ?? "", status.evidence ?? {});
+      }
+      const situation = JSON.stringify(obs);
+      if (situation !== lastSituation || running) {
+        lastSituation = situation;
+        lastProgressAt = clock.t;
+      }
+      if (clock.t - lastProgressAt > stallSeconds) {
+        return await result("stalled", `no progress for ${stallSeconds}s`, {});
+      }
+      if (options.maxSeconds !== void 0 && clock.t - startedAt > options.maxSeconds) {
+        return await result("stalled", `time limit at ${Math.round(clock.t - startedAt)}s`, {});
+      }
+      if (options.cancelled?.()) {
+        cancelled = true;
+        return await result("cancelled", "cancelled by request", {});
+      }
+      const steps = harness.plan?.(obs) ?? null;
+      let legal = harness.options(obs);
+      if (steps) {
+        const current2 = steps.find((step) => !step.done(obs));
+        if (current2) {
+          const allowed = new Set(legal.map((option) => option.name));
+          void allowed;
+        }
+      }
+      if (!legal.length) {
+        await clock.wait(Math.max(0.05, 1 / tempo / 4));
+        continue;
+      }
+      const optionFacts = {};
+      for (const option of legal) {
+        optionFacts[option.name] = { description: option.description, facts: option.facts };
+      }
+      const request = {
+        goal: harness.goal,
+        situation: obs,
+        options: optionFacts,
+        nowDoing: running ? { option: running.name, since: running.startedAt, working: true } : null,
+        recent: recent.slice(-5),
+        plan: steps ? {
+          done: steps.filter((s) => s.done(obs)).map((s) => s.name),
+          now: (() => {
+            const current2 = steps.find((s) => !s.done(obs));
+            return current2 ? { step: current2.name, what: current2.what } : null;
+          })(),
+          next: (() => {
+            const pending = steps.filter((s) => !s.done(obs));
+            return pending.slice(1, 4).map((s) => s.what);
+          })()
+        } : null,
+        askedAt: Date.now() / 1e3
+      };
+      const askedAt = clock.t;
+      let answer;
+      let degraded = false;
+      try {
+        answer = await decider.decide(request);
+      } catch (decideError) {
+        if (!options.fallbackDecider) throw decideError;
+        answer = await options.fallbackDecider.decide(request);
+        degraded = true;
+        degradedDecisions++;
+      }
+      call++;
+      const invalid = validChoice(request, answer.choice);
+      if (invalid) {
+        return await result("error", invalid, {});
+      }
+      const chosen = legal.find((option) => option.name === answer.choice);
+      if (!chosen) {
+        return await result("error", `chosen option "${answer.choice}" not legal now`, {});
+      }
+      options.onDecision?.({
+        call,
+        episode,
+        t: clock.t,
+        wall: Date.now() / 1e3,
+        options: legal.map((option) => option.name),
+        request,
+        latencyS: answer.latencyS,
+        response: { model: answer.model ?? (degraded ? options.fallbackDecider.kind : decider.kind), usage: answer.usage },
+        appliedT: clock.t,
+        chosen: answer.choice,
+        action: running?.name === answer.choice ? "kept" : running ? "switched" : "started",
+        running: running?.name ?? null
+      });
+      if (!running || running.name !== answer.choice) {
+        const optionStartedAt = clock.t;
+        const name = chosen.name;
+        const settle = () => {
+          if (running?.name === name) running = null;
+        };
+        void chosen.run(surface).then(
+          (worked) => {
+            recent.push({ option: name, worked, why: worked ? void 0 : "did not work" });
+            if (recent.length > 12) recent.shift();
+            settle();
+          },
+          () => {
+            recent.push({ option: name, worked: false, why: "threw" });
+            settle();
+          }
+        );
+        running = { name, startedAt: optionStartedAt, promise: Promise.resolve(true) };
+      }
+      await clock.wait(1 / Math.max(0.1, tempo));
+      void askedAt;
+      async function result(outcome, note, evidence) {
+        if (options.watch) await options.watch.sample();
+        const findings = options.watch ? options.watch.findings() : void 0;
+        const degradedNote = degradedDecisions > 0 && (outcome === "done" || outcome === "failed") ? `${note}${note ? " \u2014 " : ""}degraded: ${degradedDecisions} decision(s) fell back to ${options.fallbackDecider?.kind ?? "fallback"}` : note;
+        return { outcome, note: degradedNote, evidence, decisions: call, seconds: Math.max(0, clock.t - startedAt), ...findings?.length ? { findings } : {} };
+      }
+    }
+  }
+
+  // src/game-use/run/unity-adapter.ts
+  function createUnitySurface(runtime, paths) {
+    return {
+      get t() {
+        return runtime.frame / 60;
+      },
+      async read(key) {
+        const raw = await runtime.call(paths.readPath);
+        const root = typeof raw === "string" ? JSON.parse(raw) : raw;
+        if (key === "snapshot") return root;
+        if (!(key in root)) throw new Error(`unity read: no fact "${key}" in ${paths.readPath}`);
+        return root[key];
+      },
+      async act(action, args) {
+        const raw = await runtime.call(paths.actPath, [action, JSON.stringify(args ?? {})]);
+        return typeof raw === "string" ? safeJson(raw) : raw;
+      }
+    };
+  }
+  function safeJson(text) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+  function createUnityClock(runtime) {
+    return {
+      get t() {
+        return runtime.frame / 60;
+      },
+      wait(seconds) {
+        const frames = Math.max(1, Math.round(seconds * 60));
+        return runtime.waitFrames(frames);
+      }
+    };
+  }
+
+  // src/game-use/run/game-watch.ts
+  var WATCH_PATH = "CS.Pie.GameUse.PieGameWatch.Collect";
+  var WATCH_RESET_PATH = "CS.Pie.GameUse.PieGameWatch.Reset";
+  var GameWatch = class _GameWatch {
+    constructor(runtime) {
+      this.runtime = runtime;
+    }
+    runtime;
+    cursor = 0;
+    lastErrorCount = 0;
+    lastWarningCount = 0;
+    errors = [];
+    warnings = [];
+    frameStats = null;
+    /** Latched when any sampled window qualified as a frame burst: a burst the
+     * game recovered from before the episode ended is still a finding. */
+    latchedFrameSpike = null;
+    static async start(runtime) {
+      try {
+        await Promise.resolve().then(() => runtime.call(WATCH_PATH, ["0"]));
+        const watch = new _GameWatch(runtime);
+        await Promise.resolve().then(() => runtime.call(WATCH_RESET_PATH, []));
+        return watch;
+      } catch {
+        return null;
+      }
+    }
+    /** Pull new log entries + frame stats; call between decisions (cheap). */
+    async sample() {
+      try {
+        const raw = await this.runtime.call(WATCH_PATH, [String(this.cursor)]);
+        const payload = JSON.parse(String(raw));
+        for (const entry of payload.newEntries ?? []) {
+          if (entry.startsWith("Error:") || entry.startsWith("Exception:") || entry.startsWith("Assert:")) {
+            if (this.errors.length < 8) this.errors.push(trimEntry(entry));
+          } else if (entry.startsWith("Warning:") && this.warnings.length < 8) {
+            this.warnings.push(trimEntry(entry));
+          }
+        }
+        this.cursor = payload.logCursor ?? this.cursor;
+        this.lastErrorCount = payload.errorCount ?? this.lastErrorCount;
+        this.lastWarningCount = payload.warningCount ?? this.lastWarningCount;
+        if (typeof payload.avgFrameMs === "number") {
+          const stats = {
+            avgFrameMs: payload.avgFrameMs,
+            worstFrameMs: payload.worstFrameMs ?? 0,
+            over33: payload.over33 ?? 0,
+            over50: payload.over50 ?? 0,
+            frames: payload.frameCount ?? 0
+          };
+          this.frameStats = stats;
+          if (stats.frames > 60 && stats.over33 > Math.max(10, Math.floor(stats.frames * 0.1))) {
+            this.latchedFrameSpike = `${stats.over33} frames over 33ms (worst ${stats.worstFrameMs.toFixed(1)}ms, avg ${stats.avgFrameMs.toFixed(1)}ms)`;
+          }
+        }
+      } catch {
+      }
+    }
+    /** The findings for the episode report (called once at episode end). */
+    findings() {
+      const out = [];
+      if (this.lastErrorCount > 0 || this.errors.length > 0) {
+        out.push({
+          kind: "log-error",
+          note: `${this.lastErrorCount} error log${this.lastErrorCount === 1 ? "" : "s"} during the episode`,
+          samples: this.errors.slice(0, 3)
+        });
+      }
+      if (this.lastWarningCount > 0) {
+        out.push({
+          kind: "log-warning",
+          note: `${this.lastWarningCount} warning log${this.lastWarningCount === 1 ? "" : "s"} during the episode`,
+          samples: this.warnings.slice(0, 3)
+        });
+      }
+      if (this.latchedFrameSpike) {
+        out.push({ kind: "frame-spike", note: this.latchedFrameSpike });
+      }
+      return out;
+    }
+  };
+  function trimEntry(entry) {
+    const text = entry.length > 300 ? `${entry.slice(0, 300)}\u2026` : entry;
+    return text.replace(/\s+/g, " ").trim();
+  }
+
+  // src/game-use/run/episode-report.ts
+  function formatGameUseReport(input) {
+    const episode = input.episode ?? {};
+    const outcome = String(episode.outcome ?? "unknown");
+    const lines = [];
+    const verdictWord = outcome === "done" ? "GOAL MET" : outcome === "failed" ? "GOAL FAILED" : outcome === "stalled" ? "STALLED" : outcome.toUpperCase();
+    lines.push(`verdict: ${verdictWord}${episode.note ? ` \u2014 ${episode.note}` : ""}`);
+    lines.push(`episode: ${episode.decisions ?? 0} decisions in ${round1(episode.seconds)}s`);
+    const evidence = episode.evidence ?? {};
+    const evidenceEntries = Object.entries(evidence);
+    if (evidenceEntries.length > 0) {
+      lines.push(`evidence: ${evidenceEntries.map(([k, v]) => `${k}=${formatValue(v)}`).join(", ")}`);
+    }
+    const findings = episode.findings ?? [];
+    if (findings.length > 0) {
+      lines.push(`findings (${findings.length}):`);
+      for (const finding of findings) {
+        lines.push(`  - [${finding.kind}] ${finding.note}`);
+        for (const sample of (finding.samples ?? []).slice(0, 3)) {
+          lines.push(`      ${truncate2(sample, 160)}`);
+        }
+      }
+    } else if (outcome === "done") {
+      lines.push("findings: none (no log errors or frame spikes observed)");
+    }
+    const trail = input.trail ?? [];
+    if (trail.length > 0) {
+      const steps = trail.slice(0, 40).map((entry) => String(entry.chosen ?? "?"));
+      const more = trail.length > 40 ? ` (+${trail.length - 40} more)` : "";
+      lines.push(`decision trail: ${steps.join(" \u2192 ")}${more}`);
+    }
+    const latencies = (input.decisions ?? []).map((d) => typeof d.latencyS === "number" ? d.latencyS * 1e3 : Number.NaN).filter((n) => Number.isFinite(n));
+    if (latencies.length > 0) {
+      const sorted = [...latencies].sort((a, b) => a - b);
+      lines.push(`decision latency: p50 ${Math.round(sorted[Math.floor(sorted.length / 2)])}ms, max ${Math.round(sorted[sorted.length - 1])}ms`);
+    }
+    return lines.join("\n");
+  }
+  function round1(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return "0";
+    return (Math.round(n * 10) / 10).toString();
+  }
+  function formatValue(value) {
+    if (typeof value === "number") return Number.isInteger(value) ? String(value) : value.toFixed(2);
+    return String(value);
+  }
+  function truncate2(text, max) {
+    if (text.length <= max) return text;
+    let cut = max;
+    if (cut > 0 && cut < text.length && (text.charCodeAt(cut - 1) & 64512) === 55296) cut -= 1;
+    return `${text.slice(0, cut)}\u2026`;
+  }
+
+  // src/game-use/sim/three-sparks-harness.ts
+  var SPARKS = [[0, 2], [2, 0], [4, 4]];
+  var WALLS = [[2, 2], [3, 2]];
+  var STEP = {
+    north: [0, 1],
+    south: [0, -1],
+    east: [1, 0],
+    west: [-1, 0]
+  };
+  function createThreeSparksHarness() {
+    const collected = /* @__PURE__ */ new Set();
+    return {
+      goal: "Collect all three sparks on the grid; walls block movement",
+      tempo: 4,
+      stallSeconds: 5,
+      // The static layout is researcher knowledge read from the game's
+      // source (SparkCells/Walls in PieCollectGame.cs); observations carry
+      // only the changing state.
+      async observe(surface) {
+        const snap = await surface.read("snapshot");
+        return {
+          x: snap.x,
+          z: snap.z,
+          score: snap.score,
+          sparks_left: snap.visibleSparks,
+          moves: snap.moves,
+          won: snap.won === true
+        };
+      },
+      options(obs) {
+        const options = [];
+        for (const [dir, [dx, dz]] of Object.entries(STEP)) {
+          const next = [obs.x + dx, obs.z + dz];
+          const onBoard = next[0] >= 0 && next[0] <= 4 && next[1] >= 0 && next[1] <= 4;
+          const wall = WALLS.some(([x, z]) => x === next[0] && z === next[1]);
+          if (!onBoard || wall) continue;
+          const spark = SPARKS.some(([x, z]) => x === next[0] && z === next[1]) && !collected.has(`${next[0]},${next[1]}`);
+          options.push({
+            name: `move_${dir}`,
+            description: `Step ${dir} to (${next[0]}, ${next[1]})${spark ? " and collect the spark" : ""}`,
+            facts: {
+              next: [next[0], next[1]],
+              collects_spark: spark,
+              toward_closest_spark: toward(obs, next, collected)
+            },
+            run: async (surface) => {
+              const moved = await surface.act("step", { dx, dz });
+              if (moved === true && SPARKS.some(([sx, sz]) => sx === next[0] && sz === next[1])) {
+                collected.add(`${next[0]},${next[1]}`);
+              }
+              return moved === true;
+            }
+          });
+        }
+        return options;
+      },
+      status(obs) {
+        if (obs.won === true) {
+          return { state: "done", note: "all three sparks collected", evidence: { score: obs.score, moves: obs.moves } };
+        }
+        return { state: "running" };
+      }
+    };
+  }
+  function toward(obs, next, collected) {
+    const sparks = SPARKS.filter(([sx, sz]) => !collected?.has(`${sx},${sz}`));
+    if (!sparks.length) return false;
+    const here = [obs.x, obs.z];
+    const dist = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
+    const best = Math.min(...sparks.map((s) => dist(here, s)));
+    const after = Math.min(...sparks.map((s) => dist(next, s)));
+    return after < best;
+  }
+
+  // src/game-use/decide/providers.ts
+  function createScriptedDecider(policy, kind = "scripted") {
+    return {
+      kind,
+      // async so a policy that throws synchronously still rejects (callers
+      // hold a promise, never a sync throw across the decider boundary)
+      async decide(request) {
+        const started = nowMs();
+        const choice = policy(request);
+        const invalid = Object.keys(request.options).includes(choice) ? null : `policy chose "${choice}"`;
+        if (invalid) throw new DecideError(invalid, false);
+        return {
+          choice,
+          latencyS: (nowMs() - started) / 1e3,
+          model: kind
+        };
+      }
+    };
+  }
+
+  // src/game-use/decide/jev.ts
+  var JEV_MODEL = "jev-1.13.0";
+  var DECIDE_TIMEOUT_MS = 1500;
+  var WARM_TIMEOUT_MS = 5e3;
+  var WARM_EVERY_MS = 15e3;
+  var API_PATH = "/v1/systemone";
+  function choiceQuestion(request) {
+    const lines = Object.entries(request.options).map(
+      ([name, option]) => `- ${name}: ${option.description}${factsLine(option.facts)}`
+    );
+    const plan = request.plan ? ` Plan: now "${request.plan.now?.what ?? "\u2014"}"; done: ${request.plan.done.join(", ") || "none"}; next: ${request.plan.next.join("; ") || "none"}.` : "";
+    const running = request.nowDoing ? ` Now doing: ${request.nowDoing.option} (${request.nowDoing.working ? "working" : "not working yet"}).` : "";
+    const recent = request.recent.length ? ` Recently: ${request.recent.slice(-5).map((r) => `${r.option}=${r.worked ? "ok" : "failed"}`).join(", ")}.` : "";
+    return `${request.instructions ?? ""} Goal: ${request.goal}.${plan}${running}${recent}
+Situation: ${JSON.stringify(request.situation)}
+Options:
+${lines.join("\n")}`;
+  }
+  function factsLine(facts) {
+    const entries = Object.entries(facts);
+    if (!entries.length) return "";
+    return ` (${entries.map(([k, v]) => v === null ? `${k}=null` : `${k}=${v}`).join(", ")})`;
+  }
+  function optionBody(option) {
+    return option.description + factsLine(option.facts);
+  }
+  async function post(options, path3, body, timeoutMs) {
+    const url = (options.baseUrl ?? "https://api.typesafe.ai") + path3;
+    const response = await options.http.request(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${options.apiKey}`,
+        // Bodies go uncompressed: some relays drop Content-Encoding bodies.
+        "accept-encoding": "identity"
+      },
+      body: JSON.stringify(body),
+      timeoutMs
+    });
+    return { status: response.status, body: await response.text() };
+  }
+  function parseChoice(body) {
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      throw new DecideError(`jev answered non-JSON (${body.slice(0, 120)})`, false);
+    }
+    const choice = parsed.answers?.pick?.choice;
+    if (typeof choice !== "string" || !choice) {
+      throw new DecideError("jev answer carries no answers.pick.choice", false);
+    }
+    const usage = parsed.usage ? {
+      input: parsed.usage.input_tokens ?? 0,
+      output: parsed.usage.output_tokens ?? 0,
+      cacheRead: parsed.usage.cache_read_tokens ?? 0
+    } : void 0;
+    return { choice, usage, model: parsed.model };
+  }
+  function createJevDecider(options) {
+    const model = options.model ?? JEV_MODEL;
+    const DECIDE_TIMEOUT = options.timeoutMs ?? DECIDE_TIMEOUT_MS;
+    let lastUsedAt = 0;
+    let warming = false;
+    const CACHE_TTL_MS = options.cacheTtlMs ?? 3e4;
+    let cacheKey = "";
+    let cacheAnswer = null;
+    let cacheAt = 0;
+    async function warmOnce() {
+      if (warming || Date.now() - lastUsedAt < WARM_EVERY_MS) return;
+      warming = true;
+      try {
+        await post(options, "/v1/models", { models: [model] }, WARM_TIMEOUT_MS);
+      } catch {
+      } finally {
+        warming = false;
+        lastUsedAt = Date.now();
+      }
+    }
+    return {
+      kind: "jev",
+      async decide(request) {
+        const started = nowMs();
+        lastUsedAt = Date.now();
+        const names = Object.keys(request.options);
+        if (!names.length) throw new DecideError("no options offered", false);
+        const key = JSON.stringify([request.goal, request.situation, request.options, request.instructions ?? null, request.nowDoing, request.recent, request.plan]);
+        if (CACHE_TTL_MS > 0 && cacheAnswer !== null && key === cacheKey && nowMs() - cacheAt < CACHE_TTL_MS) {
+          const parsed2 = parseChoice(cacheAnswer);
+          return { choice: parsed2.choice, latencyS: 0, usage: { input: 0, output: 0 }, model: parsed2.model ?? model };
+        }
+        const body = {
+          model,
+          state: {
+            goal: request.goal,
+            situation: request.situation,
+            now_doing: request.nowDoing,
+            recent: request.recent,
+            plan: request.plan
+          },
+          questions: {
+            pick: {
+              type: "choice",
+              instructions: request.instructions ?? choiceQuestion(request),
+              criteria: Object.fromEntries(
+                Object.entries(request.options).map(([name, o]) => [name, optionBody(o)])
+              )
+            }
+          }
+        };
+        let answer;
+        try {
+          const first = await post(options, API_PATH, body, DECIDE_TIMEOUT);
+          if (first.status >= 500 || first.status === 429) {
+            const second = await post(options, API_PATH, body, DECIDE_TIMEOUT);
+            answer = second.status >= 200 && second.status < 300 ? second.body : first.body;
+          } else if (first.status < 200 || first.status >= 300) {
+            throw new DecideError(`jev HTTP ${first.status}: ${first.body.slice(0, 160)}`, false);
+          } else {
+            answer = first.body;
+            void warmOnce();
+          }
+        } catch (error) {
+          const retryable = !(error instanceof DecideError) || error.retryable;
+          if (!retryable) throw error;
+          const retry = await post(options, API_PATH, body, DECIDE_TIMEOUT);
+          if (retry.status < 200 || retry.status >= 300) {
+            throw new DecideError(`jev retry HTTP ${retry.status}: ${retry.body.slice(0, 160)}`, false);
+          }
+          answer = retry.body;
+        }
+        const parsed = parseChoice(answer);
+        cacheKey = key;
+        cacheAnswer = answer;
+        cacheAt = nowMs();
+        return {
+          choice: parsed.choice,
+          latencyS: (nowMs() - started) / 1e3,
+          usage: parsed.usage,
+          model: parsed.model ?? model
+        };
+      }
+    };
+  }
+
+  // src/game-use/run/game-use-bridge.ts
+  function gameUseHttpClient() {
+    return {
+      async request(url, options = {}) {
+        const headers = options.headers ?? {};
+        const bearer = String(headers.authorization ?? headers.Authorization ?? "").replace(/^Bearer\s+/i, "");
+        const extra = {};
+        for (const [key, value] of Object.entries(headers)) {
+          const lower = key.toLowerCase();
+          if (lower === "authorization" || lower === "content-type") continue;
+          extra[key] = value;
+        }
+        const headersJson = Object.keys(extra).length ? JSON.stringify(extra) : "";
+        const raw = await puer.$promise(
+          CS.Pie.PieHttpBridge.FetchTextAsync(options.method ?? "POST", url, options.body ?? "", bearer, headersJson)
+        );
+        const parsed = JSON.parse(String(raw || "{}"));
+        return {
+          status: Number(parsed.status ?? 0),
+          text: async () => String(parsed.body ?? "")
+        };
+      }
+    };
+  }
+  function inlineHarness(h) {
+    return {
+      goal: h.goal,
+      tempo: h.tempo,
+      stallSeconds: h.stallSeconds,
+      observe: async (surface) => await h.observe({ read: (k) => surface.read(k) }),
+      options: (obs) => h.options(obs).map((option) => ({
+        name: option.name,
+        description: option.description,
+        facts: option.facts,
+        run: async (surface) => option.run({
+          read: (k) => surface.read(k),
+          act: (action, args) => surface.act(action, args)
+        })
+      })),
+      status: (obs) => h.status(obs)
+    };
+  }
+  function createGameUseScriptApi(runtime) {
+    return {
+      async runEpisode(config) {
+        const harness = harnessById(config.harness);
+        const surface = createUnitySurface(runtime, { readPath: config.readPath, actPath: config.actPath });
+        const clock = createUnityClock(runtime);
+        const decider = config.decider === "jev" ? createJevDecider({
+          apiKey: config.jevKey ?? "",
+          baseUrl: void 0,
+          http: config.jevHttp ?? gameUseHttpClient(),
+          timeoutMs: 8e3
+        }) : deciderById(config.decider);
+        return runEpisode({
+          harness,
+          decider,
+          surface,
+          clock,
+          maxSeconds: config.maxSeconds,
+          episode: "script",
+          onDecision: config.onDecision,
+          watch: config.detectors === false ? null : await GameWatch.start(runtime)
+        });
+      },
+      async playWithHarness(config) {
+        if (config.jev && config.policy) throw new Error("pass either jev or policy, not both");
+        const surface = createUnitySurface(runtime, { readPath: config.readPath, actPath: "unused" });
+        const clock = createUnityClock(runtime);
+        const watch = config.detectors === false ? null : await GameWatch.start(runtime);
+        {
+          const budget = Math.min(1e5, Math.ceil((config.maxSeconds ?? 60) * 60 * 1.5));
+          await Promise.resolve().then(() => runtime.call("CS.Pie.GameUse.PieInputHands.SetEpisodeActive", [budget])).catch(() => void 0);
+        }
+        const decider = config.jev ? createJevDecider({
+          apiKey: config.jev.key,
+          baseUrl: config.jev.baseUrl,
+          // The host HTTP bridge (PieHttpBridge: managed async HTTP
+          // awaited as a PuerTS promise — the same path the agent's
+          // own LLM calls take, no timers and no polling).
+          http: gameUseHttpClient(),
+          timeoutMs: 8e3
+        }) : createScriptedDecider(config.policy ?? inlineGreedyPolicy(), config.policy ? "scripted" : "greedy-inline");
+        const episode = await runEpisode({
+          harness: inlineHarness(config.harness),
+          decider,
+          fallbackDecider: config.jev ? createScriptedDecider(inlineGreedyPolicy(), "greedy-fallback") : void 0,
+          surface,
+          clock,
+          maxSeconds: config.maxSeconds,
+          episode: config.jev ? "jev" : "inline",
+          onDecision: config.onDecision,
+          watch
+        });
+        return { episode, report: formatGameUseReport({ episode }) };
+      }
+    };
+  }
+  function harnessById(id) {
+    if (id === "three_sparks") return createThreeSparksHarness();
+    throw new Error(`unknown harness "${id}"`);
+  }
+  function inlineGreedyPolicy() {
+    return (request) => {
+      let best = "";
+      let bestScore = -Infinity;
+      for (const [name, option] of Object.entries(request.options)) {
+        let value = 0;
+        if (option.facts.collects_spark === true) value += 4;
+        if (option.facts.toward_closest_spark === true) value += 2;
+        if (typeof option.facts.steps_to_goal === "number") value -= option.facts.steps_to_goal / 100;
+        if (value > bestScore) {
+          bestScore = value;
+          best = name;
+        }
+      }
+      return best || Object.keys(request.options)[0];
+    };
+  }
+  function deciderById(id) {
+    const kind = id ?? "greedy";
+    if (kind === "greedy") {
+      return createScriptedDecider((request) => {
+        let best = "";
+        let bestScore = -Infinity;
+        for (const [name, option] of Object.entries(request.options)) {
+          let value = 0;
+          if (option.facts.collects_spark === true) value += 4;
+          if (option.facts.toward_closest_spark === true) value += 2;
+          if (typeof option.facts.steps_to_goal === "number") value -= option.facts.steps_to_goal / 100;
+          if (value > bestScore) {
+            bestScore = value;
+            best = name;
+          }
+        }
+        return best || Object.keys(request.options)[0];
+      }, "greedy");
+    }
+    throw new Error(`unknown decider "${kind}"`);
+  }
+
+  // src/game-use/run/harness-driver.ts
+  function normalizeHarnessExports(source) {
+    const text = String(source || "");
+    let ast;
+    try {
+      ast = parse4(text, { ecmaVersion: "latest", sourceType: "module" });
+    } catch (error) {
+      throw new Error(`game_use_run: harnessSource is not valid JavaScript: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const edits = [];
+    for (const node of ast.body) {
+      if (String(node.type) === "ImportDeclaration") {
+        throw new Error("game_use_run: harnessSource must not contain imports; inline everything the harness needs.");
+      }
+      if (String(node.type) !== "ExportDefaultDeclaration" && String(node.type) !== "ExportNamedDeclaration") continue;
+      if (String(node.type) === "ExportDefaultDeclaration") {
+        const decl2 = node.declaration;
+        const exprStart = decl2 && ["FunctionDeclaration", "ClassDeclaration", "ArrowFunctionExpression", "FunctionExpression"].includes(decl2.type) ? Number(decl2.start) : Number(node.start) + "export default".length;
+        edits.push({ at: Number(node.start), end: exprStart, text: "const __pieHarnessDefault = " });
+        continue;
+      }
+      const decl = node.declaration;
+      if (decl) {
+        const exportedNames = String(decl.type) === "VariableDeclaration" ? (decl.declarations || []).map((d) => d.id?.name ?? "") : [decl.id?.name ?? ""];
+        if (String(decl.type) !== "VariableDeclaration" && !exportedNames.includes("harness")) {
+          throw new Error(`game_use_run: only the harness may be exported (found "${exportedNames[0] || "anonymous"}"); the driver provides run(ctx, args).`);
+        }
+        edits.push({ at: Number(node.start), end: Number(decl.start), text: "" });
+        continue;
+      }
+      const specifiers = node.specifiers || [];
+      const allowed = specifiers.length > 0 && specifiers.every((spec) => {
+        const local = spec.local?.name;
+        const exported = spec.exported?.name ?? local;
+        return local === "harness" && (exported === "harness" || exported === "default");
+      });
+      if (!allowed) {
+        throw new Error("game_use_run: only the harness export may be listed (export { harness } or export { harness as default }).");
+      }
+      edits.push({ at: Number(node.start), end: Number(node.end), text: "" });
+    }
+    return applyUnitySourceEdits(text, edits);
+  }
+  function policyFunctionSource(policySource) {
+    const text = String(policySource || "").trim();
+    if (!text) throw new Error("game_use_run: policySource must be a function expression like (request) => optionName.");
+    let parsed;
+    try {
+      parsed = parse4(`(${text})`, { ecmaVersion: "latest", sourceType: "module" });
+    } catch (error) {
+      throw new Error(`game_use_run: policySource is not a valid expression: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const body = parsed.body;
+    if (body.length !== 1 || String(body[0]?.type) !== "ExpressionStatement") {
+      throw new Error("game_use_run: policySource must be a single function expression.");
+    }
+    const expr = body[0].expression;
+    if (!expr || !["ArrowFunctionExpression", "FunctionExpression"].includes(String(expr.type))) {
+      throw new Error("game_use_run: policySource must be a function expression like (request) => optionName.");
+    }
+    return text;
+  }
+  function harnessDriverSource(harnessSource, options = {}) {
+    const policy = options.policySource !== void 0 && options.policySource !== null && String(options.policySource).trim() !== "" ? policyFunctionSource(String(options.policySource)) : null;
+    return `export async function run(ctx, args) {
+${normalizeHarnessExports(harnessSource)}
+;
+  const resolved = (typeof harness !== "undefined" && harness) || (typeof __pieHarnessDefault !== "undefined" && __pieHarnessDefault) || null;
+  if (!resolved) throw new Error("game_use_run: the harness module must export the harness object (a default export, or a named export called 'harness').");
+  if (args.resetPath) await ctx.runtime.call(args.resetPath, []);
+  if (args.runInBackground === true) await ctx.runtime.call("CS.Pie.GameUse.PieRuntimeOptions.SetRunInBackground", [true]);
+  const trail = [];
+  const episode = await ctx.gameUse.playWithHarness({
+    readPath: args.readPath,
+    maxSeconds: args.maxSeconds,
+    jev: args.jev,${policy ? "\n    policy: __piePolicy," : ""}
+    harness: resolved,
+    onDecision: (record) => trail.push({ call: record.call, chosen: record.chosen, situation: record.request.situation }),
+  });
+  return { episode, trail };
+}
+${policy ? `const __piePolicy = ${policy};
+` : ""}`;
+  }
+
+  // src/unity-frame-clock.ts
   function currentUnityFrame() {
     const application = typeof CS !== "undefined" ? CS?.UnityEngine?.Application : void 0;
     if (!application?.isPlaying) return void 0;
@@ -46742,6 +48244,14 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       return last ?? 0;
     };
   }
+
+  // src/unity-script-host.ts
+  var SOFT_SLICE_MS = 4;
+  var DEFAULT_TOTAL_TIMEOUT_MS = 3e4;
+  var DEFAULT_PER_STEP_TIMEOUT_MS = 100;
+  var DEFAULT_MAX_FRAMES = 1800;
+  var MAX_LOG_LINES = 200;
+  var STEP_TIMEOUT_ERROR_CODE = "STEP_TIMEOUT";
   var defaultSliceClock = createSliceClock();
   function sliceNowMs() {
     return scriptScheduler.sliceNow?.() ?? defaultSliceClock();
@@ -46763,20 +48273,20 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     }
     return existing;
   }
-  function nowMs() {
+  function nowMs2() {
     return scriptScheduler.now();
   }
   function nowIso3() {
-    return scriptScheduler.isoNow?.() ?? new Date(nowMs()).toISOString();
+    return scriptScheduler.isoNow?.() ?? new Date(nowMs2()).toISOString();
   }
   function createRunId() {
-    return `unity_script_run_${nowMs().toString(36)}_${(scriptScheduler.random?.() ?? Math.random()).toString(36).slice(2, 8)}`;
+    return `unity_script_run_${nowMs2().toString(36)}_${(scriptScheduler.random?.() ?? Math.random()).toString(36).slice(2, 8)}`;
   }
   function toPositiveNumber(value, fallback) {
     const numeric2 = Number(value);
     return Number.isFinite(numeric2) && numeric2 > 0 ? numeric2 : fallback;
   }
-  function summarizeValue2(value) {
+  function summarizeValue(value) {
     if (value === null) return "null";
     if (value === void 0) return "undefined";
     if (Array.isArray(value)) return `Array(${value.length})`;
@@ -46787,19 +48297,9 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     return String(value);
   }
   function toSerializable(value) {
-    if (value === null || value === void 0) return value ?? null;
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
-    if (Array.isArray(value)) return value.map((item) => toSerializable(item));
-    if (typeof value === "object") {
-      try {
-        return JSON.parse(JSON.stringify(value));
-      } catch {
-        return { text: String(value) };
-      }
-    }
-    return String(value);
+    return safeSerializeScriptValue(value);
   }
-  function isRecord9(value) {
+  function isRecord10(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function createScriptHostError(code, message) {
@@ -46808,14 +48308,14 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     return error;
   }
   function extractRefs(value) {
-    if (!isRecord9(value)) return [];
+    if (!isRecord10(value)) return [];
     if (Array.isArray(value.results)) return value.results;
     if (Array.isArray(value.createdRefs)) return value.createdRefs;
     if (value.target) return [value.target];
     return [];
   }
   function isStepTimeoutError(error) {
-    return isRecord9(error) && (error.code === STEP_TIMEOUT_ERROR_CODE || error.name === "PieStepTimeoutError");
+    return isRecord10(error) && (error.code === STEP_TIMEOUT_ERROR_CODE || error.name === "PieStepTimeoutError");
   }
   function buildStatus(task) {
     const done = task.status === "completed" || task.status === "failed" || task.status === "cancelled";
@@ -46832,14 +48332,14 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       status: task.status,
       done,
       ok: task.status === "completed",
-      summary: task.status === "completed" ? summarizeValue2(task.result) : task.errorMessage || task.status,
+      summary: task.status === "completed" ? summarizeValue(task.result) : task.errorMessage || task.status,
       result: task.status === "completed" ? toSerializable(task.result) : null,
       errorCode: task.errorCode,
       errorMessage: task.errorMessage,
       logs: task.logs.slice(-MAX_LOG_LINES),
       refs: toSerializable(task.createdRefs || []),
       frames: task.frames,
-      durationMs: Math.max(0, nowMs() - task.startMs),
+      durationMs: Math.max(0, nowMs2() - task.startMs),
       totalTimeoutMs: task.totalTimeoutMs,
       perStepTimeoutMs: task.perStepTimeoutMs,
       maxFrames: task.maxFrames,
@@ -46904,7 +48404,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     notifyWaiters(task);
   }
   function getTaskDeadlineError(task) {
-    const now = nowMs();
+    const now = nowMs2();
     if (now - task.startMs > task.totalTimeoutMs) {
       return createScriptHostError("TOTAL_TIMEOUT", `Unity script run exceeded ${task.totalTimeoutMs}ms.`);
     }
@@ -47086,7 +48586,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
         return createStepGate(Math.max(1, Math.floor(Number(frames) || 1)), 0);
       },
       waitSeconds(seconds) {
-        return createStepGate(0, nowMs() + Math.max(0, Number(seconds) || 0) * 1e3);
+        return createStepGate(0, nowMs2() + Math.max(0, Number(seconds) || 0) * 1e3);
       },
       query(input = {}) {
         return runHostAction(() => unity.query(input));
@@ -47100,7 +48600,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
           if (input.action === "create_scene_object") task.createdRefs.push(...extractRefs(result));
           task.mutations.push({
             action: "unity_scene_object_edit",
-            target: isRecord9(result) && result.target !== void 0 ? result.target : null,
+            target: isRecord10(result) && result.target !== void 0 ? result.target : null,
             summary: typeof input.action === "string" ? input.action : "edit"
           });
           return result;
@@ -47109,7 +48609,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       refresh() {
         return runHostAction(() => unity.refresh());
       },
-      rollback() {
+      async rollback() {
         const rollbackRefs = [...task.createdRefs].reverse();
         const rollbackState = { rolledBack: 0, failures: [] };
         let rollbackCursor = 0;
@@ -47130,12 +48630,17 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
           }
           assertTaskActive(task);
         });
-        return (async () => {
-          while (rollbackCursor < rollbackRefs.length && task.status === "running") await destroyNext();
-          return { rolledBack: rollbackState.rolledBack, failures: rollbackState.failures };
-        })();
+        while (rollbackCursor < rollbackRefs.length && task.status === "running") await destroyNext();
+        return { rolledBack: rollbackState.rolledBack, failures: rollbackState.failures };
       },
       host: hostSelector,
+      gameUse: createGameUseScriptApi({
+        call: (path3, callArgs = []) => runHostAction(() => getRuntimeApi().call(path3, callArgs)),
+        waitFrames: (frames) => createStepGate(Math.max(1, Math.floor(Number(frames) || 1)), 0),
+        get frame() {
+          return task.frames;
+        }
+      }),
       runtime: {
         has: (path3) => {
           assertTaskActive(task);
@@ -47155,7 +48660,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
         return task.frames;
       },
       get elapsedMs() {
-        return nowMs() - task.startMs;
+        return nowMs2() - task.startMs;
       }
     };
   }
@@ -47167,7 +48672,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   }
   function classifyScriptError(error) {
     if (isStepTimeoutError(error)) return "STEP_TIMEOUT";
-    if (isRecord9(error) && typeof error.code === "string" && error.code) return String(error.code);
+    if (isRecord10(error) && typeof error.code === "string" && error.code) return String(error.code);
     return "SCRIPT_ERROR";
   }
   function describeScriptError(error) {
@@ -47195,7 +48700,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   }
   function stepTask(task) {
     if (task.status !== "running") return;
-    const now = nowMs();
+    const now = nowMs2();
     if (now - task.startMs > task.totalTimeoutMs) {
       failTask(task, "TOTAL_TIMEOUT", `Unity script run exceeded ${task.totalTimeoutMs}ms.`);
       return;
@@ -47243,7 +48748,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       mutations: [],
       frames: 0,
       lastHostFrame: scriptScheduler.frame?.(),
-      startMs: nowMs(),
+      startMs: nowMs2(),
       updatedAt: nowIso3(),
       totalTimeoutMs: toPositiveNumber(payload.totalTimeoutMs, DEFAULT_TOTAL_TIMEOUT_MS),
       perStepTimeoutMs: toPositiveNumber(payload.perStepTimeoutMs, DEFAULT_PER_STEP_TIMEOUT_MS),
@@ -47259,10 +48764,10 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       if (!script.trim()) {
         throw new Error("script is required");
       }
-      const args = isRecord9(payload.args) ? payload.args : {};
+      const args = isRecord10(payload.args) ? payload.args : {};
       const ctx = createTaskContext(bridge2, task, args);
-      const entry = compileUnityScriptEntry(script, () => assertTaskActive(task));
-      task.stepStartMs = nowMs();
+      const entry = compileUnityScriptEntry(script, () => assertTaskActive(task), {});
+      task.stepStartMs = nowMs2();
       task.sliceStartMs = sliceNowMs();
       settleEntryResult(task, entry(ctx, args));
     } catch (error) {
@@ -47281,7 +48786,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   var MAX_RETAINED_TASKS = 100;
   function pruneRunStore() {
     const store = getRunStore();
-    const now = nowMs();
+    const now = nowMs2();
     const terminal = [];
     for (const task of store.values()) {
       if (task.status === "running") continue;
@@ -47330,7 +48835,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     globalThis.__pieUnityScriptHost = {
       invoke(method, argsJson) {
         const parsedPayload = argsJson ? JSON.parse(String(argsJson)) : {};
-        const payload = isRecord9(parsedPayload) ? parsedPayload : {};
+        const payload = isRecord10(parsedPayload) ? parsedPayload : {};
         switch (String(method || "")) {
           case "run_start": {
             if (!installedBridge) throw new Error("Unity script host bridge is not installed.");
@@ -47345,6 +48850,31 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
             cancelTask(task, String(payload.reason || "Unity script run cancelled."));
             return JSON.stringify(buildStatus(task));
           }
+          case "game_use_start": {
+            if (!installedBridge) throw new Error("Unity script host bridge is not installed.");
+            const harnessSource = String(payload.harnessSource ?? "");
+            const readPath = String(payload.readPath ?? "");
+            if (!harnessSource.trim()) throw new Error("harnessSource is required.");
+            if (!readPath.trim()) throw new Error("readPath is required.");
+            if (payload.jev && payload.policySource) throw new Error("pass either jev or policySource, not both.");
+            const task = createScriptRun(installedBridge, {
+              script: harnessDriverSource(harnessSource, {
+                policySource: payload.policySource === void 0 || payload.policySource === null ? void 0 : String(payload.policySource)
+              }),
+              name: "game_use_run",
+              args: {
+                readPath,
+                resetPath: payload.resetPath,
+                runInBackground: payload.runInBackground === true,
+                maxSeconds: payload.maxSeconds,
+                jev: payload.jev
+              },
+              totalTimeoutMs: typeof payload.totalTimeoutMs === "number" ? payload.totalTimeoutMs : 12e4,
+              perStepTimeoutMs: typeof payload.perStepTimeoutMs === "number" ? payload.perStepTimeoutMs : void 0,
+              maxFrames: typeof payload.maxFrames === "number" ? payload.maxFrames : 9e3
+            });
+            return JSON.stringify(buildStatus(task));
+          }
           default:
             throw new Error(`Unknown unity script host method: ${method}`);
         }
@@ -47355,494 +48885,125 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     };
   }
 
-  // ../../node_modules/@toon-format/toon/dist/index.mjs
-  var NULL_LITERAL = "null";
-  var DELIMITERS = {
-    comma: ",",
-    tab: "	",
-    pipe: "|"
-  };
-  var DEFAULT_DELIMITER = DELIMITERS.comma;
-  function escapeString(value) {
-    return value.replace(/\\/g, `\\\\`).replace(/"/g, `\\"`).replace(/\n/g, `\\n`).replace(/\r/g, `\\r`).replace(/\t/g, `\\t`).replace(/[\u0000-\u001F]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  // src/tools/game-use-run.ts
+  function requireBridge() {
+    const bridge2 = globalThis.pieBridge;
+    if (!bridge2?.devRpc?.call) {
+      throw new Error("pieBridge.devRpc is not available.");
+    }
+    return bridge2;
   }
-  function isBooleanOrNullLiteral(token) {
-    return token === "true" || token === "false" || token === "null";
+  function splitToolParams(value) {
+    if (!value || typeof value !== "object") return { rpcArgs: {}, full: false };
+    const record2 = value;
+    const { full, ...rpcArgs } = record2;
+    return { rpcArgs, full: full === true };
   }
-  function setOwnProperty(target, key, value) {
-    if (key === "__proto__") {
-      Object.defineProperty(target, key, {
-        value,
-        enumerable: true,
-        writable: true,
-        configurable: true
-      });
-      return;
-    }
-    target[key] = value;
-  }
-  var COMMENT_LINE_PATTERN = new RegExp(`(?:^\uFEFF?|\\n) *#`);
-  var RawString = class {
-    constructor(value) {
-      if (COMMENT_LINE_PATTERN.test(value)) throw new TypeError(`Raw string must not contain a line starting with "#": ${JSON.stringify(value)}`);
-      this.value = value;
-    }
-  };
-  function isRawString(value) {
-    return value instanceof RawString;
-  }
-  var SURROGATE_PATTERN = /[\uD800-\uDFFF]/;
-  function normalizeValue(value) {
-    if (value === null) return null;
-    if (isRawString(value)) return value;
-    if (typeof value === "object" && value !== null && "toJSON" in value && typeof value.toJSON === "function") {
-      const next = value.toJSON();
-      if (next !== value) return normalizeValue(next);
-    }
-    if (typeof value === "string") {
-      assertNoLoneSurrogate(value, "string value");
-      return value;
-    }
-    if (typeof value === "boolean") return value;
-    if (typeof value === "number") {
-      if (Object.is(value, -0)) return 0;
-      if (!Number.isFinite(value)) return null;
-      return value;
-    }
-    if (typeof value === "bigint") {
-      if (value >= Number.MIN_SAFE_INTEGER && value <= Number.MAX_SAFE_INTEGER) return Number(value);
-      return value.toString();
-    }
-    if (value instanceof Date) return value.toISOString();
-    if (Array.isArray(value)) return value.map(normalizeValue);
-    if (value instanceof Set) return Array.from(value).map(normalizeValue);
-    if (value instanceof Map) return Object.fromEntries(Array.from(value, ([k, v]) => [String(k), normalizeValue(v)]));
-    if (isPlainObject(value)) {
-      const encodedValues = {};
-      for (const key in value) if (Object.hasOwn(value, key)) {
-        assertNoLoneSurrogate(key, "object key");
-        setOwnProperty(encodedValues, key, normalizeValue(value[key]));
-      }
-      return encodedValues;
-    }
-    return null;
-  }
-  function assertNoLoneSurrogate(value, context) {
-    if (!SURROGATE_PATTERN.test(value)) return;
-    for (let index = 0; index < value.length; index++) {
-      const code = value.charCodeAt(index);
-      if (code < 55296 || code > 57343) continue;
-      const isHighSurrogate = code <= 56319;
-      const next = value.charCodeAt(index + 1);
-      if (isHighSurrogate && next >= 56320 && next <= 57343) {
-        index++;
-        continue;
-      }
-      throw new TypeError(`Cannot encode ${context} containing an unpaired surrogate U+${code.toString(16).toUpperCase()} at index ${index}`);
+  function episodeReportText(result) {
+    if (!result || typeof result !== "object") return "";
+    const status = result;
+    if (status.status !== "completed") return "";
+    const payload = status.result;
+    if (!payload || typeof payload !== "object") return "";
+    const props = payload.properties;
+    const source = props && typeof props === "object" ? props : payload;
+    const episode = unwrapEpisode(source.episode);
+    if (!episode) return "";
+    try {
+      return formatGameUseReport({ episode, trail: Array.isArray(source.trail) ? source.trail : void 0 });
+    } catch {
+      return "";
     }
   }
-  function isJsonPrimitive(value) {
-    return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
-  }
-  function isEncodablePrimitive(value) {
-    return isJsonPrimitive(value) || isRawString(value);
-  }
-  function isJsonArray(value) {
-    return Array.isArray(value);
-  }
-  function isJsonObject(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value) && !isRawString(value);
-  }
-  function isEmptyObject(value) {
-    return Object.keys(value).length === 0;
-  }
-  function isPlainObject(value) {
-    if (value === null || typeof value !== "object") return false;
-    const prototype = Object.getPrototypeOf(value);
-    return prototype === null || prototype === Object.prototype;
-  }
-  function isArrayOfPrimitives(value) {
-    return value.length === 0 || value.every((item) => isEncodablePrimitive(item));
-  }
-  function isArrayOfArrays(value) {
-    return value.length === 0 || value.every((item) => isJsonArray(item));
-  }
-  function isArrayOfObjects(value) {
-    return value.length === 0 || value.every((item) => isJsonObject(item));
-  }
-  var NUMERIC_LIKE_PATTERN = /^[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i;
-  function assertValidDelimiter(delimiter) {
-    if (!Object.values(DELIMITERS).includes(delimiter)) throw new TypeError(`Invalid delimiter ${JSON.stringify(delimiter)}. Valid delimiters are: comma (,), tab (\\t), pipe (|)`);
-  }
-  function isValidUnquotedKey(key) {
-    return /^[A-Z_][\w.]*$/i.test(key);
-  }
-  function isSafeUnquoted(value, delimiter = DEFAULT_DELIMITER) {
-    if (!value) return false;
-    if (/^[ \t]|[ \t]$/.test(value)) return false;
-    if (isBooleanOrNullLiteral(value) || isNumericLike(value)) return false;
-    if (value.includes(":")) return false;
-    if (value.includes('"') || value.includes("\\")) return false;
-    if (/[[\]{}]/.test(value)) return false;
-    if (/[\u0000-\u001F]/.test(value)) return false;
-    if (value.includes(delimiter)) return false;
-    if (value.startsWith("-")) return false;
-    if (value.startsWith("#")) return false;
-    return true;
-  }
-  function isNumericLike(value) {
-    return NUMERIC_LIKE_PATTERN.test(value);
-  }
-  function encodePrimitive(value, delimiter) {
-    if (isRawString(value)) return value.value;
-    if (value === null) return NULL_LITERAL;
-    if (typeof value === "boolean") return String(value);
-    if (typeof value === "number") return String(value);
-    return encodeStringLiteral(value, delimiter);
-  }
-  function encodeStringLiteral(value, delimiter = DEFAULT_DELIMITER) {
-    if (isSafeUnquoted(value, delimiter)) return value;
-    return `"${escapeString(value)}"`;
-  }
-  function encodeKey(key) {
-    if (isValidUnquotedKey(key)) return key;
-    return `"${escapeString(key)}"`;
-  }
-  function encodeAndJoinPrimitives(values, delimiter = DEFAULT_DELIMITER) {
-    return values.map((v) => encodePrimitive(v, delimiter)).join(delimiter);
-  }
-  function formatHeader(length, options) {
-    const key = options?.key;
-    const fields = options?.fields;
-    const delimiter = options?.delimiter ?? ",";
-    let header = "";
-    if (key != null) header += encodeKey(key);
-    header += `[${length}${options?.keyed ? ":" : ""}${delimiter !== DEFAULT_DELIMITER ? delimiter : ""}]`;
-    if (fields) header += `{${formatFieldSegment(fields, delimiter)}}`;
-    header += ":";
-    return header;
-  }
-  function formatFieldSegment(fields, delimiter) {
-    return fields.map((field) => encodeKey(field.name) + (field.children ? `{${formatFieldSegment(field.children, delimiter)}}` : "")).join(delimiter);
-  }
-  function extractTabularFields(rows) {
-    if (rows.length === 0) return;
-    const firstKeys = Object.keys(rows[0]);
-    if (firstKeys.length === 0) return;
-    for (const row of rows) {
-      if (Object.keys(row).length !== firstKeys.length) return;
-      for (const key of firstKeys) if (!Object.hasOwn(row, key)) return;
+  function unwrapEpisode(value) {
+    if (!value || typeof value !== "object") return null;
+    const record2 = value;
+    if (record2.episode && typeof record2.episode === "object") {
+      return record2.episode;
     }
-    const fieldNodes = [];
-    for (const key of firstKeys) {
-      const fieldNode = classifyColumn(key, rows.map((row) => row[key]));
-      if (!fieldNode) return;
-      fieldNodes.push(fieldNode);
-    }
-    return fieldNodes;
+    return typeof record2.outcome === "string" ? record2 : null;
   }
-  function extractKeyedTabularFields(value) {
-    const entryValues = Object.values(value);
-    if (entryValues.length < 2) return;
-    if (!entryValues.every((entryValue) => isJsonObject(entryValue) && !isEmptyObject(entryValue))) return;
-    return extractTabularFields(entryValues);
-  }
-  function collectRowLeaves(row, fields) {
-    const leaves = [];
-    collectLeafValues(row, fields, leaves);
-    return leaves;
-  }
-  function classifyColumn(name, values) {
-    if (values.every((value) => isEncodablePrimitive(value))) return { name };
-    if (!values.every((value) => isJsonObject(value) && !isEmptyObject(value))) return;
-    const children = extractTabularFields(values);
-    if (!children) return;
+  function createGameUseRunTool() {
     return {
-      name,
-      children
-    };
-  }
-  function collectLeafValues(row, fields, leaves) {
-    for (const field of fields) {
-      const value = row[field.name];
-      if (field.children) collectLeafValues(value, field.children, leaves);
-      else leaves.push(value);
-    }
-  }
-  function* encodeJsonValue(value, options, depth) {
-    if (isEncodablePrimitive(value)) {
-      const encodedPrimitive = encodePrimitive(value, options.delimiter);
-      if (encodedPrimitive !== "") yield encodedPrimitive;
-      return;
-    }
-    if (isJsonArray(value)) yield* encodeArrayLines(void 0, value, depth, options);
-    else if (isJsonObject(value)) {
-      const keyedFields = extractKeyedTabularFields(value);
-      if (keyedFields) {
-        yield* encodeKeyedObjectLines(void 0, value, keyedFields, depth, options);
-        return;
-      }
-      yield* encodeObjectLines(value, depth, options);
-    }
-  }
-  function* encodeObjectLines(value, depth, options) {
-    for (const [key, val] of Object.entries(value)) yield* encodeKeyValuePairLines(key, val, depth, options);
-  }
-  function* encodeKeyValuePairLines(key, value, depth, options) {
-    const encodedKey = encodeKey(key);
-    if (isEncodablePrimitive(value)) yield indentedLine(depth, `${encodedKey}: ${encodePrimitive(value, options.delimiter)}`, options.indentSize);
-    else if (isJsonArray(value)) yield* encodeArrayLines(key, value, depth, options);
-    else if (isJsonObject(value)) {
-      const keyedFields = extractKeyedTabularFields(value);
-      if (keyedFields) {
-        yield* encodeKeyedObjectLines(key, value, keyedFields, depth, options);
-        return;
-      }
-      yield indentedLine(depth, `${encodedKey}:`, options.indentSize);
-      if (!isEmptyObject(value)) yield* encodeObjectLines(value, depth + 1, options);
-    }
-  }
-  function* encodeKeyedObjectLines(key, value, fields, depth, options) {
-    const entries = Object.entries(value);
-    yield indentedLine(depth, formatHeader(entries.length, {
-      key,
-      fields,
-      delimiter: options.delimiter,
-      keyed: true
-    }), options.indentSize);
-    yield* encodeKeyedEntryRowsLines(entries, fields, depth + 1, options);
-  }
-  function* encodeKeyedEntryRowsLines(entries, fields, depth, options) {
-    for (const [entryKey, entryValue] of entries) {
-      const leaves = collectRowLeaves(entryValue, fields);
-      yield indentedLine(depth, `${encodeKey(entryKey)}: ${encodeAndJoinPrimitives(leaves, options.delimiter)}`, options.indentSize);
-    }
-  }
-  function* encodeArrayLines(key, value, depth, options) {
-    if (value.length === 0) {
-      yield indentedLine(depth, key != null ? `${encodeKey(key)}: []` : "[]", options.indentSize);
-      return;
-    }
-    if (isArrayOfPrimitives(value)) {
-      yield indentedLine(depth, encodeInlineArrayLine(value, options.delimiter, key), options.indentSize);
-      return;
-    }
-    if (isArrayOfArrays(value)) {
-      if (value.every((arr) => isArrayOfPrimitives(arr))) {
-        yield* encodeArrayOfArraysAsListItemsLines(key, value, depth, options);
-        return;
-      }
-    }
-    if (isArrayOfObjects(value)) {
-      const fields = extractTabularFields(value);
-      if (fields) yield* encodeArrayOfObjectsAsTabularLines(key, value, fields, depth, options);
-      else yield* encodeMixedArrayAsListItemsLines(key, value, depth, options);
-      return;
-    }
-    yield* encodeMixedArrayAsListItemsLines(key, value, depth, options);
-  }
-  function* encodeArrayOfArraysAsListItemsLines(prefix, values, depth, options) {
-    yield indentedLine(depth, formatHeader(values.length, {
-      key: prefix,
-      delimiter: options.delimiter
-    }), options.indentSize);
-    for (const arr of values) if (isArrayOfPrimitives(arr)) {
-      const arrayLine = encodeInlineArrayLine(arr, options.delimiter);
-      yield indentedListItem(depth + 1, arrayLine, options.indentSize);
-    }
-  }
-  function encodeInlineArrayLine(values, delimiter, prefix) {
-    const header = formatHeader(values.length, {
-      key: prefix,
-      delimiter
-    });
-    const joinedValue = encodeAndJoinPrimitives(values, delimiter);
-    if (values.length === 0) return header;
-    return `${header} ${joinedValue}`;
-  }
-  function* encodeArrayOfObjectsAsTabularLines(prefix, rows, fields, depth, options) {
-    yield indentedLine(depth, formatHeader(rows.length, {
-      key: prefix,
-      fields,
-      delimiter: options.delimiter
-    }), options.indentSize);
-    yield* writeTabularRowsLines(rows, fields, depth + 1, options);
-  }
-  function* writeTabularRowsLines(rows, fields, depth, options) {
-    for (const row of rows) yield indentedLine(depth, encodeAndJoinPrimitives(collectRowLeaves(row, fields), options.delimiter), options.indentSize);
-  }
-  function* encodeMixedArrayAsListItemsLines(prefix, items, depth, options) {
-    yield indentedLine(depth, formatHeader(items.length, {
-      key: prefix,
-      delimiter: options.delimiter
-    }), options.indentSize);
-    for (const item of items) yield* encodeListItemValueLines(item, depth + 1, options);
-  }
-  function* encodeObjectAsListItemLines(obj, depth, options) {
-    if (isEmptyObject(obj)) {
-      yield indentedLine(depth, "-", options.indentSize);
-      return;
-    }
-    const entries = Object.entries(obj);
-    const [firstKey, firstValue] = entries[0];
-    const restEntries = entries.slice(1);
-    if (isJsonArray(firstValue) && isArrayOfObjects(firstValue)) {
-      const fields = extractTabularFields(firstValue);
-      if (fields) {
-        yield indentedListItem(depth, formatHeader(firstValue.length, {
-          key: firstKey,
-          fields,
-          delimiter: options.delimiter
-        }), options.indentSize);
-        yield* writeTabularRowsLines(firstValue, fields, depth + 2, options);
-        if (restEntries.length > 0) yield* encodeObjectLines(Object.fromEntries(restEntries), depth + 1, options);
-        return;
-      }
-    }
-    if (isJsonObject(firstValue)) {
-      const keyedFields = extractKeyedTabularFields(firstValue);
-      if (keyedFields) {
-        const keyedEntries = Object.entries(firstValue);
-        yield indentedListItem(depth, formatHeader(keyedEntries.length, {
-          key: firstKey,
-          fields: keyedFields,
-          delimiter: options.delimiter,
-          keyed: true
-        }), options.indentSize);
-        yield* encodeKeyedEntryRowsLines(keyedEntries, keyedFields, depth + 2, options);
-        if (restEntries.length > 0) yield* encodeObjectLines(Object.fromEntries(restEntries), depth + 1, options);
-        return;
-      }
-    }
-    const encodedKey = encodeKey(firstKey);
-    if (isEncodablePrimitive(firstValue)) yield indentedListItem(depth, `${encodedKey}: ${encodePrimitive(firstValue, options.delimiter)}`, options.indentSize);
-    else if (isJsonArray(firstValue)) if (firstValue.length === 0) yield indentedListItem(depth, `${encodedKey}: []`, options.indentSize);
-    else if (isArrayOfPrimitives(firstValue)) yield indentedListItem(depth, `${encodedKey}${encodeInlineArrayLine(firstValue, options.delimiter)}`, options.indentSize);
-    else {
-      yield indentedListItem(depth, `${encodedKey}${formatHeader(firstValue.length, { delimiter: options.delimiter })}`, options.indentSize);
-      for (const item of firstValue) yield* encodeListItemValueLines(item, depth + 2, options);
-    }
-    else if (isJsonObject(firstValue)) {
-      yield indentedListItem(depth, `${encodedKey}:`, options.indentSize);
-      if (!isEmptyObject(firstValue)) yield* encodeObjectLines(firstValue, depth + 2, options);
-    }
-    if (restEntries.length > 0) yield* encodeObjectLines(Object.fromEntries(restEntries), depth + 1, options);
-  }
-  function* encodeListItemValueLines(value, depth, options) {
-    if (isEncodablePrimitive(value)) yield indentedListItem(depth, encodePrimitive(value, options.delimiter), options.indentSize);
-    else if (isJsonArray(value)) if (isArrayOfPrimitives(value)) yield indentedListItem(depth, encodeInlineArrayLine(value, options.delimiter), options.indentSize);
-    else {
-      yield indentedListItem(depth, formatHeader(value.length, { delimiter: options.delimiter }), options.indentSize);
-      for (const item of value) yield* encodeListItemValueLines(item, depth + 1, options);
-    }
-    else if (isJsonObject(value)) yield* encodeObjectAsListItemLines(value, depth, options);
-  }
-  function indentedLine(depth, content, indentSize) {
-    return " ".repeat(indentSize * depth) + content;
-  }
-  function indentedListItem(depth, content, indentSize) {
-    return indentedLine(depth, "- " + content, indentSize);
-  }
-  function applyReplacer(root, replacer) {
-    const replacedRoot = replacer("", root, []);
-    if (replacedRoot === void 0) return transformChildren(root, replacer, []);
-    return transformReplaced(root, replacedRoot, replacer, []);
-  }
-  function transformReplaced(original, replaced, replacer, path3) {
-    if (isRawString(replaced) && !isEncodablePrimitive(original)) return transformChildren(original, replacer, path3);
-    return transformChildren(normalizeValue(replaced), replacer, path3);
-  }
-  function transformChildren(value, replacer, path3) {
-    if (isJsonObject(value)) return transformObject(value, replacer, path3);
-    if (isJsonArray(value)) return transformArray(value, replacer, path3);
-    return value;
-  }
-  function transformObject(obj, replacer, path3) {
-    const result = {};
-    for (const [key, value] of Object.entries(obj)) {
-      const childPath = [...path3, key];
-      const replacedValue = replacer(key, value, childPath);
-      if (replacedValue === void 0) continue;
-      setOwnProperty(result, key, transformReplaced(value, replacedValue, replacer, childPath));
-    }
-    return result;
-  }
-  function transformArray(arr, replacer, path3) {
-    const result = [];
-    for (let i2 = 0; i2 < arr.length; i2++) {
-      const value = arr[i2];
-      const childPath = [...path3, i2];
-      const replacedValue = replacer(String(i2), value, childPath);
-      if (replacedValue === void 0) continue;
-      result.push(transformReplaced(value, replacedValue, replacer, childPath));
-    }
-    return result;
-  }
-  function encode(input, options) {
-    return Array.from(encodeLines(input, options)).join("\n");
-  }
-  function encodeLines(input, options) {
-    const normalizedValue = normalizeValue(input);
-    const resolvedOptions = resolveOptions(options);
-    return encodeJsonValue(resolvedOptions.replacer ? applyReplacer(normalizedValue, resolvedOptions.replacer) : normalizedValue, resolvedOptions, 0);
-  }
-  function resolveOptions(options) {
-    const delimiter = options?.delimiter ?? DEFAULT_DELIMITER;
-    assertValidDelimiter(delimiter);
-    return {
-      indentSize: options?.indentSize ?? options?.indent ?? 2,
-      delimiter,
-      replacer: options?.replacer
-    };
-  }
+      name: "game_use_run",
+      label: "game_use_run",
+      description: "Run a game-use episode: play the live game toward a goal with a researcher-authored harness. Provide the harness module source (an exported object with `goal`, `observe(surface)`, `options(obs)`, `status(obs)`, optional `tempo`/`stallSeconds`) plus `readPath` (a static C# method returning state JSON, written as the full runtime path string). The decider is a scripted `policySource` (evaluated expression of (request) => optionName) by default; pass `jev: {key}` for live model decisions. Returns the episode outcome (done/failed/stalled/cancelled), evidence, decision count and the decision trail. Read the game-use skill for the harness contract before writing one.",
+      parameters: Type.Object({
+        harnessSource: Type.String({ description: "The harness module source. Must export the harness object (default export or a named export called `harness`) with goal/observe/options/status. Plain data and functions; no imports." }),
+        readPath: Type.String({ description: 'Static C# runtime path the facts pipeline reads each tick (the same string you would pass to ctx.runtime.call). Its return value is JSON and lands in observe() as the "snapshot" key.' }),
+        resetPath: Type.Optional(Type.String({ description: "Optional static C# path called once before the episode starts (e.g. the game's reset method) so verification never rides on a pre-existing state." })),
+        runInBackground: Type.Optional(Type.Boolean({ description: "Keep the player running when unfocused (Application.runInBackground). Recommended true for unattended runs \u2014 an unfocused editor pauses Play Mode otherwise." })),
+        policySource: Type.Optional(Type.String({ description: 'A scripted policy as an expression evaluating to a (request) => optionName function, e.g. "(request) => Object.keys(request.options)[0]". Omit for the built-in greedy (scores collects_spark/toward_closest_spark/steps_to_goal facts).' })),
+        jev: Type.Optional(Type.Object({ key: Type.String(), baseUrl: Type.Optional(Type.String()) }, { description: "Live model decisions through the in-process HTTP bridge. Mutually exclusive with policySource." })),
+        maxSeconds: Type.Optional(Type.Number({ description: "Hard episode cap in game seconds (default 60)." })),
+        maxFrames: Type.Optional(Type.Number({ description: "Script-task frame budget (default 9000)." })),
+        totalTimeoutMs: Type.Optional(Type.Number({ description: "Script-task wall-clock budget (default 120000)." })),
+        perStepTimeoutMs: Type.Optional(Type.Number()),
+        full: Type.Optional(Type.Boolean({ description: "Return untruncated model-facing output when the result is large." }))
+      }),
+      execute: async (_toolCallId, params, signal, onUpdate) => {
+        let rpcArgs;
+        let full = false;
+        try {
+          const split = splitToolParams(params);
+          rpcArgs = split.rpcArgs;
+          full = split.full;
+          const harnessSource = String(rpcArgs.harnessSource ?? "");
+          if (!harnessSource.trim()) throw new Error("harnessSource is required.");
+          const readPath = String(rpcArgs.readPath ?? "");
+          if (!readPath.trim()) throw new Error("readPath is required.");
+          if (rpcArgs.jev && rpcArgs.policySource) throw new Error("pass either jev or policySource, not both.");
+          const policySource = rpcArgs.policySource === void 0 || rpcArgs.policySource === null ? void 0 : String(rpcArgs.policySource);
+          const script = harnessDriverSource(harnessSource, { policySource });
+          const { taskId, promise } = startUnityScriptTask(requireBridge(), {
+            script,
+            name: "game_use_run",
+            args: {
+              readPath,
+              resetPath: rpcArgs.resetPath,
+              maxSeconds: rpcArgs.maxSeconds,
+              jev: rpcArgs.jev,
+              policySource: rpcArgs.policySource
+            },
+            totalTimeoutMs: typeof rpcArgs.totalTimeoutMs === "number" ? rpcArgs.totalTimeoutMs : 12e4,
+            perStepTimeoutMs: rpcArgs.perStepTimeoutMs,
+            maxFrames: typeof rpcArgs.maxFrames === "number" ? rpcArgs.maxFrames : 9e3
+          }, {
+            onProgress: onUpdate ? (status) => onUpdate({
+              content: [{ type: "text", text: `game_use_run ${status.status} (frames=${status.frames})` }],
+              details: { status: status.status, frames: status.frames, logs: status.logs.slice(-5) }
+            }) : void 0
+          });
+          const handleAbort = () => {
+            cancelUnityScriptTask(taskId, "Tool call aborted.");
+          };
+          if (signal) {
+            if (signal.aborted) handleAbort();
+            else signal.addEventListener("abort", handleAbort, { once: true });
+          }
+          try {
+            const result = await promise;
+            const report = episodeReportText(result);
+            const text = report ? `${report}
 
-  // src/agent-output.ts
-  function isRecord10(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
-  }
-  function compact(value, full, depth = 0) {
-    if (full || depth > 5) return value;
-    if (typeof value === "string") {
-      return value.length > 500 ? `${value.slice(0, 500)}\u2026 (truncated, ${value.length} chars total; request full output when needed)` : value;
-    }
-    if (Array.isArray(value)) {
-      const items = value.slice(0, 20).map((entry) => compact(entry, false, depth + 1));
-      return value.length > 20 ? { totalCount: value.length, shownCount: items.length, items, truncated: true } : items;
-    }
-    if (!isRecord10(value)) return value;
-    const out = {};
-    for (const [key, entry] of Object.entries(value)) {
-      if (key === "stack" || key === "rawResponse") continue;
-      out[key] = compact(entry, false, depth + 1);
-      if (Array.isArray(entry) && entry.length <= 20 && !Object.hasOwn(value, `${key}Count`)) out[`${key}Count`] = entry.length;
-    }
-    return out;
-  }
-  function recoveryHelp(record2, operation) {
-    const nested = isRecord10(record2.result) ? record2.result : {};
-    const code = String(nested.errorCode || record2.errorCode || record2.code || "");
-    if (record2.executionStateUnknown === true || nested.executionStateUnknown === true || code === "HOST_TIMEOUT") return ["Query current Unity state before retrying; prior scene edits may have applied."];
-    if (nested.partial === true || record2.partial === true) return ["Inspect appliedOperations and current Unity state before deciding whether to undo or continue."];
-    if (code === "SCRIPT_CONTRACT") return ["Use export async function run(ctx, args) and await host calls or frame waits."];
-    if (code === "RPC_UNAUTHORIZED") return ["Refresh the selected instance token and retry once."];
-    if (record2.ok === false) return [operation ? `Inspect ${operation} arguments and the host manifest before retrying.` : "Inspect the error code and host manifest before retrying."];
-    return [];
-  }
-  function formatAgentOutput(value, options = {}) {
-    const source = isRecord10(value) ? value : { result: value };
-    const body = compact(source, options.full === true);
-    const nested = isRecord10(source.result) ? source.result : {};
-    const failed = source.ok === false || nested.ok === false;
-    if (failed) {
-      const code = String(nested.errorCode || source.errorCode || source.code || "UNKNOWN_ERROR");
-      body.retryable = ["RPC_UNAUTHORIZED", "TEMPORARILY_UNAVAILABLE", "DOMAIN_RELOAD"].includes(code);
-      if (nested.errorCode && source.errorCode !== nested.errorCode) body.causeCode = nested.errorCode;
-    }
-    const help = recoveryHelp(source, options.operation);
-    if (help.length > 0 && !Object.hasOwn(body, "help")) body.help = help;
-    if (options.operation && !Object.hasOwn(body, "operation")) body.operation = options.operation;
-    if (Object.keys(body).length === 0) body.count = 0;
-    return encode(body);
+${formatAgentOutput(result, { operation: "game_use_run", full })}` : formatAgentOutput(result, { operation: "game_use_run", full });
+            return {
+              content: [{ type: "text", text }],
+              details: result,
+              isError: result?.status === "failed" || result?.status === "cancelled"
+            };
+          } finally {
+            signal?.removeEventListener?.("abort", handleAbort);
+          }
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: formatAgentOutput({ ok: false, errorCode: "GAME_USE_RUN_ERROR", errorMessage: error instanceof Error ? error.message : String(error) }, { operation: "game_use_run" }) }],
+            details: { errorCode: "GAME_USE_RUN_ERROR", errorMessage: error instanceof Error ? error.message : String(error) },
+            isError: true
+          };
+        }
+      }
+    };
   }
 
   // src/unity-screenshot-request.ts
@@ -47915,7 +49076,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   }
 
   // src/tools/unity-dev-rpc.ts
-  function requireBridge() {
+  function requireBridge2() {
     const bridge2 = globalThis.pieBridge;
     if (!bridge2?.devRpc?.call) {
       throw new Error("pieBridge.devRpc is not available.");
@@ -47925,7 +49086,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   function asRecord(value) {
     return value && typeof value === "object" ? value : {};
   }
-  function splitToolParams(value) {
+  function splitToolParams2(value) {
     const record2 = asRecord(value);
     const { full, ...rpcArgs } = record2;
     return { rpcArgs, full: full === true };
@@ -47938,8 +49099,8 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
       parameters,
       execute: async (_toolCallId, params, signal) => {
         try {
-          const { rpcArgs, full } = splitToolParams(params);
-          const result = executeRpc ? await executeRpc(rpcArgs, signal) : requireBridge().devRpc.call(method, rpcArgs);
+          const { rpcArgs, full } = splitToolParams2(params);
+          const result = executeRpc ? await executeRpc(rpcArgs, signal) : requireBridge2().devRpc.call(method, rpcArgs);
           const text = formatAgentOutput(result, { operation: name, full });
           return {
             content: [{ type: "text", text }],
@@ -47973,7 +49134,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
             if (!tool) throw new Error("tool is required.");
             const data2 = asRecord(record2.data);
             const full = record2.full === true;
-            const result = requireBridge().devRpc.call(tool, data2);
+            const result = requireBridge2().devRpc.call(tool, data2);
             return {
               content: [{ type: "text", text: formatAgentOutput(result, { operation: tool, full }) }],
               details: result
@@ -48079,7 +49240,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
           includeUI: Type.Optional(Type.Boolean({ description: "Set false to capture via a camera render with UI canvases temporarily disabled (chat panels, HUD); that fresh render can differ from the final presented frame. Default true (play mode, no cameraName) captures the final game view including overlay UI." })),
           full: Type.Optional(Type.Boolean({ description: "Return untruncated model-facing output when the result is large." }))
         }),
-        (args, signal) => requestUnityScreenshot(requireBridge().devRpc, args, signal)
+        (args, signal) => requestUnityScreenshot(requireBridge2().devRpc, args, signal)
       ),
       {
         name: "unity_script_run",
@@ -48096,7 +49257,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
         }),
         execute: async (_toolCallId, params, signal, onUpdate) => {
           try {
-            const { rpcArgs, full } = splitToolParams(params);
+            const { rpcArgs, full } = splitToolParams2(params);
             if (signal?.aborted) {
               const cancelled = {
                 status: "cancelled",
@@ -48110,7 +49271,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
                 isError: true
               };
             }
-            const { taskId, promise } = startUnityScriptTask(requireBridge(), rpcArgs, {
+            const { taskId, promise } = startUnityScriptTask(requireBridge2(), rpcArgs, {
               onProgress: onUpdate ? (status) => onUpdate({
                 content: [{ type: "text", text: `unity_script_run ${status.status} (frames=${status.frames})` }],
                 details: {
@@ -48156,11 +49317,12 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     const nativeFindTool = createFindFilesTool(options.filesystemSearchRoot, options.filesystemPathOptions);
     const nativeGrepTool = createGrepTextTool(options.filesystemSearchRoot, options.filesystemPathOptions);
     const unityRuntimeTools = createUnityRuntimeTools();
+    const gameUseRunTool = createGameUseRunTool();
     const capabilities = [
       {
         id: "inspect-unity-context",
         description: "Unity host capability for inspecting the live editor/runtime context.",
-        tools: [inspectUnityContextTool, ...unityRuntimeTools]
+        tools: [inspectUnityContextTool, ...unityRuntimeTools, gameUseRunTool]
       },
       {
         id: "filesystem-search-executor",
@@ -50975,12 +52137,12 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   function isRecord13(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
-  function truncate2(value, limit) {
+  function truncate3(value, limit) {
     if (value.length <= limit) return { value, truncated: false };
     return { value: value.slice(0, limit), truncated: true };
   }
   function summary(value) {
-    return truncate2(value.replace(/\s+/g, " ").trim(), MAX_SUMMARY).value;
+    return truncate3(value.replace(/\s+/g, " ").trim(), MAX_SUMMARY).value;
   }
   function jsonText(value) {
     let encoded = "";
@@ -50989,7 +52151,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     } catch {
       encoded = "";
     }
-    return truncate2(encoded, MAX_TOOL_FIELD);
+    return truncate3(encoded, MAX_TOOL_FIELD);
   }
   function timestampOf(message, fallback) {
     const timestamp = message?.timestamp;
@@ -51061,7 +52223,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       if (role === "user") {
         activeClientTurnId = normalizedTurnId(sessionId, timestamp, messageIndex, clientTurnIdOf(message));
         assistantIndex = -1;
-        const textValue = truncate2(displayText(message), MAX_ASSISTANT_TEXT);
+        const textValue = truncate3(displayText(message), MAX_ASSISTANT_TEXT);
         const item = baseTimelineItem({
           sessionId,
           clientTurnId: activeClientTurnId,
@@ -51081,7 +52243,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       }
       if (role === "assistant") {
         assistantIndex += 1;
-        const textValue = truncate2(messageText(message), MAX_ASSISTANT_TEXT);
+        const textValue = truncate3(messageText(message), MAX_ASSISTANT_TEXT);
         const stopReason = typeof metadata.stopReason === "string" ? metadata.stopReason : "";
         const errorMessage = typeof metadata.errorMessage === "string" ? metadata.errorMessage : "";
         const status = stopReason === "aborted" ? "aborted" : stopReason === "error" || errorMessage ? "failed" : "succeeded";
@@ -51152,7 +52314,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
           items.push(item);
           if (callId) toolsByCallId.set(callId, item);
         }
-        const result = truncate2(toolResultText(message), MAX_TOOL_FIELD);
+        const result = truncate3(toolResultText(message), MAX_TOOL_FIELD);
         const details = jsonText(metadata.details);
         item.status = metadata.isError === true ? "failed" : "succeeded";
         item.updatedAt = timestamp;
@@ -51259,7 +52421,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         toolsByCallId: /* @__PURE__ */ new Map(),
         toolsByName: /* @__PURE__ */ new Map()
       };
-      const value = truncate2(displayContent, MAX_ASSISTANT_TEXT);
+      const value = truncate3(displayContent, MAX_ASSISTANT_TEXT);
       const item = baseTimelineItem({
         sessionId,
         clientTurnId,
@@ -51296,7 +52458,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       const active = this.active;
       if (!active || !active.assistantItemId) return;
       const metadata = message;
-      const text = truncate2(messageText(message), MAX_ASSISTANT_TEXT);
+      const text = truncate3(messageText(message), MAX_ASSISTANT_TEXT);
       const stopReason = typeof metadata.stopReason === "string" ? metadata.stopReason : "";
       const errorText = typeof metadata.errorMessage === "string" ? metadata.errorMessage : "";
       const status = stopReason === "aborted" ? "aborted" : stopReason === "error" || errorText ? "failed" : "succeeded";
@@ -51423,7 +52585,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }
     emitToolTerminal(params, identity, timestamp) {
       const args = identity.tracked ? { value: identity.tracked.argsJson, truncated: identity.tracked.argsTruncated } : jsonText(params.args);
-      const resultText = truncate2(params.resultText, MAX_TOOL_FIELD);
+      const resultText = truncate3(params.resultText, MAX_TOOL_FIELD);
       const details = jsonText(params.result?.details);
       const item = baseTimelineItem({
         sessionId: identity.sessionId,
@@ -51477,7 +52639,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
           status: payload.code === "ABORTED" ? "aborted" : "failed",
           timestamp
         });
-        const value = truncate2(message, MAX_ASSISTANT_TEXT);
+        const value = truncate3(message, MAX_ASSISTANT_TEXT);
         item.text = value.value;
         item.summary = summary(value.value);
         item.isError = payload.code !== "ABORTED";

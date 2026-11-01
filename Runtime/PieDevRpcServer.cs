@@ -220,8 +220,10 @@ namespace Pie
                     var toolName = Uri.UnescapeDataString(path.Substring("/tool/".Length));
                     var toolBody = ReadRequestBody(request);
                     var toolResponse = string.Equals(toolName, "unity_script_run", StringComparison.Ordinal)
-                        ? HandleUnityScriptRunTool(toolBody, _cts != null ? _cts.Token : CancellationToken.None)
-                        : PieDevRpcDispatcher.InvokeSync(() => BuildCapabilityEnvelope("tool", toolName, toolBody));
+                        ? HandleScriptTaskTool("unity_script_run", argsJson => PieUnityCapabilitiesBootstrap.StartUnityScriptRun(argsJson), toolBody, _cts != null ? _cts.Token : CancellationToken.None)
+                        : string.Equals(toolName, "game_use_run", StringComparison.Ordinal)
+                            ? HandleScriptTaskTool("game_use_run", argsJson => PieUnityCapabilitiesBootstrap.StartGameUseRun(argsJson), toolBody, _cts != null ? _cts.Token : CancellationToken.None)
+                            : PieDevRpcDispatcher.InvokeSync(() => BuildCapabilityEnvelope("tool", toolName, toolBody));
                     WriteJson(context.Response, 200, toolResponse);
                     return;
                 }
@@ -436,13 +438,17 @@ namespace Pie
             return BuildEnvelope(kind, name, ok, resultJson, ok ? "" : (error ?? "Unknown error"));
         }
 
-        private static string HandleUnityScriptRunTool(string argsJson, CancellationToken token)
+        // Shared long-poll path for script-task-backed tools (unity_script_run,
+        // game_use_run): start on the main thread, poll status, stop on
+        // completion/cancellation. game_use_run rides the same channel so Chat
+        // and RPC clients observe identical frame gates and cancellation.
+        private static string HandleScriptTaskTool(string toolName, Func<string, string> start, string argsJson, CancellationToken token)
         {
             var taskId = "";
             try
             {
                 var statusJson = PieDevRpcDispatcher.InvokeSync(
-                    () => PieUnityCapabilitiesBootstrap.StartUnityScriptRun(argsJson),
+                    () => start(argsJson),
                     ScriptRunMainThreadTimeoutMs);
 
                 var watchdog = System.Diagnostics.Stopwatch.StartNew();
@@ -462,13 +468,13 @@ namespace Pie
                     {
                         var ok = string.Equals(status.status, "completed", StringComparison.Ordinal);
                         var error = ok ? "" : (status.errorMessage ?? status.status ?? "Unity script run failed.");
-                        return BuildEnvelopeOnMainThread("tool", "unity_script_run", ok, statusJson, error);
+                        return BuildEnvelopeOnMainThread("tool", toolName, ok, statusJson, error);
                     }
 
                     if (token.IsCancellationRequested)
                     {
                         TryCancelUnityScriptRun(taskId, "Dev RPC server is stopping.");
-                        return BuildScriptRunFailure(taskId, "cancelled", "CANCELLED", "Dev RPC server is stopping.");
+                        return BuildScriptRunFailure(toolName, taskId, "cancelled", "CANCELLED", "Dev RPC server is stopping.");
                     }
 
                     Thread.Sleep(ScriptRunPollIntervalMs);
@@ -480,16 +486,16 @@ namespace Pie
             catch (Exception ex)
             {
                 TryCancelUnityScriptRun(taskId, ex.Message);
-                return BuildScriptRunFailure(taskId, "failed", ex is TimeoutException ? "HOST_TIMEOUT" : "HOST_ERROR", ex.Message);
+                return BuildScriptRunFailure(toolName, taskId, "failed", ex is TimeoutException ? "HOST_TIMEOUT" : "HOST_ERROR", ex.Message);
             }
         }
 
         // Transport terminal state must not call Unity, PuerTS, or the main-thread dispatcher.
-        private static string BuildScriptRunFailure(string taskId, string status, string code, string message)
+        private static string BuildScriptRunFailure(string toolName, string taskId, string status, string code, string message)
         {
             var result = "{\"taskId\":\"" + EscapeJson(taskId ?? "") + "\",\"done\":true,\"status\":\"" + status
                 + "\",\"errorCode\":\"" + code + "\",\"errorMessage\":\"" + EscapeJson(message ?? "") + "\",\"executionStateUnknown\":true}";
-            return "{\"ok\":false,\"kind\":\"tool\",\"name\":\"unity_script_run\",\"result\":\"" + EscapeJson(result)
+            return "{\"ok\":false,\"kind\":\"tool\",\"name\":\"" + EscapeJson(toolName ?? "") + "\",\"result\":\"" + EscapeJson(result)
                 + "\",\"errorCode\":\"" + code + "\",\"error\":\"" + EscapeJson(message ?? "") + "\"}";
         }
 
