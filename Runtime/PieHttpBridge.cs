@@ -47,6 +47,19 @@ namespace Pie
             new ConcurrentDictionary<int, RequestState>();
 
         private static int _nextRequestId = 1;
+        private static int _nextBufferedRequestId = 1;
+        private static readonly ConcurrentDictionary<int, BufferedRequestState> _bufferedRequests =
+            new ConcurrentDictionary<int, BufferedRequestState>();
+
+        private sealed class BufferedRequestState
+        {
+            public readonly object Sync = new object();
+            public readonly CancellationTokenSource Cts = new CancellationTokenSource();
+            public HttpWebRequest NativeRequest;
+            public bool Started;
+            public bool Cancelled;
+            public bool Finished;
+        }
 
         // ─────────────────────────────────────────────────────────────────
         // Buffered fetch bounds
@@ -274,8 +287,208 @@ namespace Pie
             string headersJson = null,
             bool manualRedirect = false)
         {
+            return Task.Run(() => FetchTextCoreAsync(method, url, body, bearerToken, headersJson, manualRedirect, 0, CancellationToken.None));
+        }
+
+        /// <summary>Create an individually cancellable buffered request. This is
+        /// intentionally separate from the SSE request dictionary/pump.</summary>
+        public static int CreateBufferedRequest()
+        {
+            var id = Interlocked.Increment(ref _nextBufferedRequestId);
+            var state = new BufferedRequestState();
+            if (!_bufferedRequests.TryAdd(id, state))
+            {
+                state.Cts.Dispose();
+                throw new InvalidOperationException("Could not allocate buffered request id.");
+            }
+            return id;
+        }
+
+        public static void CancelBufferedRequest(int requestId)
+        {
+            if (!_bufferedRequests.TryGetValue(requestId, out var state)) return;
+            var dispose = false;
+            lock (state.Sync)
+            {
+                if (state.Finished) return;
+                state.Cancelled = true;
+                _bufferedRequests.TryRemove(requestId, out _);
+                // Once started, only the worker disposes the CTS. Cancellation
+                // may race Token capture/linked-source creation or body reads.
+                if (!state.Started) dispose = true;
+            }
+            // Never invoke cancellation callbacks while holding Sync: a worker
+            // completing inline may need the same lock before it can finish.
+            try { state.Cts.Cancel(); } catch { }
+            try { state.NativeRequest?.Abort(); } catch { }
+            if (dispose) state.Cts.Dispose();
+        }
+
+        public static Task<string> FetchTextRequestAsync(
+            int requestId,
+            string method,
+            string url,
+            string body,
+            string bearerToken,
+            string headersJson,
+            bool manualRedirect,
+            int timeoutMs)
+        {
+            if (!_bufferedRequests.TryGetValue(requestId, out var state))
+                throw new OperationCanceledException("Buffered request was cancelled before it started.");
+            CancellationToken requestToken;
+            lock (state.Sync)
+            {
+                if (state.Cancelled || state.Finished)
+                    throw new OperationCanceledException("Buffered request was cancelled before it started.");
+                if (state.Started)
+                    throw new InvalidOperationException("A buffered request handle can only be started once.");
+                state.Started = true;
+                requestToken = state.Cts.Token;
+            }
             return Task.Run(async () =>
             {
+                try
+                {
+                    return await FetchTextWebRequestAsync(state, method, url, body, bearerToken, headersJson, manualRedirect, timeoutMs);
+                }
+                finally
+                {
+                    lock (state.Sync) { state.Finished = true; }
+                    _bufferedRequests.TryRemove(requestId, out _);
+                    state.NativeRequest = null;
+                    state.Cts.Dispose();
+                }
+            });
+        }
+
+        private static async Task<HttpWebResponse> GetBufferedWebResponseAsync(HttpWebRequest request)
+        {
+            try { return (HttpWebResponse)await request.GetResponseAsync(); }
+            catch (WebException ex)
+            {
+                if (ex.Response is HttpWebResponse response) return response;
+                throw;
+            }
+        }
+
+        /// <summary>Buffered fetch over HttpWebRequest. Unlike the shared
+        /// HttpClient path, each owned request has native Abort() and independent
+        /// header/body timeouts, which is reliable on the Unity IL2CPP player.</summary>
+        private static async Task<string> FetchTextWebRequestAsync(
+            BufferedRequestState state,
+            string method,
+            string url,
+            string body,
+            string bearerToken,
+            string headersJson,
+            bool manualRedirect,
+            int timeoutMs)
+        {
+            if (string.IsNullOrWhiteSpace(url)) throw new ArgumentException("Fetch URL is required.", nameof(url));
+            var normalizedMethod = string.IsNullOrWhiteSpace(method) ? "GET" : method.ToUpperInvariant();
+            var parsedHeaders = ParseHeaders(headersJson);
+            var request = (HttpWebRequest)WebRequest.Create(url);
+            state.NativeRequest = request;
+            request.Method = normalizedMethod;
+            request.ProtocolVersion = HttpVersion.Version10;
+            request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
+            request.AllowAutoRedirect = manualRedirect;
+            var effectiveTimeout = timeoutMs > 0 ? timeoutMs : 600000;
+            request.Timeout = effectiveTimeout;
+            request.ReadWriteTimeout = effectiveTimeout;
+            request.KeepAlive = false;
+            request.Proxy = null;
+            request.ServicePoint.Expect100Continue = false;
+
+            if (!string.IsNullOrEmpty(bearerToken))
+            {
+                var token = bearerToken.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) ? bearerToken.Substring(7) : bearerToken;
+                request.Headers[HttpRequestHeader.Authorization] = $"Bearer {token}";
+            }
+            foreach (var kv in parsedHeaders)
+            {
+                if (string.Equals(kv.Key, "Authorization", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(kv.Key, "Content-Length", StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.Equals(kv.Key, "Content-Type", StringComparison.OrdinalIgnoreCase)) { request.ContentType = kv.Value; continue; }
+                if (string.Equals(kv.Key, "Accept", StringComparison.OrdinalIgnoreCase)) { request.Accept = kv.Value; continue; }
+                request.Headers[kv.Key] = kv.Value;
+            }
+            if (string.IsNullOrEmpty(request.Accept)) request.Accept = "application/json";
+            if (!string.IsNullOrEmpty(body) && normalizedMethod != "GET" && normalizedMethod != "HEAD")
+            {
+                if (string.IsNullOrEmpty(request.ContentType)) request.ContentType = "application/json";
+                var payload = Encoding.UTF8.GetBytes(body);
+                using var requestStream = await request.GetRequestStreamAsync();
+                await requestStream.WriteAsync(payload, 0, payload.Length, state.Cts.Token);
+            }
+
+            using var response = await GetBufferedWebResponseAsync(request);
+            Dictionary<string, string> responseHeaders = null;
+            if (manualRedirect)
+            {
+                responseHeaders = new Dictionary<string, string>();
+                foreach (string key in response.Headers.AllKeys)
+                    responseHeaders[key.ToLowerInvariant()] = response.Headers[key];
+            }
+
+            string responseText;
+            long observedBytes;
+            long declaredBodyBytes;
+            bool bodyTruncated;
+            var contentTypeHeader = response.ContentType;
+            if (response.ContentLength == 0)
+            {
+                responseText = string.Empty;
+                observedBytes = 0;
+                declaredBodyBytes = 0;
+                bodyTruncated = false;
+            }
+            else
+            {
+                declaredBodyBytes = response.ContentLength;
+                using var stream = response.GetResponseStream();
+                using var buffered = new MemoryStream();
+                var buffer = new byte[64 * 1024];
+                long totalRead = 0;
+                while (totalRead <= MaxBufferedFetchBytes)
+                {
+                    var read = await stream.ReadAsync(buffer, 0, buffer.Length, state.Cts.Token);
+                    if (read <= 0) break;
+                    var remaining = MaxBufferedFetchBytes + 1 - totalRead;
+                    var keep = (int)Math.Min(read, remaining);
+                    if (keep > 0) buffered.Write(buffer, 0, keep);
+                    totalRead += read;
+                    if (totalRead > MaxBufferedFetchBytes) break;
+                }
+                bodyTruncated = totalRead > MaxBufferedFetchBytes;
+                observedBytes = totalRead;
+                responseText = DecodeBodyText(buffered, contentTypeHeader);
+            }
+            var finalUrl = response.ResponseUri?.ToString() ?? url;
+            return BuildFetchTextResponseJson(
+                (int)response.StatusCode,
+                response.StatusDescription ?? string.Empty,
+                response.StatusCode >= HttpStatusCode.OK && response.StatusCode < HttpStatusCode.MultipleChoices,
+                finalUrl,
+                contentTypeHeader ?? string.Empty,
+                responseText,
+                observedBytes,
+                declaredBodyBytes,
+                bodyTruncated,
+                responseHeaders);
+        }
+
+        private static async Task<string> FetchTextCoreAsync(
+            string method,
+            string url,
+            string body,
+            string bearerToken,
+            string headersJson,
+            bool manualRedirect,
+            int timeoutMs,
+            CancellationToken cancellationToken)
+        {
                 if (string.IsNullOrWhiteSpace(url))
                     throw new ArgumentException("Fetch URL is required.", nameof(url));
 
@@ -324,9 +537,11 @@ namespace Pie
                 // CTS owns the deadline across SendAsync and every body read.
                 // The CTS is disposed (timer released) on every terminal path:
                 // completion, truncation, fault, and cancellation.
-                using var timeoutCts = new CancellationTokenSource();
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 var client = manualRedirect ? _manualRedirectHttpClient : _httpClient;
-                if (client.Timeout != Timeout.InfiniteTimeSpan)
+                if (timeoutMs > 0)
+                    timeoutCts.CancelAfter(TimeSpan.FromMilliseconds(timeoutMs));
+                else if (client.Timeout != Timeout.InfiniteTimeSpan)
                     timeoutCts.CancelAfter(client.Timeout);
 
                 using var response = await client.SendAsync(
@@ -403,7 +618,6 @@ namespace Pie
                     declaredBodyBytes,
                     bodyTruncated,
                     responseHeaders);
-            });
         }
 
         /// <summary>Create a capped receiver for the UnityWebRequest buffered fallback (see BoundedDownloadHandler).</summary>
@@ -594,6 +808,9 @@ namespace Pie
                     CancelState(state);
                 }
             }
+
+            foreach (var requestId in _bufferedRequests.Keys)
+                CancelBufferedRequest(requestId);
 
             // Both clients carry in-flight requests: the provider auto-follow
             // client AND the manual-redirect fetch client (long bounded body

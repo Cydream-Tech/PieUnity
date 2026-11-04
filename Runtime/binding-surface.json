@@ -60,7 +60,7 @@
     {
       "name": "Pie.PieHttpBridge",
       "assembly": "Pie.Runtime",
-      "usedBy": "LLM HTTP/SSE streaming (unity-http-client)"
+      "usedBy": "LLM HTTP/SSE streaming plus individually cancellable, deadline-owning Game Use buffered requests"
     },
     {
       "name": "Pie.PieUtf8Sha256",

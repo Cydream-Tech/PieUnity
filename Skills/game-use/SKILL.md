@@ -25,8 +25,11 @@ For a goal you research the game and produce exactly three things:
 3. **Status rule** — when the goal is `done`/`failed`, judged on game state
    (a counter, a position, a flag), never on the option history.
 
-Optional: a `plan` of steps for multi-step goals (data, not code) and
-`tempo` (decisions/second: 0.5 deliberate .. 8 reflex).
+Optional: a `setup()` for reset/probes, a `plan` of steps for multi-step goals,
+`progress(obs)` returning a stable game-defined progress token (score,
+checkpoint, high-water mark), and `tempo` (decisions/second: 0.5 deliberate ..
+8 reflex). With `progress`, changing clocks or merely running an option does
+not reset the stall budget.
 
 ## Workflow
 
@@ -98,7 +101,7 @@ export async function run(ctx) {
         return { state: "running" };
       },
     },
-    policy: (request) => {              // your scripted policy; omit for built-in greedy
+    policy: (request) => {              // your scripted policy; omit for first-listed
       let best, bestScore = Infinity;
       for (const [name, o] of Object.entries(request.options))
         if (o.facts.steps_to_goal < bestScore) { bestScore = o.facts.steps_to_goal; best = name; }
@@ -114,15 +117,20 @@ Notes on the shape:
 - `status` returns `{ state: "running" | "done" | "failed", note?, evidence? }` —
   a plain string does not parse; nonterminal ticks return `running`.
 - `policy` (scripted) and `jev` (live model) are mutually exclusive; passing
-  neither runs the built-in greedy (scores `collects_spark`,
-  `toward_closest_spark`, `steps_to_goal` facts). Passing both throws.
+  neither runs the game-neutral first-listed policy. Passing both throws.
+  `fallbackPolicy` / `fallbackPolicySource` optionally overrides the same
+  first-listed default for Jev degradation. Game-specific scoring belongs in
+  your policy or sample, never in PieUnity's core.
 - An option's `run` acts on the game the way you verified while researching:
   close over `ctx.runtime.call("CS.MyGame.Step", [dx, dz])` (or
   `CS.Pie.GameUse.PieInputHands.Press` for key synthesis). The `surface`
   argument is for reads; its `act` is only wired when a host-provided
   harness sets an act path, so don't rely on it in an inline harness.
-- Record decisions with `onDecision` — the episode result carries counts and
-  evidence, not the trail.
+- Record decisions with `onDecision` — the result also contains full
+  `decisions` and option lifecycle `actions`; failed/cancelled tasks retain
+  partial evidence. A long-running option receives an optional second
+  `OptionRunContext`: check `cancelled` / `throwIfCancelled()` and register
+  `onCleanup` so switching or ending the episode stops its controller.
 - Timing: `tempo` bounds decisions/second; `stallSeconds` bounds no-progress
   ticks; `maxSeconds` bounds the whole episode. An option's `run` should
   confirm its own effect (e.g. wait a few frames and re-read) before

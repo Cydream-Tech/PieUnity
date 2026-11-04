@@ -6134,9 +6134,9 @@ var _PieAgent = (() => {
       });
     }
   };
-  function scheduleNextTick(callback, _delayMs) {
+  function scheduleNextTick(callback) {
     if (typeof setTimeout === "function") {
-      setTimeout(callback, _delayMs);
+      setTimeout(callback, 0);
       return;
     }
     Promise.resolve().then(callback);
@@ -6149,7 +6149,6 @@ var _PieAgent = (() => {
         url: url.slice(0, 100),
         method: options.method || "GET"
       });
-      void scheduleNextTick;
       let legacyBridge = false;
       try {
         legacyBridge = typeof CS !== "undefined" && !!CS?.AgentBridge && typeof CS.AgentBridge.HttpPostAsyncStart === "function";
@@ -6328,7 +6327,7 @@ var _PieAgent = (() => {
             void completed.then(() => checkComplete());
           }
         };
-        scheduleNextTick(checkComplete, 0);
+        scheduleNextTick(checkComplete);
       });
     }
   };
@@ -12651,13 +12650,16 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
     }
     return { role: "user", type: "message", content: parts };
   }
+  function omittedAttachmentNote(modality, reason) {
+    return { type: "input_text", text: `[${modality} attachment omitted: ${reason} Re-read with a compatible model.]` };
+  }
   function encodeUserContentBlock(block, model) {
     if (block.type === "hostContext") {
       throw new ResponsesProtocolError(`Unprojected hostContext block reached Responses conversion (${block.kind}); the request path must project host envelopes to text first.`);
     }
     const modality = block.type === "fileRef" ? block.modality : block.type;
     if (modality !== "text" && !model.input.includes(modality)) {
-      throw new ResponsesProtocolError(`Current model does not support ${modality} input.`);
+      return [omittedAttachmentNote(modality, "current model does not support this modality.")];
     }
     switch (block.type) {
       case "text":
@@ -12666,13 +12668,13 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
         return [{ type: "input_image", image_url: `data:${block.mimeType};base64,${block.data}` }];
       case "video":
       case "audio":
-        throw new ResponsesProtocolError(`Responses ${block.type} input is not supported by this provider.`);
+        return [omittedAttachmentNote(block.type, `the Responses provider does not deliver ${block.type} input.`)];
       case "fileRef": {
         const ref2 = block;
         if (ref2.modality === "image") {
           return [{ type: "input_image", image_url: ref2.url }];
         }
-        throw new ResponsesProtocolError(`Responses ${ref2.modality} file references are not supported by this provider.`);
+        return [omittedAttachmentNote(ref2.modality, `the Responses provider does not deliver ${ref2.modality} file references.`)];
       }
       default:
         throw new ResponsesProtocolError("Unsupported Responses content block.");
@@ -21935,6 +21937,15 @@ ${summary2}`;
       return status === "ok" || status === "corrupt";
     }
     /**
+     * Read a session's metadata without activating the session (O(1) head
+     * read). Returns null when the session is missing or its head is
+     * unreadable. Hosts use this for pre-activation decisions such as
+     * resume-time cwd handling.
+     */
+    getMetadata(sessionId) {
+      return this.store.getMetadata(sessionId);
+    }
+    /**
      * Fork the current session at a specific entry: the new session contains
      * a fork marker plus the path segment from the entry down to the active
      * leaf. Bodies stream in bounded batches (one body resident at a time
@@ -22888,6 +22899,12 @@ ${summary2}`;
     get snapshot() {
       return this.queuedInputs.map(cloneQueuedInput);
     }
+    /** Restore an input taken by shift() back to the FRONT (dispatch aborted
+     *  between shift and delivery — e.g. streaming resumed during preparation). */
+    unshift(queuedInput) {
+      this.queuedInputs.unshift(queuedInput);
+      this.emitQueueChanged();
+    }
     peek() {
       return this.queuedInputs[0];
     }
@@ -23034,6 +23051,15 @@ ${summary2}`;
     generation = 0;
     pendingDispatch;
     resolvePendingDispatch;
+    /** Single-flight: at most one dispatchNext at a time; a wakeup during
+     *  execution (end hook racing the busy-poll) is remembered and served after
+     *  it settles instead of overlapping a second concurrent dispatch. */
+    executing = false;
+    wakeupRequested = false;
+    /** Busy/policy re-arm backoff (100ms → 800ms cap): streaming can last
+     *  minutes and a policy hold indefinitely; a flat 100ms poll wakes the
+     *  process ~10×/s for nothing. Enqueue still re-arms via schedule(). */
+    backoffDelayMs = 100;
     get hasPendingDispatch() {
       return this.dispatchTimer !== void 0 || this.pendingDispatch !== void 0;
     }
@@ -23041,6 +23067,11 @@ ${summary2}`;
       return this.pendingDispatch ?? Promise.resolve();
     }
     schedule(delayMs = 0) {
+      this.backoffDelayMs = 100;
+      this.armTimer(delayMs);
+    }
+    /** Timer-arming core shared by schedule() and the busy re-arm. */
+    armTimer(delayMs) {
       if (this.options.getDisposed() || this.options.getRuntimeGuardTriggered() || this.dispatchTimer !== void 0) {
         return;
       }
@@ -23049,10 +23080,20 @@ ${summary2}`;
       const generation = this.generation;
       this.dispatchTimer = setTimer(() => {
         this.dispatchTimer = void 0;
+        if (this.executing) {
+          this.wakeupRequested = true;
+          return;
+        }
+        this.executing = true;
         void this.dispatchNext().catch((error) => {
           if (generation === this.generation) this.options.emit({ type: "turn_policy_error", message: String(error) });
         }).finally(() => {
-          if (generation === this.generation) this.resolvePending();
+          this.executing = false;
+          if (this.wakeupRequested && !this.options.getDisposed()) {
+            this.wakeupRequested = false;
+            this.armTimer(0);
+          }
+          this.resolvePending();
         });
       }, delayMs);
     }
@@ -23065,17 +23106,28 @@ ${summary2}`;
       }
       this.resolvePending();
     }
+    /** Busy/policy re-arm: exponential backoff, 100ms → 800ms cap. Bypasses
+     *  schedule() so the ladder is not reset. True (not-dispatched) when
+     *  streaming/policy obstruction was found. */
+    busyRearm() {
+      if (!this.options.isStreaming() && !this.options.isBlockedByRuntimePolicy()) return false;
+      const delay = this.backoffDelayMs;
+      this.backoffDelayMs = Math.min(this.backoffDelayMs * 2, 800);
+      this.armTimer(delay);
+      return true;
+    }
     async dispatchNext() {
       const generation = this.generation;
-      if (this.options.getDisposed() || this.options.isStreaming() || this.options.isBlockedByRuntimePolicy()) {
+      if (this.options.getDisposed()) {
         return false;
       }
+      if (this.options.queue.length === 0 || this.options.isRecoveryTerminal()) {
+        return false;
+      }
+      if (this.busyRearm()) return false;
       await this.options.agent.waitForIdle();
       if (generation !== this.generation) return false;
-      if (this.options.getDisposed() || this.options.isStreaming() || this.options.isBlockedByRuntimePolicy()) {
-        this.schedule(100);
-        return false;
-      }
+      if (this.options.getDisposed() || this.busyRearm()) return false;
       const queuedInput = this.options.queue.peek();
       if (!queuedInput) {
         return false;
@@ -23101,16 +23153,14 @@ ${summary2}`;
       }
       await this.options.runPreRequestAutoCompact();
       if (generation !== this.generation) return false;
-      if (this.options.getDisposed() || this.options.isStreaming() || this.options.isBlockedByRuntimePolicy()) {
-        this.schedule(100);
-        return false;
-      }
+      if (this.options.getDisposed() || this.busyRearm()) return false;
       const dispatched = this.options.queue.shift();
       if (!dispatched) {
         return false;
       }
       this.options.emit({ type: "queued_turn_dispatched", queuedInput: cloneQueuedInput(dispatched) });
       if (!dispatched.deliveredToAgent) {
+        const originalMessages = dispatched.messages;
         const prepared = await this.options.preparePromptMessages(dispatched.messages, {
           source: dispatched.source,
           streamingBehavior: dispatched.mode,
@@ -23125,6 +23175,12 @@ ${summary2}`;
           this.options.agent.setSystemPrompt(prepared.systemPrompt);
         }
         dispatched.messages = prepared.messages;
+        if (this.options.isStreaming()) {
+          dispatched.messages = originalMessages;
+          this.options.queue.unshift(dispatched);
+          this.busyRearm();
+          return false;
+        }
       }
       if (dispatched.deliveredToAgent || this.options.agent.state.messages.at(-1)?.role === "assistant") {
         if (!dispatched.deliveredToAgent) {
@@ -24200,6 +24256,7 @@ ${summary2}`;
         getRuntimeGuardTriggered: () => this.runtimeGuard.triggered,
         isStreaming: () => this.isStreaming,
         isBlockedByRuntimePolicy: () => this.isBlockedByRuntimePolicy(),
+        isRecoveryTerminal: () => this.recoveryState === "terminal" || this.recoveryState === "cancelled",
         runPreRequestAutoCompact: () => this.runPreRequestAutoCompactIfNeeded(),
         preparePromptMessages: (messages, promptOptions) => this.preparePromptMessages(messages, promptOptions),
         continueTurn: () => this.continue(),
@@ -24313,9 +24370,7 @@ ${summary2}`;
       if (options?.streamingBehavior) {
         this.queue.enqueue(messages, options.streamingBehavior, options);
         this.recordLifecycle({ type: "queued_input_added" });
-        if (!this.isStreaming) {
-          this.queueDispatcher.schedule();
-        }
+        this.queueDispatcher.schedule();
         return;
       }
       if (this.isStreaming) {
@@ -47403,6 +47458,165 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     };
   }
 
+  // src/game-use/run/harness-driver.ts
+  function normalizeHarnessExports(source) {
+    const text = String(source || "");
+    let ast;
+    try {
+      ast = parse4(text, { ecmaVersion: "latest", sourceType: "module" });
+    } catch (error) {
+      throw new Error(`game_use_run: harnessSource is not valid JavaScript: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const edits = [];
+    for (const node of ast.body) {
+      if (String(node.type) === "ImportDeclaration") {
+        throw new Error("game_use_run: harnessSource must not contain imports; inline everything the harness needs.");
+      }
+      if (String(node.type) !== "ExportDefaultDeclaration" && String(node.type) !== "ExportNamedDeclaration") continue;
+      if (String(node.type) === "ExportDefaultDeclaration") {
+        const decl2 = node.declaration;
+        const exprStart = decl2 && ["FunctionDeclaration", "ClassDeclaration", "ArrowFunctionExpression", "FunctionExpression"].includes(decl2.type) ? Number(decl2.start) : Number(node.start) + "export default".length;
+        edits.push({ at: Number(node.start), end: exprStart, text: "const __pieHarnessDefault = " });
+        continue;
+      }
+      const decl = node.declaration;
+      if (decl) {
+        const exportedNames = String(decl.type) === "VariableDeclaration" ? (decl.declarations || []).map((d) => d.id?.name ?? "") : [decl.id?.name ?? ""];
+        if (String(decl.type) !== "VariableDeclaration" && !exportedNames.includes("harness")) {
+          throw new Error(`game_use_run: only the harness may be exported (found "${exportedNames[0] || "anonymous"}"); the driver provides run(ctx, args).`);
+        }
+        edits.push({ at: Number(node.start), end: Number(decl.start), text: "" });
+        continue;
+      }
+      const specifiers = node.specifiers || [];
+      const allowed = specifiers.length > 0 && specifiers.every((spec) => {
+        const local = spec.local?.name;
+        const exported = spec.exported?.name ?? local;
+        return local === "harness" && (exported === "harness" || exported === "default");
+      });
+      if (!allowed) {
+        throw new Error("game_use_run: only the harness export may be listed (export { harness } or export { harness as default }).");
+      }
+      edits.push({ at: Number(node.start), end: Number(node.end), text: "" });
+    }
+    return applyUnitySourceEdits(text, edits);
+  }
+  function policyFunctionSource(policySource) {
+    const text = String(policySource || "").trim();
+    if (!text) throw new Error("game_use_run: policySource must be a function expression like (request) => optionName.");
+    let parsed;
+    try {
+      parsed = parse4(`(${text})`, { ecmaVersion: "latest", sourceType: "module" });
+    } catch (error) {
+      throw new Error(`game_use_run: policySource is not a valid expression: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const body = parsed.body;
+    if (body.length !== 1 || String(body[0]?.type) !== "ExpressionStatement") {
+      throw new Error("game_use_run: policySource must be a single function expression.");
+    }
+    const expr = body[0].expression;
+    if (!expr || !["ArrowFunctionExpression", "FunctionExpression"].includes(String(expr.type))) {
+      throw new Error("game_use_run: policySource must be a function expression like (request) => optionName.");
+    }
+    return text;
+  }
+  function harnessDriverSource(harnessSource, options = {}) {
+    const policy = options.policySource !== void 0 && options.policySource !== null && String(options.policySource).trim() !== "" ? policyFunctionSource(String(options.policySource)) : null;
+    const fallbackPolicy = options.fallbackPolicySource !== void 0 && options.fallbackPolicySource !== null && String(options.fallbackPolicySource).trim() !== "" ? policyFunctionSource(String(options.fallbackPolicySource)) : null;
+    return `export async function run(ctx, args) {
+${normalizeHarnessExports(harnessSource)}
+;
+  const resolved = (typeof harness !== "undefined" && harness) || (typeof __pieHarnessDefault !== "undefined" && __pieHarnessDefault) || null;
+  if (!resolved) throw new Error("game_use_run: the harness module must export the harness object (a default export, or a named export called 'harness').");
+  if (args.runInBackground === true) await ctx.runtime.call("CS.Pie.GameUse.PieRuntimeOptions.SetRunInBackground", [true]);
+  if (args.resetPath) await ctx.runtime.call(args.resetPath, []);
+  const trail = [];
+  const played = await ctx.gameUse.playWithHarness({
+    readPath: args.readPath,
+    maxSeconds: args.maxSeconds,
+    jev: args.jev,${policy ? "\n    policy: __piePolicy," : ""}${fallbackPolicy ? "\n    fallbackPolicy: __pieFallbackPolicy," : ""}
+    harness: resolved,
+    // Compact, DTO-safe preview; the complete request/options/model record is
+    // returned separately in decisions (and checkpointed by the host).
+    onDecision: (record) => trail.push({ call: record.call, chosen: record.chosen, situation: record.request.situation, latencyS: record.latencyS, action: record.action, running: record.running, model: record.response.model, usage: record.response.usage }),
+  });
+  // Keep the established episode wrapper shallow; full telemetry lives at
+  // the top level so safe DTO depth limits do not hide the verdict.
+  return { episode: { episode: played.episode, report: played.report }, trail, decisions: played.decisions, actions: played.actions };
+}
+${policy ? `const __piePolicy = ${policy};
+` : ""}${fallbackPolicy ? `const __pieFallbackPolicy = ${fallbackPolicy};
+` : ""}`;
+  }
+
+  // src/game-use/run/game-use-request.ts
+  function buildGameUseTaskRequest(payload) {
+    const harnessSource = String(payload.harnessSource ?? "");
+    const readPath = String(payload.readPath ?? "");
+    if (!harnessSource.trim()) throw new Error("harnessSource is required.");
+    if (!readPath.trim()) throw new Error("readPath is required.");
+    if (payload.jev && payload.policySource) throw new Error("pass either jev or policySource, not both.");
+    const policySource = payload.policySource === void 0 || payload.policySource === null ? void 0 : String(payload.policySource);
+    const fallbackPolicySource = payload.fallbackPolicySource === void 0 || payload.fallbackPolicySource === null ? void 0 : String(payload.fallbackPolicySource);
+    return {
+      script: harnessDriverSource(harnessSource, { policySource, fallbackPolicySource }),
+      name: "game_use_run",
+      args: {
+        readPath,
+        resetPath: payload.resetPath,
+        runInBackground: payload.runInBackground === true,
+        maxSeconds: payload.maxSeconds,
+        jev: payload.jev
+      },
+      totalTimeoutMs: typeof payload.totalTimeoutMs === "number" ? payload.totalTimeoutMs : 12e4,
+      // Game Use may perform first-call reflection binding; async model waits
+      // use awaitExternal and do not consume this synchronous CPU budget.
+      perStepTimeoutMs: typeof payload.perStepTimeoutMs === "number" ? payload.perStepTimeoutMs : 2e3,
+      maxFrames: typeof payload.maxFrames === "number" ? payload.maxFrames : 9e3
+    };
+  }
+
+  // src/unity-frame-clock.ts
+  function currentUnityFrame() {
+    const application = typeof CS !== "undefined" ? CS?.UnityEngine?.Application : void 0;
+    if (!application?.isPlaying) return void 0;
+    const frameCount = typeof CS !== "undefined" ? CS?.UnityEngine?.Time?.frameCount : void 0;
+    return typeof frameCount === "number" ? frameCount : void 0;
+  }
+  function createSliceClock() {
+    const sources = [
+      () => {
+        const value = typeof CS !== "undefined" ? CS?.UnityEngine?.Time?.realtimeSinceStartupAsDouble : void 0;
+        return typeof value === "number" ? value * 1e3 : NaN;
+      },
+      () => typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : NaN,
+      () => Date.now()
+    ];
+    let selected = 0, offset2 = 0, fresh = true;
+    let last;
+    return () => {
+      while (selected < sources.length) {
+        let value = NaN;
+        try {
+          value = sources[selected]();
+        } catch {
+        }
+        if (Number.isFinite(value)) {
+          if (fresh) {
+            offset2 = last === void 0 ? 0 : last - value;
+            fresh = false;
+          }
+          last = Math.max(last ?? -Infinity, value + offset2);
+          return last;
+        }
+        fresh = true;
+        if (selected === sources.length - 1) return last ?? 0;
+        selected++;
+      }
+      return last ?? 0;
+    };
+  }
+
   // src/game-use/decide/contract.ts
   var DecideError = class extends Error {
     constructor(message, retryable) {
@@ -47425,139 +47639,209 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   // src/game-use/loop/play-loop.ts
   var DEFAULT_TEMPO = 2;
   var DEFAULT_STALL_SECONDS = 90;
+  var DEFAULT_MAX_SECONDS = 60;
   async function runEpisode(options) {
     const { harness, decider, surface, clock } = options;
     const episode = options.episode ?? "trace1";
     const tempo = harness.tempo ?? DEFAULT_TEMPO;
     const stallSeconds = harness.stallSeconds ?? DEFAULT_STALL_SECONDS;
+    const maxSeconds = options.maxSeconds ?? DEFAULT_MAX_SECONDS;
     const startedAt = clock.t;
     let call = 0;
+    let nextRunId = 0;
     let running = null;
     const recent = [];
     let lastProgressAt = startedAt;
-    let lastSituation = "";
-    let cancelled = false;
+    let lastProgressKey = "";
     let degradedDecisions = 0;
-    if (harness.setup) await harness.setup(surface);
-    for (; ; ) {
-      if (options.watch) await options.watch.sample();
-      const obs = await harness.observe(surface);
-      const status = harness.status(obs);
-      if (status.state !== "running") {
-        return await result(status.state === "done" ? "done" : "failed", status.note ?? "", status.evidence ?? {});
-      }
-      const situation = JSON.stringify(obs);
-      if (situation !== lastSituation || running) {
-        lastSituation = situation;
-        lastProgressAt = clock.t;
-      }
-      if (clock.t - lastProgressAt > stallSeconds) {
-        return await result("stalled", `no progress for ${stallSeconds}s`, {});
-      }
-      if (options.maxSeconds !== void 0 && clock.t - startedAt > options.maxSeconds) {
-        return await result("stalled", `time limit at ${Math.round(clock.t - startedAt)}s`, {});
-      }
-      if (options.cancelled?.()) {
-        cancelled = true;
-        return await result("cancelled", "cancelled by request", {});
-      }
-      const steps = harness.plan?.(obs) ?? null;
-      let legal = harness.options(obs);
-      if (steps) {
-        const current2 = steps.find((step) => !step.done(obs));
-        if (current2) {
-          const allowed = new Set(legal.map((option) => option.name));
-          void allowed;
+    const action = (kind, active, extra = {}) => {
+      options.onAction?.({ kind, call: active.call, option: active.name, runId: active.id, t: clock.t, ...extra });
+    };
+    const drainCleanup = (active) => {
+      const errors = [];
+      for (const cleanup of active.cleanups.splice(0)) {
+        try {
+          cleanup();
+        } catch (error) {
+          errors.push(error instanceof Error ? error.message : String(error));
         }
       }
-      if (!legal.length) {
-        await clock.wait(Math.max(0.05, 1 / tempo / 4));
-        continue;
-      }
-      const optionFacts = {};
-      for (const option of legal) {
-        optionFacts[option.name] = { description: option.description, facts: option.facts };
-      }
-      const request = {
-        goal: harness.goal,
-        situation: obs,
-        options: optionFacts,
-        nowDoing: running ? { option: running.name, since: running.startedAt, working: true } : null,
-        recent: recent.slice(-5),
-        plan: steps ? {
-          done: steps.filter((s) => s.done(obs)).map((s) => s.name),
-          now: (() => {
-            const current2 = steps.find((s) => !s.done(obs));
-            return current2 ? { step: current2.name, what: current2.what } : null;
-          })(),
-          next: (() => {
-            const pending = steps.filter((s) => !s.done(obs));
-            return pending.slice(1, 4).map((s) => s.what);
-          })()
-        } : null,
-        askedAt: Date.now() / 1e3
-      };
-      const askedAt = clock.t;
-      let answer;
-      let degraded = false;
-      try {
-        answer = await decider.decide(request);
-      } catch (decideError) {
-        if (!options.fallbackDecider) throw decideError;
-        answer = await options.fallbackDecider.decide(request);
-        degraded = true;
-        degradedDecisions++;
-      }
-      call++;
-      const invalid = validChoice(request, answer.choice);
-      if (invalid) {
-        return await result("error", invalid, {});
-      }
-      const chosen = legal.find((option) => option.name === answer.choice);
-      if (!chosen) {
-        return await result("error", `chosen option "${answer.choice}" not legal now`, {});
-      }
-      options.onDecision?.({
-        call,
-        episode,
-        t: clock.t,
-        wall: Date.now() / 1e3,
-        options: legal.map((option) => option.name),
-        request,
-        latencyS: answer.latencyS,
-        response: { model: answer.model ?? (degraded ? options.fallbackDecider.kind : decider.kind), usage: answer.usage },
-        appliedT: clock.t,
-        chosen: answer.choice,
-        action: running?.name === answer.choice ? "kept" : running ? "switched" : "started",
-        running: running?.name ?? null
-      });
-      if (!running || running.name !== answer.choice) {
-        const optionStartedAt = clock.t;
-        const name = chosen.name;
-        const settle = () => {
-          if (running?.name === name) running = null;
+      return errors.length ? errors.join("; ") : void 0;
+    };
+    const cancelRunning = (reason) => {
+      const active = running;
+      if (!active) return;
+      running = null;
+      if (active.revoked) return;
+      active.revoked = true;
+      const cleanupError = drainCleanup(active);
+      action("cancelled", active, { error: cleanupError ? `${reason}; cleanup: ${cleanupError}` : reason });
+    };
+    const finish = async (outcome, note, evidence) => {
+      if (options.watch) await options.watch.sample();
+      const findings = options.watch ? options.watch.findings() : void 0;
+      const degradedNote = degradedDecisions > 0 && (outcome === "done" || outcome === "failed") ? `${note}${note ? " \u2014 " : ""}degraded: ${degradedDecisions} decision(s) fell back to ${options.fallbackDecider?.kind ?? "fallback"}` : note;
+      return { outcome, note: degradedNote, evidence, decisions: call, seconds: Math.max(0, clock.t - startedAt), ...findings?.length ? { findings } : {} };
+    };
+    try {
+      if (harness.setup) await harness.setup(surface);
+      for (; ; ) {
+        if (options.watch) await options.watch.sample();
+        const obs = await harness.observe(surface);
+        const status = harness.status(obs);
+        if (status.state !== "running") {
+          return await finish(status.state === "done" ? "done" : "failed", status.note ?? "", status.evidence ?? {});
+        }
+        const progressKey = JSON.stringify(harness.progress ? harness.progress(obs) : obs);
+        if (progressKey !== lastProgressKey || !harness.progress && running) {
+          lastProgressKey = progressKey;
+          lastProgressAt = clock.t;
+        }
+        if (clock.t - lastProgressAt > stallSeconds) return await finish("stalled", `no progress for ${stallSeconds}s`, {});
+        if (clock.t - startedAt > maxSeconds) return await finish("stalled", `time limit at ${Math.round(clock.t - startedAt)}s`, {});
+        if (options.cancelled?.()) return await finish("cancelled", "cancelled by request", {});
+        const steps = harness.plan?.(obs) ?? null;
+        const stepStates = steps?.map((step) => ({ step, done: step.done(obs) })) ?? null;
+        const currentStep = stepStates?.find((entry) => !entry.done)?.step ?? null;
+        const legal = harness.options(obs);
+        if (!legal.length) {
+          await clock.wait(Math.max(0.05, 1 / tempo / 4));
+          continue;
+        }
+        const optionFacts = {};
+        for (const option of legal) optionFacts[option.name] = { description: option.description, facts: option.facts };
+        const publicObs = Object.fromEntries(Object.entries(obs).filter(([key]) => !key.startsWith("_")));
+        const request = {
+          goal: harness.goal,
+          situation: publicObs,
+          options: optionFacts,
+          nowDoing: running ? { option: running.name, since: running.startedAt, working: true } : null,
+          recent: recent.slice(-5),
+          plan: stepStates ? {
+            done: stepStates.filter((entry) => entry.done).map((entry) => entry.step.name),
+            now: currentStep ? { step: currentStep.name, what: currentStep.what } : null,
+            next: stepStates.filter((entry) => !entry.done).slice(1, 4).map((entry) => entry.step.what)
+          } : null,
+          askedAt: Date.now() / 1e3
         };
-        void chosen.run(surface).then(
-          (worked) => {
-            recent.push({ option: name, worked, why: worked ? void 0 : "did not work" });
-            if (recent.length > 12) recent.shift();
-            settle();
+        const askedT = clock.t;
+        const askedWall = Date.now() / 1e3;
+        let answer;
+        let degraded = false;
+        try {
+          answer = await decider.decide(request);
+        } catch (decideError) {
+          if (options.cancelled?.()) throw decideError;
+          if (!options.fallbackDecider) throw decideError;
+          answer = await options.fallbackDecider.decide(request);
+          degraded = true;
+          degradedDecisions++;
+        }
+        call++;
+        const appliedT = clock.t;
+        const invalid = validChoice(request, answer.choice);
+        const recordBase = {
+          call,
+          episode,
+          t: askedT,
+          wall: askedWall,
+          options: legal.map((option) => option.name),
+          request,
+          latencyS: answer.latencyS,
+          response: { model: answer.model ?? (degraded ? options.fallbackDecider.kind : decider.kind), usage: answer.usage },
+          appliedT,
+          chosen: answer.choice,
+          running: running?.name ?? null
+        };
+        if (invalid) {
+          options.onDecision?.({ ...recordBase, action: "rejected" });
+          return await finish("error", invalid, {});
+        }
+        if (options.cancelled?.()) {
+          options.onDecision?.({ ...recordBase, action: "cancelled" });
+          return await finish("cancelled", "cancelled by request", {});
+        }
+        if (clock.t - startedAt > maxSeconds) {
+          options.onDecision?.({ ...recordBase, action: "expired" });
+          return await finish("stalled", `time limit at ${Math.round(clock.t - startedAt)}s`, {});
+        }
+        const chosen = legal.find((option) => option.name === answer.choice);
+        const sameRunning = running?.name === chosen.name;
+        const blocked = !!running && !sameRunning && !running.interruptible;
+        const appliedAction = sameRunning ? "kept" : blocked ? "blocked" : running ? "switched" : "started";
+        options.onDecision?.({ ...recordBase, action: appliedAction });
+        if (sameRunning || blocked) {
+          await clock.wait(1 / Math.max(0.1, tempo));
+          continue;
+        }
+        cancelRunning("switched");
+        const active = {
+          id: ++nextRunId,
+          name: chosen.name,
+          interruptible: chosen.interruptible !== false,
+          startedAt: appliedT,
+          call,
+          revoked: false,
+          cleanups: []
+        };
+        running = active;
+        const context = {
+          id: active.id,
+          get cancelled() {
+            return active.revoked;
           },
-          () => {
-            recent.push({ option: name, worked: false, why: "threw" });
-            settle();
+          throwIfCancelled() {
+            if (active.revoked) throw new Error(`option "${active.name}" run ${active.id} was cancelled`);
+          },
+          onCleanup(cleanup) {
+            if (active.revoked) {
+              cleanup();
+              return;
+            }
+            active.cleanups.push(cleanup);
+          }
+        };
+        const scopedSurface = {
+          get t() {
+            return surface.t;
+          },
+          read: (key) => surface.read(key),
+          act: (actionName, args) => {
+            if (active.revoked) return Promise.reject(new Error(`option "${active.name}" run ${active.id} is no longer active`));
+            return surface.act(actionName, args);
+          }
+        };
+        action("started", active);
+        let returned;
+        try {
+          returned = Promise.resolve(chosen.run(scopedSurface, context));
+        } catch (error) {
+          returned = Promise.reject(error);
+        }
+        void returned.then(
+          (worked) => {
+            if (running?.id !== active.id || active.revoked) return;
+            running = null;
+            active.revoked = true;
+            recent.push({ option: active.name, worked, why: worked ? void 0 : "did not work" });
+            if (recent.length > 12) recent.shift();
+            action("completed", active, { worked, error: drainCleanup(active) });
+          },
+          (error) => {
+            if (running?.id !== active.id || active.revoked) return;
+            running = null;
+            active.revoked = true;
+            recent.push({ option: active.name, worked: false, why: "threw" });
+            if (recent.length > 12) recent.shift();
+            const message = error instanceof Error ? error.message : String(error);
+            const cleanupError = drainCleanup(active);
+            action("failed", active, { worked: false, error: cleanupError ? `${message}; cleanup: ${cleanupError}` : message });
           }
         );
-        running = { name, startedAt: optionStartedAt, promise: Promise.resolve(true) };
+        await clock.wait(1 / Math.max(0.1, tempo));
       }
-      await clock.wait(1 / Math.max(0.1, tempo));
-      void askedAt;
-      async function result(outcome, note, evidence) {
-        if (options.watch) await options.watch.sample();
-        const findings = options.watch ? options.watch.findings() : void 0;
-        const degradedNote = degradedDecisions > 0 && (outcome === "done" || outcome === "failed") ? `${note}${note ? " \u2014 " : ""}degraded: ${degradedDecisions} decision(s) fell back to ${options.fallbackDecider?.kind ?? "fallback"}` : note;
-        return { outcome, note: degradedNote, evidence, decisions: call, seconds: Math.max(0, clock.t - startedAt), ...findings?.length ? { findings } : {} };
-      }
+    } finally {
+      cancelRunning("episode-ended");
     }
   }
 
@@ -47565,7 +47849,7 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   function createUnitySurface(runtime, paths) {
     return {
       get t() {
-        return runtime.frame / 60;
+        return runtime.nowSeconds?.() ?? runtime.frame / 60;
       },
       async read(key) {
         const raw = await runtime.call(paths.readPath);
@@ -47590,9 +47874,10 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
   function createUnityClock(runtime) {
     return {
       get t() {
-        return runtime.frame / 60;
+        return runtime.nowSeconds?.() ?? runtime.frame / 60;
       },
       wait(seconds) {
+        if (runtime.waitSeconds) return runtime.waitSeconds(seconds);
         const frames = Math.max(1, Math.round(seconds * 60));
         return runtime.waitFrames(frames);
       }
@@ -47723,6 +48008,18 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     }
     return lines.join("\n");
   }
+  function formatGameUsePartialReport(input) {
+    const lines = [`verdict: INCOMPLETE \u2014 ${input.errorCode || "SCRIPT_ERROR"}${input.errorMessage ? `: ${input.errorMessage}` : ""}`];
+    const decisions = input.decisions ?? [];
+    lines.push(`partial evidence: ${decisions.length} decision(s), ${(input.actions ?? []).length} action event(s)`);
+    if (decisions.length) lines.push(`decision trail: ${decisions.slice(0, 40).map((entry) => String(entry.chosen ?? "?")).join(" \u2192 ")}${decisions.length > 40 ? ` (+${decisions.length - 40} more)` : ""}`);
+    const latencies = decisions.map((entry) => typeof entry.latencyS === "number" ? entry.latencyS * 1e3 : Number.NaN).filter(Number.isFinite);
+    if (latencies.length) {
+      latencies.sort((a, b) => a - b);
+      lines.push(`decision latency: p50 ${Math.round(latencies[Math.floor(latencies.length / 2)])}ms, max ${Math.round(latencies[latencies.length - 1])}ms`);
+    }
+    return lines.join("\n");
+  }
   function round1(value) {
     const n = Number(value);
     if (!Number.isFinite(n)) return "0";
@@ -47737,80 +48034,6 @@ return { run: (typeof run !== "undefined" ? run : (module.exports.run || exports
     let cut = max;
     if (cut > 0 && cut < text.length && (text.charCodeAt(cut - 1) & 64512) === 55296) cut -= 1;
     return `${text.slice(0, cut)}\u2026`;
-  }
-
-  // src/game-use/sim/three-sparks-harness.ts
-  var SPARKS = [[0, 2], [2, 0], [4, 4]];
-  var WALLS = [[2, 2], [3, 2]];
-  var STEP = {
-    north: [0, 1],
-    south: [0, -1],
-    east: [1, 0],
-    west: [-1, 0]
-  };
-  function createThreeSparksHarness() {
-    const collected = /* @__PURE__ */ new Set();
-    return {
-      goal: "Collect all three sparks on the grid; walls block movement",
-      tempo: 4,
-      stallSeconds: 5,
-      // The static layout is researcher knowledge read from the game's
-      // source (SparkCells/Walls in PieCollectGame.cs); observations carry
-      // only the changing state.
-      async observe(surface) {
-        const snap = await surface.read("snapshot");
-        return {
-          x: snap.x,
-          z: snap.z,
-          score: snap.score,
-          sparks_left: snap.visibleSparks,
-          moves: snap.moves,
-          won: snap.won === true
-        };
-      },
-      options(obs) {
-        const options = [];
-        for (const [dir, [dx, dz]] of Object.entries(STEP)) {
-          const next = [obs.x + dx, obs.z + dz];
-          const onBoard = next[0] >= 0 && next[0] <= 4 && next[1] >= 0 && next[1] <= 4;
-          const wall = WALLS.some(([x, z]) => x === next[0] && z === next[1]);
-          if (!onBoard || wall) continue;
-          const spark = SPARKS.some(([x, z]) => x === next[0] && z === next[1]) && !collected.has(`${next[0]},${next[1]}`);
-          options.push({
-            name: `move_${dir}`,
-            description: `Step ${dir} to (${next[0]}, ${next[1]})${spark ? " and collect the spark" : ""}`,
-            facts: {
-              next: [next[0], next[1]],
-              collects_spark: spark,
-              toward_closest_spark: toward(obs, next, collected)
-            },
-            run: async (surface) => {
-              const moved = await surface.act("step", { dx, dz });
-              if (moved === true && SPARKS.some(([sx, sz]) => sx === next[0] && sz === next[1])) {
-                collected.add(`${next[0]},${next[1]}`);
-              }
-              return moved === true;
-            }
-          });
-        }
-        return options;
-      },
-      status(obs) {
-        if (obs.won === true) {
-          return { state: "done", note: "all three sparks collected", evidence: { score: obs.score, moves: obs.moves } };
-        }
-        return { state: "running" };
-      }
-    };
-  }
-  function toward(obs, next, collected) {
-    const sparks = SPARKS.filter(([sx, sz]) => !collected?.has(`${sx},${sz}`));
-    if (!sparks.length) return false;
-    const here = [obs.x, obs.z];
-    const dist = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
-    const best = Math.min(...sparks.map((s) => dist(here, s)));
-    const after = Math.min(...sparks.map((s) => dist(next, s)));
-    return after < best;
   }
 
   // src/game-use/decide/providers.ts
@@ -47943,26 +48166,21 @@ ${lines.join("\n")}`;
             }
           }
         };
-        let answer;
-        try {
-          const first = await post(options, API_PATH, body, DECIDE_TIMEOUT);
-          if (first.status >= 500 || first.status === 429) {
-            const second = await post(options, API_PATH, body, DECIDE_TIMEOUT);
-            answer = second.status >= 200 && second.status < 300 ? second.body : first.body;
-          } else if (first.status < 200 || first.status >= 300) {
-            throw new DecideError(`jev HTTP ${first.status}: ${first.body.slice(0, 160)}`, false);
-          } else {
-            answer = first.body;
-            void warmOnce();
+        let answer = "";
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const response = await post(options, API_PATH, body, DECIDE_TIMEOUT);
+            if (response.status >= 200 && response.status < 300) {
+              answer = response.body;
+              if (attempt === 0) void warmOnce();
+              break;
+            }
+            const retryable = response.status >= 500 || response.status === 429;
+            throw new DecideError(`jev HTTP ${response.status}: ${response.body.slice(0, 160)}`, retryable);
+          } catch (error) {
+            const retryable = !(error instanceof DecideError) || error.retryable;
+            if (!retryable || attempt === 1) throw error;
           }
-        } catch (error) {
-          const retryable = !(error instanceof DecideError) || error.retryable;
-          if (!retryable) throw error;
-          const retry = await post(options, API_PATH, body, DECIDE_TIMEOUT);
-          if (retry.status < 200 || retry.status >= 300) {
-            throw new DecideError(`jev retry HTTP ${retry.status}: ${retry.body.slice(0, 160)}`, false);
-          }
-          answer = retry.body;
         }
         const parsed = parseChoice(answer);
         cacheKey = key;
@@ -47979,7 +48197,10 @@ ${lines.join("\n")}`;
   }
 
   // src/game-use/run/game-use-bridge.ts
-  function gameUseHttpClient() {
+  function nativeHttpBridge() {
+    return CS.Pie.PieHttpBridge;
+  }
+  function gameUseHttpClient(services) {
     return {
       async request(url, options = {}) {
         const headers = options.headers ?? {};
@@ -47987,19 +48208,61 @@ ${lines.join("\n")}`;
         const extra = {};
         for (const [key, value] of Object.entries(headers)) {
           const lower = key.toLowerCase();
-          if (lower === "authorization" || lower === "content-type") continue;
+          if (lower === "authorization" || lower === "content-length") continue;
           extra[key] = value;
         }
         const headersJson = Object.keys(extra).length ? JSON.stringify(extra) : "";
-        const raw = await puer.$promise(
-          CS.Pie.PieHttpBridge.FetchTextAsync(options.method ?? "POST", url, options.body ?? "", bearer, headersJson)
-        );
+        const timeoutMs = Math.max(1, Math.floor(options.timeoutMs ?? 8e3));
+        const native = nativeHttpBridge();
+        const awaitExternal = (promise) => services.awaitExternal ? services.awaitExternal(promise) : promise;
+        let raw;
+        if (native.CreateBufferedRequest && native.FetchTextRequestAsync && native.CancelBufferedRequest) {
+          const requestId = native.CreateBufferedRequest();
+          let cancelled = false;
+          const cancelOwned = () => {
+            if (cancelled) return;
+            cancelled = true;
+            native.CancelBufferedRequest(requestId);
+          };
+          const unregister = services.onTermination?.(cancelOwned) ?? (() => {
+          });
+          try {
+            raw = await awaitExternal(puer.$promise(native.FetchTextRequestAsync(
+              requestId,
+              options.method ?? "POST",
+              url,
+              options.body ?? "",
+              bearer,
+              headersJson,
+              false,
+              timeoutMs
+            )));
+          } finally {
+            unregister();
+            cancelOwned();
+          }
+        } else {
+          raw = await awaitExternal(puer.$promise(native.FetchTextAsync(
+            options.method ?? "POST",
+            url,
+            options.body ?? "",
+            bearer,
+            headersJson
+          )));
+        }
         const parsed = JSON.parse(String(raw || "{}"));
-        return {
-          status: Number(parsed.status ?? 0),
-          text: async () => String(parsed.body ?? "")
-        };
+        if (parsed.bodyTruncated) throw new Error("game-use HTTP response was truncated");
+        return { status: Number(parsed.status ?? 0), text: async () => String(parsed.body ?? "") };
       }
+    };
+  }
+  function adaptSurface(surface) {
+    return {
+      get t() {
+        return surface.t;
+      },
+      read: (key) => surface.read(key),
+      act: (action, args) => surface.act(action, args)
     };
   }
   function inlineHarness(h) {
@@ -48007,422 +48270,304 @@ ${lines.join("\n")}`;
       goal: h.goal,
       tempo: h.tempo,
       stallSeconds: h.stallSeconds,
-      observe: async (surface) => await h.observe({ read: (k) => surface.read(k) }),
+      setup: h.setup ? async (surface) => h.setup(adaptSurface(surface)) : void 0,
+      observe: async (surface) => await h.observe(adaptSurface(surface)),
+      progress: h.progress ? (obs) => h.progress(obs) : void 0,
       options: (obs) => h.options(obs).map((option) => ({
         name: option.name,
         description: option.description,
         facts: option.facts,
-        run: async (surface) => option.run({
-          read: (k) => surface.read(k),
-          act: (action, args) => surface.act(action, args)
-        })
+        interruptible: option.interruptible,
+        run: async (surface, context) => option.run(adaptSurface(surface), context)
       })),
-      status: (obs) => h.status(obs)
+      status: (obs) => h.status(obs),
+      plan: h.plan ? (obs) => h.plan(obs) : void 0
     };
   }
-  function createGameUseScriptApi(runtime) {
+  function firstListedPolicy(request) {
+    const first = Object.keys(request.options)[0];
+    if (!first) throw new Error("no options offered");
+    return first;
+  }
+  function createGameUseScriptApi(runtime, services = {}) {
     return {
-      async runEpisode(config) {
-        const harness = harnessById(config.harness);
-        const surface = createUnitySurface(runtime, { readPath: config.readPath, actPath: config.actPath });
-        const clock = createUnityClock(runtime);
-        const decider = config.decider === "jev" ? createJevDecider({
-          apiKey: config.jevKey ?? "",
-          baseUrl: void 0,
-          http: config.jevHttp ?? gameUseHttpClient(),
-          timeoutMs: 8e3
-        }) : deciderById(config.decider);
-        return runEpisode({
-          harness,
-          decider,
-          surface,
-          clock,
-          maxSeconds: config.maxSeconds,
-          episode: "script",
-          onDecision: config.onDecision,
-          watch: config.detectors === false ? null : await GameWatch.start(runtime)
-        });
-      },
       async playWithHarness(config) {
         if (config.jev && config.policy) throw new Error("pass either jev or policy, not both");
-        const surface = createUnitySurface(runtime, { readPath: config.readPath, actPath: "unused" });
+        const surface = createUnitySurface(runtime, { readPath: config.readPath, actPath: config.actPath ?? "unused" });
         const clock = createUnityClock(runtime);
         const watch = config.detectors === false ? null : await GameWatch.start(runtime);
-        {
+        const decisions = [];
+        const actions = [];
+        let inputReleased = false;
+        const releaseInput = () => {
+          if (inputReleased) return;
+          inputReleased = true;
+          if (services.releaseInput) {
+            services.releaseInput();
+            return;
+          }
+          void Promise.resolve().then(() => runtime.call("CS.Pie.GameUse.PieInputHands.ReleaseAll", [])).catch(() => void 0);
+          void Promise.resolve().then(() => runtime.call("CS.Pie.GameUse.PieInputHands.SetEpisodeActive", [0])).catch(() => void 0);
+        };
+        const unregisterTermination = services.onTermination?.(releaseInput) ?? (() => {
+        });
+        const checkpoint = (error) => services.checkpoint?.({
+          episode: null,
+          decisions,
+          actions,
+          incomplete: true,
+          ...error ? { error: error instanceof Error ? error.message : String(error) } : {}
+        });
+        try {
           const budget = Math.min(1e5, Math.ceil((config.maxSeconds ?? 60) * 60 * 1.5));
           await Promise.resolve().then(() => runtime.call("CS.Pie.GameUse.PieInputHands.SetEpisodeActive", [budget])).catch(() => void 0);
-        }
-        const decider = config.jev ? createJevDecider({
-          apiKey: config.jev.key,
-          baseUrl: config.jev.baseUrl,
-          // The host HTTP bridge (PieHttpBridge: managed async HTTP
-          // awaited as a PuerTS promise — the same path the agent's
-          // own LLM calls take, no timers and no polling).
-          http: gameUseHttpClient(),
-          timeoutMs: 8e3
-        }) : createScriptedDecider(config.policy ?? inlineGreedyPolicy(), config.policy ? "scripted" : "greedy-inline");
-        const episode = await runEpisode({
-          harness: inlineHarness(config.harness),
-          decider,
-          fallbackDecider: config.jev ? createScriptedDecider(inlineGreedyPolicy(), "greedy-fallback") : void 0,
-          surface,
-          clock,
-          maxSeconds: config.maxSeconds,
-          episode: config.jev ? "jev" : "inline",
-          onDecision: config.onDecision,
-          watch
-        });
-        return { episode, report: formatGameUseReport({ episode }) };
-      }
-    };
-  }
-  function harnessById(id) {
-    if (id === "three_sparks") return createThreeSparksHarness();
-    throw new Error(`unknown harness "${id}"`);
-  }
-  function inlineGreedyPolicy() {
-    return (request) => {
-      let best = "";
-      let bestScore = -Infinity;
-      for (const [name, option] of Object.entries(request.options)) {
-        let value = 0;
-        if (option.facts.collects_spark === true) value += 4;
-        if (option.facts.toward_closest_spark === true) value += 2;
-        if (typeof option.facts.steps_to_goal === "number") value -= option.facts.steps_to_goal / 100;
-        if (value > bestScore) {
-          bestScore = value;
-          best = name;
+          const decider = config.jev ? createJevDecider({ apiKey: config.jev.key, baseUrl: config.jev.baseUrl, http: gameUseHttpClient(services), timeoutMs: 8e3 }) : createScriptedDecider(config.policy ?? firstListedPolicy, config.policy ? "scripted" : "first-listed");
+          const episode = await runEpisode({
+            harness: inlineHarness(config.harness),
+            decider,
+            fallbackDecider: config.jev ? createScriptedDecider(config.fallbackPolicy ?? firstListedPolicy, config.fallbackPolicy ? "scripted-fallback" : "first-listed-fallback") : void 0,
+            surface,
+            clock,
+            maxSeconds: config.maxSeconds,
+            episode: config.jev ? "jev" : "inline",
+            cancelled: services.cancelled,
+            onDecision: (record2) => {
+              decisions.push(record2);
+              checkpoint();
+              config.onDecision?.(record2);
+            },
+            onAction: (record2) => {
+              actions.push(record2);
+              checkpoint();
+            },
+            watch
+          });
+          return { episode, report: formatGameUseReport({ episode, decisions }), decisions, actions };
+        } catch (error) {
+          checkpoint(error);
+          throw error;
+        } finally {
+          unregisterTermination();
+          releaseInput();
         }
       }
-      return best || Object.keys(request.options)[0];
-    };
-  }
-  function deciderById(id) {
-    const kind = id ?? "greedy";
-    if (kind === "greedy") {
-      return createScriptedDecider((request) => {
-        let best = "";
-        let bestScore = -Infinity;
-        for (const [name, option] of Object.entries(request.options)) {
-          let value = 0;
-          if (option.facts.collects_spark === true) value += 4;
-          if (option.facts.toward_closest_spark === true) value += 2;
-          if (typeof option.facts.steps_to_goal === "number") value -= option.facts.steps_to_goal / 100;
-          if (value > bestScore) {
-            bestScore = value;
-            best = name;
-          }
-        }
-        return best || Object.keys(request.options)[0];
-      }, "greedy");
-    }
-    throw new Error(`unknown decider "${kind}"`);
-  }
-
-  // src/game-use/run/harness-driver.ts
-  function normalizeHarnessExports(source) {
-    const text = String(source || "");
-    let ast;
-    try {
-      ast = parse4(text, { ecmaVersion: "latest", sourceType: "module" });
-    } catch (error) {
-      throw new Error(`game_use_run: harnessSource is not valid JavaScript: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    const edits = [];
-    for (const node of ast.body) {
-      if (String(node.type) === "ImportDeclaration") {
-        throw new Error("game_use_run: harnessSource must not contain imports; inline everything the harness needs.");
-      }
-      if (String(node.type) !== "ExportDefaultDeclaration" && String(node.type) !== "ExportNamedDeclaration") continue;
-      if (String(node.type) === "ExportDefaultDeclaration") {
-        const decl2 = node.declaration;
-        const exprStart = decl2 && ["FunctionDeclaration", "ClassDeclaration", "ArrowFunctionExpression", "FunctionExpression"].includes(decl2.type) ? Number(decl2.start) : Number(node.start) + "export default".length;
-        edits.push({ at: Number(node.start), end: exprStart, text: "const __pieHarnessDefault = " });
-        continue;
-      }
-      const decl = node.declaration;
-      if (decl) {
-        const exportedNames = String(decl.type) === "VariableDeclaration" ? (decl.declarations || []).map((d) => d.id?.name ?? "") : [decl.id?.name ?? ""];
-        if (String(decl.type) !== "VariableDeclaration" && !exportedNames.includes("harness")) {
-          throw new Error(`game_use_run: only the harness may be exported (found "${exportedNames[0] || "anonymous"}"); the driver provides run(ctx, args).`);
-        }
-        edits.push({ at: Number(node.start), end: Number(decl.start), text: "" });
-        continue;
-      }
-      const specifiers = node.specifiers || [];
-      const allowed = specifiers.length > 0 && specifiers.every((spec) => {
-        const local = spec.local?.name;
-        const exported = spec.exported?.name ?? local;
-        return local === "harness" && (exported === "harness" || exported === "default");
-      });
-      if (!allowed) {
-        throw new Error("game_use_run: only the harness export may be listed (export { harness } or export { harness as default }).");
-      }
-      edits.push({ at: Number(node.start), end: Number(node.end), text: "" });
-    }
-    return applyUnitySourceEdits(text, edits);
-  }
-  function policyFunctionSource(policySource) {
-    const text = String(policySource || "").trim();
-    if (!text) throw new Error("game_use_run: policySource must be a function expression like (request) => optionName.");
-    let parsed;
-    try {
-      parsed = parse4(`(${text})`, { ecmaVersion: "latest", sourceType: "module" });
-    } catch (error) {
-      throw new Error(`game_use_run: policySource is not a valid expression: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    const body = parsed.body;
-    if (body.length !== 1 || String(body[0]?.type) !== "ExpressionStatement") {
-      throw new Error("game_use_run: policySource must be a single function expression.");
-    }
-    const expr = body[0].expression;
-    if (!expr || !["ArrowFunctionExpression", "FunctionExpression"].includes(String(expr.type))) {
-      throw new Error("game_use_run: policySource must be a function expression like (request) => optionName.");
-    }
-    return text;
-  }
-  function harnessDriverSource(harnessSource, options = {}) {
-    const policy = options.policySource !== void 0 && options.policySource !== null && String(options.policySource).trim() !== "" ? policyFunctionSource(String(options.policySource)) : null;
-    return `export async function run(ctx, args) {
-${normalizeHarnessExports(harnessSource)}
-;
-  const resolved = (typeof harness !== "undefined" && harness) || (typeof __pieHarnessDefault !== "undefined" && __pieHarnessDefault) || null;
-  if (!resolved) throw new Error("game_use_run: the harness module must export the harness object (a default export, or a named export called 'harness').");
-  if (args.resetPath) await ctx.runtime.call(args.resetPath, []);
-  if (args.runInBackground === true) await ctx.runtime.call("CS.Pie.GameUse.PieRuntimeOptions.SetRunInBackground", [true]);
-  const trail = [];
-  const episode = await ctx.gameUse.playWithHarness({
-    readPath: args.readPath,
-    maxSeconds: args.maxSeconds,
-    jev: args.jev,${policy ? "\n    policy: __piePolicy," : ""}
-    harness: resolved,
-    onDecision: (record) => trail.push({ call: record.call, chosen: record.chosen, situation: record.request.situation }),
-  });
-  return { episode, trail };
-}
-${policy ? `const __piePolicy = ${policy};
-` : ""}`;
-  }
-
-  // src/unity-frame-clock.ts
-  function currentUnityFrame() {
-    const application = typeof CS !== "undefined" ? CS?.UnityEngine?.Application : void 0;
-    if (!application?.isPlaying) return void 0;
-    const frameCount = typeof CS !== "undefined" ? CS?.UnityEngine?.Time?.frameCount : void 0;
-    return typeof frameCount === "number" ? frameCount : void 0;
-  }
-  function createSliceClock() {
-    const sources = [
-      () => {
-        const value = typeof CS !== "undefined" ? CS?.UnityEngine?.Time?.realtimeSinceStartupAsDouble : void 0;
-        return typeof value === "number" ? value * 1e3 : NaN;
-      },
-      () => typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : NaN,
-      () => Date.now()
-    ];
-    let selected = 0, offset2 = 0, fresh = true;
-    let last;
-    return () => {
-      while (selected < sources.length) {
-        let value = NaN;
-        try {
-          value = sources[selected]();
-        } catch {
-        }
-        if (Number.isFinite(value)) {
-          if (fresh) {
-            offset2 = last === void 0 ? 0 : last - value;
-            fresh = false;
-          }
-          last = Math.max(last ?? -Infinity, value + offset2);
-          return last;
-        }
-        fresh = true;
-        if (selected === sources.length - 1) return last ?? 0;
-        selected++;
-      }
-      return last ?? 0;
     };
   }
 
-  // src/unity-script-host.ts
-  var SOFT_SLICE_MS = 4;
-  var DEFAULT_TOTAL_TIMEOUT_MS = 3e4;
-  var DEFAULT_PER_STEP_TIMEOUT_MS = 100;
-  var DEFAULT_MAX_FRAMES = 1800;
-  var MAX_LOG_LINES = 200;
-  var STEP_TIMEOUT_ERROR_CODE = "STEP_TIMEOUT";
-  var defaultSliceClock = createSliceClock();
-  function sliceNowMs() {
-    return scriptScheduler.sliceNow?.() ?? defaultSliceClock();
-  }
-  var installedBridge = null;
-  var scriptScheduler = {
-    now: () => Date.now(),
-    frame: currentUnityFrame,
-    random: () => Math.random()
-  };
-  function getRunStore() {
-    const key = "__pieUnityScriptRuns";
-    const unityGlobal = globalThis;
-    const existing = unityGlobal[key];
-    if (!existing || typeof existing.get !== "function" || typeof existing.set !== "function") {
-      const created = /* @__PURE__ */ new Map();
-      unityGlobal[key] = created;
-      return created;
-    }
-    return existing;
-  }
-  function nowMs2() {
-    return scriptScheduler.now();
-  }
-  function nowIso3() {
-    return scriptScheduler.isoNow?.() ?? new Date(nowMs2()).toISOString();
-  }
-  function createRunId() {
-    return `unity_script_run_${nowMs2().toString(36)}_${(scriptScheduler.random?.() ?? Math.random()).toString(36).slice(2, 8)}`;
-  }
-  function toPositiveNumber(value, fallback) {
-    const numeric2 = Number(value);
-    return Number.isFinite(numeric2) && numeric2 > 0 ? numeric2 : fallback;
-  }
-  function summarizeValue(value) {
-    if (value === null) return "null";
-    if (value === void 0) return "undefined";
-    if (Array.isArray(value)) return `Array(${value.length})`;
-    if (typeof value === "object") {
-      const keys = Object.keys(value);
-      return `Object(${keys.slice(0, 6).join(", ")})`;
-    }
-    return String(value);
-  }
-  function toSerializable(value) {
-    return safeSerializeScriptValue(value);
-  }
-  function isRecord10(value) {
-    return !!value && typeof value === "object" && !Array.isArray(value);
-  }
-  function createScriptHostError(code, message) {
-    const error = new Error(message);
-    error.code = code;
-    return error;
-  }
-  function extractRefs(value) {
-    if (!isRecord10(value)) return [];
-    if (Array.isArray(value.results)) return value.results;
-    if (Array.isArray(value.createdRefs)) return value.createdRefs;
-    if (value.target) return [value.target];
-    return [];
-  }
-  function isStepTimeoutError(error) {
-    return isRecord10(error) && (error.code === STEP_TIMEOUT_ERROR_CODE || error.name === "PieStepTimeoutError");
-  }
-  function buildStatus(task) {
-    const done = task.status === "completed" || task.status === "failed" || task.status === "cancelled";
-    const hardStepTermination = false;
-    const appliedOperations = task.mutations.map((mutation) => ({
-      action: mutation.action,
-      target: toSerializable(mutation.target),
-      summary: mutation.summary
-    }));
-    return {
-      taskId: task.id,
-      name: task.name,
-      mode: task.mode,
-      status: task.status,
-      done,
-      ok: task.status === "completed",
-      summary: task.status === "completed" ? summarizeValue(task.result) : task.errorMessage || task.status,
-      result: task.status === "completed" ? toSerializable(task.result) : null,
-      errorCode: task.errorCode,
-      errorMessage: task.errorMessage,
-      logs: task.logs.slice(-MAX_LOG_LINES),
-      refs: toSerializable(task.createdRefs || []),
-      frames: task.frames,
-      durationMs: Math.max(0, nowMs2() - task.startMs),
-      totalTimeoutMs: task.totalTimeoutMs,
-      perStepTimeoutMs: task.perStepTimeoutMs,
-      maxFrames: task.maxFrames,
-      updatedAt: task.updatedAt,
-      applied: appliedOperations.length,
-      appliedOperations,
-      partial: done && task.status !== "completed" && appliedOperations.length > 0,
-      protection: {
-        model: "cooperative-yield",
-        hardStepTermination,
-        slicePolicy: "post-action-awaited",
-        softSliceMs: SOFT_SLICE_MS,
-        sliceScope: "task-local; sequential awaited calls only; native calls are not preempted",
-        note: "The task is frame-scheduled and guarded by a script-level step deadline on common loop shapes. pie-unity uses PuerTS 2.2.2 JsEnv + BackendType.V8 and does not rely on native V8 termination."
-      }
-    };
-  }
-  function notifyWaiters(task) {
-    if (task.waiters.length === 0) return;
-    const result = buildStatus(task);
-    const waiters = task.waiters.splice(0, task.waiters.length);
-    for (const waiter of waiters) {
+  // src/unity-script-task-context.ts
+  function createTaskContext(bridge2, task, args, scheduler, sliceNowMs2, assertTaskActive2) {
+    const unity = getUnityHostApi(bridge2, task);
+    const runtimeHost = getRegisteredHostApi(bridge2);
+    const runHostAction = (action) => {
+      assertTaskActive2(task);
+      let result;
       try {
-        waiter(result);
-      } catch {
+        result = action();
+      } finally {
+        assertTaskActive2(task);
       }
-    }
+      if (result && typeof result.then === "function") {
+        const pending = Promise.resolve(result).then((value) => {
+          assertTaskActive2(task);
+          return deliverResult(value);
+        });
+        void pending.catch(() => {
+        });
+        return pending;
+      }
+      return deliverResult(result);
+    };
+    const createStepGate = (waitFrames, waitUntilMs) => {
+      assertTaskActive2(task);
+      const pending = new Promise((resolve2, reject) => {
+        task.gates.push({
+          resolve: resolve2,
+          reject,
+          waitFrames: Math.max(0, Math.floor(waitFrames)),
+          waitUntilMs,
+          createdHostFrame: scheduler.frame?.()
+        });
+      });
+      void pending.catch(() => {
+      });
+      return pending;
+    };
+    const deliverResult = (value) => {
+      if (!unityWorkScheduler.shouldYield(task.id, task.sliceStartMs, {
+        now: () => sliceNowMs2()
+      })) return Promise.resolve(value);
+      const pending = createStepGate(1, 0).then(() => {
+        assertTaskActive2(task);
+        return value;
+      });
+      void pending.catch(() => {
+      });
+      return pending;
+    };
+    const awaitExternal = (promise) => {
+      const pending = Promise.resolve(promise).then((value) => {
+        if (task.status === "running") {
+          task.stepStartMs = scheduler.now();
+          task.sliceStartMs = sliceNowMs2();
+        }
+        assertTaskActive2(task);
+        return deliverResult(value);
+      }, (error) => {
+        if (task.status === "running") {
+          task.stepStartMs = scheduler.now();
+          task.sliceStartMs = sliceNowMs2();
+        }
+        throw error;
+      });
+      void pending.catch(() => {
+      });
+      return pending;
+    };
+    const hostSelector = ((namespace) => {
+      assertTaskActive2(task);
+      if (!namespace) return hostSelector;
+      const scoped = runtimeHost.namespace(namespace);
+      return {
+        list: () => {
+          assertTaskActive2(task);
+          return scoped.list();
+        },
+        call: (name, hostArgs = {}) => runHostAction(() => scoped.call(name, hostArgs))
+      };
+    });
+    hostSelector.call = (fullName, hostArgs = {}) => runHostAction(() => runtimeHost.call(fullName, hostArgs));
+    hostSelector.hasCapability = (name) => {
+      assertTaskActive2(task);
+      return runtimeHost.hasCapability(name);
+    };
+    hostSelector.list = (namespace) => {
+      assertTaskActive2(task);
+      return runtimeHost.list(namespace);
+    };
+    return {
+      args,
+      log(...parts) {
+        assertTaskActive2(task);
+        const text = parts.map((part) => String(part)).join(" ");
+        task.logs.push(text);
+        if (task.logs.length > MAX_LOG_LINES) task.logs.splice(0, task.logs.length - MAX_LOG_LINES);
+        bridge2.log?.("info", `[unity.script.run:${task.id}] ${text}`);
+        return text;
+      },
+      nextFrame() {
+        return createStepGate(1, 0);
+      },
+      waitFrames(frames) {
+        return createStepGate(Math.max(1, Math.floor(Number(frames) || 1)), 0);
+      },
+      waitSeconds(seconds) {
+        return createStepGate(0, scheduler.now() + Math.max(0, Number(seconds) || 0) * 1e3);
+      },
+      query(input = {}) {
+        return runHostAction(() => unity.query(input));
+      },
+      inspect(input = {}) {
+        return runHostAction(() => unity.inspect(input));
+      },
+      edit(input = {}) {
+        return runHostAction(() => {
+          const result = unity.edit(input);
+          if (input.action === "create_scene_object") task.createdRefs.push(...extractRefs(result));
+          task.mutations.push({
+            action: "unity_scene_object_edit",
+            target: isRecord10(result) && result.target !== void 0 ? result.target : null,
+            summary: typeof input.action === "string" ? input.action : "edit"
+          });
+          return result;
+        });
+      },
+      refresh() {
+        return runHostAction(() => unity.refresh());
+      },
+      async rollback() {
+        const rollbackRefs = [...task.createdRefs].reverse();
+        const rollbackState = { rolledBack: 0, failures: [] };
+        let rollbackCursor = 0;
+        const destroyNext = () => runHostAction(() => {
+          assertTaskActive2(task);
+          if (rollbackCursor >= rollbackRefs.length) return;
+          const ref2 = rollbackRefs[rollbackCursor];
+          rollbackCursor += 1;
+          try {
+            unity.edit({ action: "destroy_scene_object", target: ref2 });
+            rollbackState.rolledBack += 1;
+            const index = task.createdRefs.lastIndexOf(ref2);
+            if (index >= 0) task.createdRefs.splice(index, 1);
+            task.mutations.push({ action: "rollback", target: toSerializable(ref2), summary: "destroyed 1 created object(s)" });
+          } catch (error) {
+            if (task.status !== "running") throw error;
+            rollbackState.failures.push({ target: toSerializable(ref2), error: error instanceof Error ? error.message : String(error) });
+          }
+          assertTaskActive2(task);
+        });
+        while (rollbackCursor < rollbackRefs.length && task.status === "running") await destroyNext();
+        return { rolledBack: rollbackState.rolledBack, failures: rollbackState.failures };
+      },
+      host: hostSelector,
+      gameUse: createGameUseScriptApi({
+        call: (path3, callArgs = []) => runHostAction(() => getRuntimeApi().call(path3, callArgs)),
+        waitFrames: (frames) => createStepGate(Math.max(1, Math.floor(Number(frames) || 1)), 0),
+        waitSeconds: (seconds) => createStepGate(0, scheduler.now() + Math.max(0, Number(seconds) || 0) * 1e3),
+        nowSeconds: () => Math.max(0, (scheduler.now() - task.startMs) / 1e3),
+        get frame() {
+          return task.frames;
+        }
+      }, {
+        awaitExternal,
+        cancelled: () => task.status !== "running",
+        checkpoint: (value) => {
+          if (task.status === "running") task.partialResult = toSerializable(value);
+        },
+        releaseInput: () => {
+          for (const [path3, args2] of [["CS.Pie.GameUse.PieInputHands.ReleaseAll", []], ["CS.Pie.GameUse.PieInputHands.SetEpisodeActive", [0]]]) {
+            try {
+              const pending = getRuntimeApi().call(path3, [...args2]);
+              if (isThenable(pending)) void Promise.resolve(pending).catch(() => void 0);
+            } catch {
+            }
+          }
+        },
+        onTermination: (listener) => {
+          if (task.status !== "running") {
+            listener();
+            return () => {
+            };
+          }
+          task.terminationListeners.add(listener);
+          return () => {
+            task.terminationListeners.delete(listener);
+          };
+        }
+      }),
+      runtime: {
+        has: (path3) => {
+          assertTaskActive2(task);
+          return getRuntimeApi().has(path3);
+        },
+        get: (path3) => {
+          assertTaskActive2(task);
+          return getRuntimeApi().get(path3);
+        },
+        members: (path3 = "") => {
+          assertTaskActive2(task);
+          return getRuntimeApi().members(path3);
+        },
+        call: (path3, runtimeArgs = []) => runHostAction(() => getRuntimeApi().call(path3, runtimeArgs))
+      },
+      get frame() {
+        return task.frames;
+      },
+      get elapsedMs() {
+        return scheduler.now() - task.startMs;
+      }
+    };
   }
-  function rejectPendingGates(task, code, message) {
-    const gates = task.gates.splice(0);
-    for (const gate of gates) gate.reject(createScriptHostError(code, message));
-  }
-  function completeTask(task, result) {
-    if (task.status !== "running") return;
-    const deadline = getTaskDeadlineError(task);
-    if (deadline) {
-      failTask(task, deadline.code, deadline.message);
-      return;
-    }
-    task.status = "completed";
-    task.result = result;
-    task.updatedAt = nowIso3();
-    rejectPendingGates(task, "TASK_COMPLETED", "Unity script run completed before this gate was awaited.");
-    notifyWaiters(task);
-  }
-  function failTask(task, code, message) {
-    if (task.status !== "running") return;
-    task.status = "failed";
-    task.errorCode = code;
-    task.errorMessage = message;
-    task.updatedAt = nowIso3();
-    rejectPendingGates(task, code, message);
-    notifyWaiters(task);
-  }
-  function cancelTask(task, reason) {
-    if (task.status !== "running") return;
-    task.status = "cancelled";
-    task.errorCode = "CANCELLED";
-    task.errorMessage = reason || "Unity script run cancelled.";
-    task.updatedAt = nowIso3();
-    rejectPendingGates(task, "CANCELLED", task.errorMessage);
-    notifyWaiters(task);
-  }
-  function getTaskDeadlineError(task) {
-    const now = nowMs2();
-    if (now - task.startMs > task.totalTimeoutMs) {
-      return createScriptHostError("TOTAL_TIMEOUT", `Unity script run exceeded ${task.totalTimeoutMs}ms.`);
-    }
-    if (now - task.stepStartMs > task.perStepTimeoutMs) {
-      return createScriptHostError(STEP_TIMEOUT_ERROR_CODE, `Unity script step exceeded ${task.perStepTimeoutMs}ms.`);
-    }
-    return null;
-  }
-  function assertTaskActive(task) {
-    if (task.status !== "running") {
-      throw createScriptHostError(task.errorCode || "TASK_NOT_RUNNING", task.errorMessage || `Unity script run is ${task.status}.`);
-    }
-    const deadline = getTaskDeadlineError(task);
-    if (deadline) {
-      failTask(task, deadline.code, deadline.message);
-      throw deadline;
-    }
-  }
+  var MAX_LOG_LINES = 200;
   function getUnityHostApi(bridge2, task) {
     const call = (method, args = {}) => {
       if (!bridge2.devRpc?.call) {
@@ -48499,172 +48644,212 @@ ${policy ? `const __piePolicy = ${policy};
       }
     };
   }
-  function createTaskContext(bridge2, task, args) {
-    const unity = getUnityHostApi(bridge2, task);
-    const runtimeHost = getRegisteredHostApi(bridge2);
-    const runHostAction = (action) => {
-      assertTaskActive(task);
-      let result;
-      try {
-        result = action();
-      } finally {
-        assertTaskActive(task);
-      }
-      if (result && typeof result.then === "function") {
-        const pending = Promise.resolve(result).then((value) => {
-          assertTaskActive(task);
-          return deliverResult(value);
-        });
-        void pending.catch(() => {
-        });
-        return pending;
-      }
-      return deliverResult(result);
-    };
-    const createStepGate = (waitFrames, waitUntilMs) => {
-      assertTaskActive(task);
-      const pending = new Promise((resolve2, reject) => {
-        task.gates.push({
-          resolve: resolve2,
-          reject,
-          waitFrames: Math.max(0, Math.floor(waitFrames)),
-          waitUntilMs,
-          createdHostFrame: scriptScheduler.frame?.()
-        });
-      });
-      void pending.catch(() => {
-      });
-      return pending;
-    };
-    const deliverResult = (value) => {
-      if (!unityWorkScheduler.shouldYield(task.id, task.sliceStartMs, {
-        now: () => sliceNowMs()
-      })) return Promise.resolve(value);
-      const pending = createStepGate(1, 0).then(() => {
-        assertTaskActive(task);
-        return value;
-      });
-      void pending.catch(() => {
-      });
-      return pending;
-    };
-    const hostSelector = ((namespace) => {
-      assertTaskActive(task);
-      if (!namespace) return hostSelector;
-      const scoped = runtimeHost.namespace(namespace);
-      return {
-        list: () => {
-          assertTaskActive(task);
-          return scoped.list();
-        },
-        call: (name, hostArgs = {}) => runHostAction(() => scoped.call(name, hostArgs))
-      };
-    });
-    hostSelector.call = (fullName, hostArgs = {}) => runHostAction(() => runtimeHost.call(fullName, hostArgs));
-    hostSelector.hasCapability = (name) => {
-      assertTaskActive(task);
-      return runtimeHost.hasCapability(name);
-    };
-    hostSelector.list = (namespace) => {
-      assertTaskActive(task);
-      return runtimeHost.list(namespace);
-    };
+  function isThenable(value) {
+    return !!value && (typeof value === "object" || typeof value === "function") && typeof value.then === "function";
+  }
+  function isRecord10(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  }
+  function extractRefs(value) {
+    if (!isRecord10(value)) return [];
+    if (Array.isArray(value.results)) return value.results;
+    if (Array.isArray(value.createdRefs)) return value.createdRefs;
+    if (value.target) return [value.target];
+    return [];
+  }
+  function toSerializable(value) {
+    return safeSerializeScriptValue(value);
+  }
+
+  // src/unity-script-host.ts
+  var SOFT_SLICE_MS = 4;
+  var DEFAULT_TOTAL_TIMEOUT_MS = 3e4;
+  var DEFAULT_PER_STEP_TIMEOUT_MS = 100;
+  var DEFAULT_MAX_FRAMES = 1800;
+  var MAX_LOG_LINES2 = 200;
+  var STEP_TIMEOUT_ERROR_CODE = "STEP_TIMEOUT";
+  var defaultSliceClock = createSliceClock();
+  function sliceNowMs() {
+    return scriptScheduler.sliceNow?.() ?? defaultSliceClock();
+  }
+  var installedBridge = null;
+  var scriptScheduler = {
+    now: () => Date.now(),
+    frame: currentUnityFrame,
+    random: () => Math.random()
+  };
+  function getRunStore() {
+    const key = "__pieUnityScriptRuns";
+    const unityGlobal = globalThis;
+    const existing = unityGlobal[key];
+    if (!existing || typeof existing.get !== "function" || typeof existing.set !== "function") {
+      const created = /* @__PURE__ */ new Map();
+      unityGlobal[key] = created;
+      return created;
+    }
+    return existing;
+  }
+  function nowMs2() {
+    return scriptScheduler.now();
+  }
+  function nowIso3() {
+    return scriptScheduler.isoNow?.() ?? new Date(nowMs2()).toISOString();
+  }
+  function createRunId() {
+    return `unity_script_run_${nowMs2().toString(36)}_${(scriptScheduler.random?.() ?? Math.random()).toString(36).slice(2, 8)}`;
+  }
+  function toPositiveNumber(value, fallback) {
+    const numeric2 = Number(value);
+    return Number.isFinite(numeric2) && numeric2 > 0 ? numeric2 : fallback;
+  }
+  function summarizeValue(value) {
+    if (value === null) return "null";
+    if (value === void 0) return "undefined";
+    if (Array.isArray(value)) return `Array(${value.length})`;
+    if (typeof value === "object") {
+      const keys = Object.keys(value);
+      return `Object(${keys.slice(0, 6).join(", ")})`;
+    }
+    return String(value);
+  }
+  function toSerializable2(value) {
+    return safeSerializeScriptValue(value);
+  }
+  function isRecord11(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  }
+  function createScriptHostError(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+  function isStepTimeoutError(error) {
+    return isRecord11(error) && (error.code === STEP_TIMEOUT_ERROR_CODE || error.name === "PieStepTimeoutError");
+  }
+  function buildStatus(task) {
+    const done = task.status === "completed" || task.status === "failed" || task.status === "cancelled";
+    const hardStepTermination = false;
+    const appliedOperations = task.mutations.map((mutation) => ({
+      action: mutation.action,
+      target: toSerializable2(mutation.target),
+      summary: mutation.summary
+    }));
     return {
-      args,
-      log(...parts) {
-        assertTaskActive(task);
-        const text = parts.map((part) => String(part)).join(" ");
-        task.logs.push(text);
-        if (task.logs.length > MAX_LOG_LINES) task.logs.splice(0, task.logs.length - MAX_LOG_LINES);
-        bridge2.log?.("info", `[unity.script.run:${task.id}] ${text}`);
-        return text;
-      },
-      nextFrame() {
-        return createStepGate(1, 0);
-      },
-      waitFrames(frames) {
-        return createStepGate(Math.max(1, Math.floor(Number(frames) || 1)), 0);
-      },
-      waitSeconds(seconds) {
-        return createStepGate(0, nowMs2() + Math.max(0, Number(seconds) || 0) * 1e3);
-      },
-      query(input = {}) {
-        return runHostAction(() => unity.query(input));
-      },
-      inspect(input = {}) {
-        return runHostAction(() => unity.inspect(input));
-      },
-      edit(input = {}) {
-        return runHostAction(() => {
-          const result = unity.edit(input);
-          if (input.action === "create_scene_object") task.createdRefs.push(...extractRefs(result));
-          task.mutations.push({
-            action: "unity_scene_object_edit",
-            target: isRecord10(result) && result.target !== void 0 ? result.target : null,
-            summary: typeof input.action === "string" ? input.action : "edit"
-          });
-          return result;
-        });
-      },
-      refresh() {
-        return runHostAction(() => unity.refresh());
-      },
-      async rollback() {
-        const rollbackRefs = [...task.createdRefs].reverse();
-        const rollbackState = { rolledBack: 0, failures: [] };
-        let rollbackCursor = 0;
-        const destroyNext = () => runHostAction(() => {
-          assertTaskActive(task);
-          if (rollbackCursor >= rollbackRefs.length) return;
-          const ref2 = rollbackRefs[rollbackCursor];
-          rollbackCursor += 1;
-          try {
-            unity.edit({ action: "destroy_scene_object", target: ref2 });
-            rollbackState.rolledBack += 1;
-            const index = task.createdRefs.lastIndexOf(ref2);
-            if (index >= 0) task.createdRefs.splice(index, 1);
-            task.mutations.push({ action: "rollback", target: toSerializable(ref2), summary: "destroyed 1 created object(s)" });
-          } catch (error) {
-            if (task.status !== "running") throw error;
-            rollbackState.failures.push({ target: toSerializable(ref2), error: error instanceof Error ? error.message : String(error) });
-          }
-          assertTaskActive(task);
-        });
-        while (rollbackCursor < rollbackRefs.length && task.status === "running") await destroyNext();
-        return { rolledBack: rollbackState.rolledBack, failures: rollbackState.failures };
-      },
-      host: hostSelector,
-      gameUse: createGameUseScriptApi({
-        call: (path3, callArgs = []) => runHostAction(() => getRuntimeApi().call(path3, callArgs)),
-        waitFrames: (frames) => createStepGate(Math.max(1, Math.floor(Number(frames) || 1)), 0),
-        get frame() {
-          return task.frames;
-        }
-      }),
-      runtime: {
-        has: (path3) => {
-          assertTaskActive(task);
-          return getRuntimeApi().has(path3);
-        },
-        get: (path3) => {
-          assertTaskActive(task);
-          return getRuntimeApi().get(path3);
-        },
-        members: (path3 = "") => {
-          assertTaskActive(task);
-          return getRuntimeApi().members(path3);
-        },
-        call: (path3, runtimeArgs = []) => runHostAction(() => getRuntimeApi().call(path3, runtimeArgs))
-      },
-      get frame() {
-        return task.frames;
-      },
-      get elapsedMs() {
-        return nowMs2() - task.startMs;
+      taskId: task.id,
+      name: task.name,
+      mode: task.mode,
+      status: task.status,
+      done,
+      ok: task.status === "completed",
+      summary: task.status === "completed" ? summarizeValue(task.result) : task.errorMessage || task.status,
+      result: task.status === "completed" ? toSerializable2(task.result) : null,
+      errorCode: task.errorCode,
+      errorMessage: task.errorMessage,
+      logs: task.logs.slice(-MAX_LOG_LINES2),
+      refs: toSerializable2(task.createdRefs || []),
+      frames: task.frames,
+      durationMs: Math.max(0, nowMs2() - task.startMs),
+      totalTimeoutMs: task.totalTimeoutMs,
+      perStepTimeoutMs: task.perStepTimeoutMs,
+      maxFrames: task.maxFrames,
+      updatedAt: task.updatedAt,
+      applied: appliedOperations.length,
+      appliedOperations,
+      partial: done && task.status !== "completed" && (appliedOperations.length > 0 || task.partialResult !== null),
+      partialResult: done && task.status !== "completed" ? task.partialResult : null,
+      protection: {
+        model: "cooperative-yield",
+        hardStepTermination,
+        slicePolicy: "post-action-awaited",
+        softSliceMs: SOFT_SLICE_MS,
+        sliceScope: "task-local; sequential awaited calls only; native calls are not preempted",
+        note: "The task is frame-scheduled and guarded by a script-level step deadline on common loop shapes. pie-unity uses PuerTS 2.2.2 JsEnv + BackendType.V8 and does not rely on native V8 termination."
       }
     };
   }
-  function isThenable(value) {
+  function notifyWaiters(task) {
+    if (task.waiters.length === 0) return;
+    const result = buildStatus(task);
+    const waiters = task.waiters.splice(0, task.waiters.length);
+    for (const waiter of waiters) {
+      try {
+        waiter(result);
+      } catch {
+      }
+    }
+  }
+  function rejectPendingGates(task, code, message) {
+    const gates = task.gates.splice(0);
+    for (const gate of gates) gate.reject(createScriptHostError(code, message));
+  }
+  function notifyTermination(task) {
+    const listeners = [...task.terminationListeners];
+    task.terminationListeners.clear();
+    for (const listener of listeners) {
+      try {
+        listener();
+      } catch {
+      }
+    }
+  }
+  function completeTask(task, result) {
+    if (task.status !== "running") return;
+    const deadline = getTaskDeadlineError(task);
+    if (deadline) {
+      failTask(task, deadline.code, deadline.message);
+      return;
+    }
+    task.status = "completed";
+    task.result = result;
+    task.updatedAt = nowIso3();
+    notifyTermination(task);
+    rejectPendingGates(task, "TASK_COMPLETED", "Unity script run completed before this gate was awaited.");
+    notifyWaiters(task);
+  }
+  function failTask(task, code, message) {
+    if (task.status !== "running") return;
+    task.status = "failed";
+    task.errorCode = code;
+    task.errorMessage = message;
+    task.updatedAt = nowIso3();
+    notifyTermination(task);
+    rejectPendingGates(task, code, message);
+    notifyWaiters(task);
+  }
+  function cancelTask(task, reason) {
+    if (task.status !== "running") return;
+    task.status = "cancelled";
+    task.errorCode = "CANCELLED";
+    task.errorMessage = reason || "Unity script run cancelled.";
+    task.updatedAt = nowIso3();
+    notifyTermination(task);
+    rejectPendingGates(task, "CANCELLED", task.errorMessage);
+    notifyWaiters(task);
+  }
+  function getTaskDeadlineError(task) {
+    const now = nowMs2();
+    if (now - task.startMs > task.totalTimeoutMs) {
+      return createScriptHostError("TOTAL_TIMEOUT", `Unity script run exceeded ${task.totalTimeoutMs}ms.`);
+    }
+    if (now - task.stepStartMs > task.perStepTimeoutMs) {
+      return createScriptHostError(STEP_TIMEOUT_ERROR_CODE, `Unity script step exceeded ${task.perStepTimeoutMs}ms.`);
+    }
+    return null;
+  }
+  function assertTaskActive(task) {
+    if (task.status !== "running") {
+      throw createScriptHostError(task.errorCode || "TASK_NOT_RUNNING", task.errorMessage || `Unity script run is ${task.status}.`);
+    }
+    const deadline = getTaskDeadlineError(task);
+    if (deadline) {
+      failTask(task, deadline.code, deadline.message);
+      throw deadline;
+    }
+  }
+  function createTaskContextForRun(bridge2, task, args) {
+    return createTaskContext(bridge2, task, args, scriptScheduler, sliceNowMs, assertTaskActive);
+  }
+  function isThenable2(value) {
     return !!value && (typeof value === "object" || typeof value === "function") && typeof value.then === "function";
   }
   function isIteratorLike(value) {
@@ -48672,7 +48857,7 @@ ${policy ? `const __piePolicy = ${policy};
   }
   function classifyScriptError(error) {
     if (isStepTimeoutError(error)) return "STEP_TIMEOUT";
-    if (isRecord10(error) && typeof error.code === "string" && error.code) return String(error.code);
+    if (isRecord11(error) && typeof error.code === "string" && error.code) return String(error.code);
     return "SCRIPT_ERROR";
   }
   function describeScriptError(error) {
@@ -48689,7 +48874,7 @@ ${policy ? `const __piePolicy = ${policy};
         "Generator entries are no longer supported. Use `export async function run(ctx, args)` and `await ctx.nextFrame()`."
       );
     }
-    if (isThenable(returned)) {
+    if (isThenable2(returned)) {
       Promise.resolve(returned).then(
         (value) => completeTask(task, value),
         (error) => failTask(task, classifyScriptError(error), describeScriptError(error))
@@ -48756,7 +48941,9 @@ ${policy ? `const __piePolicy = ${policy};
       gates: [],
       stepStartMs: 0,
       sliceStartMs: 0,
-      waiters: []
+      waiters: [],
+      terminationListeners: /* @__PURE__ */ new Set(),
+      partialResult: null
     };
     getRunStore().set(task.id, task);
     try {
@@ -48764,8 +48951,8 @@ ${policy ? `const __piePolicy = ${policy};
       if (!script.trim()) {
         throw new Error("script is required");
       }
-      const args = isRecord10(payload.args) ? payload.args : {};
-      const ctx = createTaskContext(bridge2, task, args);
+      const args = isRecord11(payload.args) ? payload.args : {};
+      const ctx = createTaskContextForRun(bridge2, task, args);
       const entry = compileUnityScriptEntry(script, () => assertTaskActive(task), {});
       task.stepStartMs = nowMs2();
       task.sliceStartMs = sliceNowMs();
@@ -48835,7 +49022,7 @@ ${policy ? `const __piePolicy = ${policy};
     globalThis.__pieUnityScriptHost = {
       invoke(method, argsJson) {
         const parsedPayload = argsJson ? JSON.parse(String(argsJson)) : {};
-        const payload = isRecord10(parsedPayload) ? parsedPayload : {};
+        const payload = isRecord11(parsedPayload) ? parsedPayload : {};
         switch (String(method || "")) {
           case "run_start": {
             if (!installedBridge) throw new Error("Unity script host bridge is not installed.");
@@ -48852,27 +49039,7 @@ ${policy ? `const __piePolicy = ${policy};
           }
           case "game_use_start": {
             if (!installedBridge) throw new Error("Unity script host bridge is not installed.");
-            const harnessSource = String(payload.harnessSource ?? "");
-            const readPath = String(payload.readPath ?? "");
-            if (!harnessSource.trim()) throw new Error("harnessSource is required.");
-            if (!readPath.trim()) throw new Error("readPath is required.");
-            if (payload.jev && payload.policySource) throw new Error("pass either jev or policySource, not both.");
-            const task = createScriptRun(installedBridge, {
-              script: harnessDriverSource(harnessSource, {
-                policySource: payload.policySource === void 0 || payload.policySource === null ? void 0 : String(payload.policySource)
-              }),
-              name: "game_use_run",
-              args: {
-                readPath,
-                resetPath: payload.resetPath,
-                runInBackground: payload.runInBackground === true,
-                maxSeconds: payload.maxSeconds,
-                jev: payload.jev
-              },
-              totalTimeoutMs: typeof payload.totalTimeoutMs === "number" ? payload.totalTimeoutMs : 12e4,
-              perStepTimeoutMs: typeof payload.perStepTimeoutMs === "number" ? payload.perStepTimeoutMs : void 0,
-              maxFrames: typeof payload.maxFrames === "number" ? payload.maxFrames : 9e3
-            });
+            const task = createScriptRun(installedBridge, buildGameUseTaskRequest(payload));
             return JSON.stringify(buildStatus(task));
           }
           default:
@@ -48899,10 +49066,23 @@ ${policy ? `const __piePolicy = ${policy};
     const { full, ...rpcArgs } = record2;
     return { rpcArgs, full: full === true };
   }
+  function dtoProperties(value) {
+    if (value && typeof value === "object") {
+      const properties = value.properties;
+      if (properties && typeof properties === "object") return properties;
+    }
+    return value;
+  }
   function episodeReportText(result) {
     if (!result || typeof result !== "object") return "";
     const status = result;
-    if (status.status !== "completed") return "";
+    if (status.status !== "completed") {
+      const partial = dtoProperties(status.partialResult);
+      if (!partial || !partial.decisions?.length && !partial.actions?.length) return "";
+      const decisions = (partial.decisions ?? []).map((entry) => dtoProperties(entry));
+      const actions = (partial.actions ?? []).map((entry) => dtoProperties(entry));
+      return formatGameUsePartialReport({ errorCode: status.errorCode, errorMessage: status.errorMessage, decisions, actions });
+    }
     const payload = status.result;
     if (!payload || typeof payload !== "object") return "";
     const props = payload.properties;
@@ -48910,7 +49090,8 @@ ${policy ? `const __piePolicy = ${policy};
     const episode = unwrapEpisode(source.episode);
     if (!episode) return "";
     try {
-      return formatGameUseReport({ episode, trail: Array.isArray(source.trail) ? source.trail : void 0 });
+      const decisions = Array.isArray(source.decisions) ? source.decisions.map((entry) => dtoProperties(entry)) : void 0;
+      return formatGameUseReport({ episode, trail: Array.isArray(source.trail) ? source.trail : void 0, decisions });
     } catch {
       return "";
     }
@@ -48933,7 +49114,8 @@ ${policy ? `const __piePolicy = ${policy};
         readPath: Type.String({ description: 'Static C# runtime path the facts pipeline reads each tick (the same string you would pass to ctx.runtime.call). Its return value is JSON and lands in observe() as the "snapshot" key.' }),
         resetPath: Type.Optional(Type.String({ description: "Optional static C# path called once before the episode starts (e.g. the game's reset method) so verification never rides on a pre-existing state." })),
         runInBackground: Type.Optional(Type.Boolean({ description: "Keep the player running when unfocused (Application.runInBackground). Recommended true for unattended runs \u2014 an unfocused editor pauses Play Mode otherwise." })),
-        policySource: Type.Optional(Type.String({ description: 'A scripted policy as an expression evaluating to a (request) => optionName function, e.g. "(request) => Object.keys(request.options)[0]". Omit for the built-in greedy (scores collects_spark/toward_closest_spark/steps_to_goal facts).' })),
+        policySource: Type.Optional(Type.String({ description: "A scripted policy as an expression evaluating to a (request) => optionName function. If omitted, the generic first-listed option is used." })),
+        fallbackPolicySource: Type.Optional(Type.String({ description: "Optional generic scripted fallback for Jev failures, as a (request) => optionName expression. Defaults to first-listed." })),
         jev: Type.Optional(Type.Object({ key: Type.String(), baseUrl: Type.Optional(Type.String()) }, { description: "Live model decisions through the in-process HTTP bridge. Mutually exclusive with policySource." })),
         maxSeconds: Type.Optional(Type.Number({ description: "Hard episode cap in game seconds (default 60)." })),
         maxFrames: Type.Optional(Type.Number({ description: "Script-task frame budget (default 9000)." })),
@@ -48948,27 +49130,9 @@ ${policy ? `const __piePolicy = ${policy};
           const split = splitToolParams(params);
           rpcArgs = split.rpcArgs;
           full = split.full;
-          const harnessSource = String(rpcArgs.harnessSource ?? "");
-          if (!harnessSource.trim()) throw new Error("harnessSource is required.");
-          const readPath = String(rpcArgs.readPath ?? "");
-          if (!readPath.trim()) throw new Error("readPath is required.");
-          if (rpcArgs.jev && rpcArgs.policySource) throw new Error("pass either jev or policySource, not both.");
-          const policySource = rpcArgs.policySource === void 0 || rpcArgs.policySource === null ? void 0 : String(rpcArgs.policySource);
-          const script = harnessDriverSource(harnessSource, { policySource });
-          const { taskId, promise } = startUnityScriptTask(requireBridge(), {
-            script,
-            name: "game_use_run",
-            args: {
-              readPath,
-              resetPath: rpcArgs.resetPath,
-              maxSeconds: rpcArgs.maxSeconds,
-              jev: rpcArgs.jev,
-              policySource: rpcArgs.policySource
-            },
-            totalTimeoutMs: typeof rpcArgs.totalTimeoutMs === "number" ? rpcArgs.totalTimeoutMs : 12e4,
-            perStepTimeoutMs: rpcArgs.perStepTimeoutMs,
-            maxFrames: typeof rpcArgs.maxFrames === "number" ? rpcArgs.maxFrames : 9e3
-          }, {
+          if (signal?.aborted) throw new Error("Tool call aborted.");
+          const request = buildGameUseTaskRequest(rpcArgs);
+          const { taskId, promise } = startUnityScriptTask(requireBridge(), request, {
             onProgress: onUpdate ? (status) => onUpdate({
               content: [{ type: "text", text: `game_use_run ${status.status} (frames=${status.frames})` }],
               details: { status: status.status, frames: status.frames, logs: status.logs.slice(-5) }
@@ -51637,11 +51801,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   function assistantEventField(event, field) {
     return event && typeof event === "object" && field in event ? String(event[field] ?? "") : "";
   }
-  function isRecord11(value) {
+  function isRecord12(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function routeMetaFromToolResult(toolName, result) {
-    const details = isRecord11(result) && isRecord11(result.details) ? result.details : void 0;
+    const details = isRecord12(result) && isRecord12(result.details) ? result.details : void 0;
     if (!details) return null;
     if (toolName === "web_search") {
       return {
@@ -51656,7 +51820,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         attempts: Array.isArray(details.attempts) ? details.attempts.length : void 0
       };
     }
-    if (toolName === "read_file" && isRecord11(details.understanding)) {
+    if (toolName === "read_file" && isRecord12(details.understanding)) {
       const understanding = details.understanding;
       return {
         toolName,
@@ -51927,11 +52091,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   }
 
   // src/session-message-utils.ts
-  function isRecord12(value) {
+  function isRecord13(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function hasRealUsage(usage) {
-    if (!isRecord12(usage)) return false;
+    if (!isRecord13(usage)) return false;
     return Number(usage.input || 0) > 0 || Number(usage.output || 0) > 0 || Number(usage.cacheRead || 0) > 0 || Number(usage.cacheWrite || 0) > 0 || Number(usage.totalTokens || 0) > 0;
   }
   function estimateTokensFromText(text) {
@@ -51941,12 +52105,12 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   }
   function collectMessageText(message) {
     if (!message) return "";
-    if (!isRecord12(message)) return "";
+    if (!isRecord13(message)) return "";
     const content = message.content;
     if (typeof content === "string") return content;
     if (!Array.isArray(content)) return "";
     return content.map((block) => {
-      if (!isRecord12(block)) return "";
+      if (!isRecord13(block)) return "";
       if (block.type === "text") return typeof block.text === "string" ? block.text : "";
       if (block.type === "thinking") return typeof block.thinking === "string" ? block.thinking : "";
       if (block.type === "toolCall") {
@@ -51958,9 +52122,9 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }).join("");
   }
   function buildUsagePayload(messages, message, fallbackIndex) {
-    const messageRecord = isRecord12(message) ? message : {};
+    const messageRecord = isRecord13(message) ? message : {};
     const usage = messageRecord.usage;
-    if (hasRealUsage(usage) && isRecord12(usage)) {
+    if (hasRealUsage(usage) && isRecord13(usage)) {
       return {
         input: Number(usage.input || 0),
         output: Number(usage.output || 0),
@@ -51996,14 +52160,14 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   function extractToolText(result) {
     if (!result) return "";
     if (typeof result === "string") return result;
-    if (isRecord12(result) && Array.isArray(result.content)) {
-      return result.content.filter((item) => isRecord12(item) && item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
+    if (isRecord13(result) && Array.isArray(result.content)) {
+      return result.content.filter((item) => isRecord13(item) && item.type === "text").map((item) => String(item.text ?? "")).join("\n").trim();
     }
     return "";
   }
   function extractEffectiveArgs(toolName, args, details) {
-    const argRecord = isRecord12(args) ? args : {};
-    const detailRecord = isRecord12(details) ? details : {};
+    const argRecord = isRecord13(args) ? args : {};
+    const detailRecord = isRecord13(details) ? details : {};
     if (toolName === "find_files") {
       return {
         rawPattern: detailRecord.rawPattern ?? argRecord.pattern ?? argRecord.query ?? argRecord.name ?? argRecord.file_name ?? "",
@@ -52028,10 +52192,10 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   function buildSessionSyncMessagesCached(stateMessages) {
     const argsByCallId = /* @__PURE__ */ new Map();
     for (const message of stateMessages) {
-      const messageRecord = isRecord12(message) ? message : {};
+      const messageRecord = isRecord13(message) ? message : {};
       if (messageRecord.role === "assistant" && Array.isArray(messageRecord.content)) {
         for (const block of messageRecord.content) {
-          if (isRecord12(block) && block.type === "toolCall" && typeof block.id === "string")
+          if (isRecord13(block) && block.type === "toolCall" && typeof block.id === "string")
             argsByCallId.set(block.id, block.arguments);
         }
       }
@@ -52039,7 +52203,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     const output = new Array(stateMessages.length);
     for (let index = 0; index < stateMessages.length; index += 1) {
       const message = stateMessages[index];
-      const cacheKey = isRecord12(message) ? message : void 0;
+      const cacheKey = isRecord13(message) ? message : void 0;
       const cached = cacheKey !== void 0 ? sessionSyncMessageCache.get(cacheKey) : void 0;
       if (cached !== void 0) {
         output[index] = cached;
@@ -52074,10 +52238,10 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     return !(usage && usage.estimated === true);
   }
   function buildSessionSyncMessageRecord(message, index, argsByCallId, stateMessages) {
-    const messageRecord = isRecord12(message) ? message : {};
+    const messageRecord = isRecord13(message) ? message : {};
     const isToolResult = messageRecord.role === "toolResult";
     const args = argsByCallId.get(String(messageRecord.toolCallId || ""));
-    const serializedContent = typeof messageRecord.content === "string" ? [{ type: "text", text: messageRecord.content }] : Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord12(block)).map((block) => block.type === "toolCall" ? {
+    const serializedContent = typeof messageRecord.content === "string" ? [{ type: "text", text: messageRecord.content }] : Array.isArray(messageRecord.content) ? messageRecord.content.filter((block) => isRecord13(block)).map((block) => block.type === "toolCall" ? {
       type: "toolCall",
       text: typeof block.text === "string" ? block.text : "",
       // Editor history uses these to render calls that never
@@ -52110,14 +52274,14 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     const needle = String(clientTurnId || "").trim();
     if (!needle) return null;
     const turnStart = messages.findIndex((message) => {
-      const record2 = isRecord12(message) ? message : {};
+      const record2 = isRecord13(message) ? message : {};
       return record2.role === "user" && record2.clientTurnId === needle;
     });
     if (turnStart === -1) return null;
     if (keep === "before") return messages.slice(0, turnStart);
     let turnEnd = messages.length;
     for (let index = turnStart + 1; index < messages.length; index += 1) {
-      const record2 = isRecord12(messages[index]) ? messages[index] : {};
+      const record2 = isRecord13(messages[index]) ? messages[index] : {};
       if (record2.role === "user") {
         turnEnd = index;
         break;
@@ -52134,7 +52298,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   var MAX_TURNS = 50;
   var MAX_TRACKED_TOOL_ORIGINS = 256;
   var UNCLOSED_TOOL_NOTE = "Tool did not report a result before the turn ended.";
-  function isRecord13(value) {
+  function isRecord14(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   function truncate3(value, limit) {
@@ -52161,7 +52325,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     const content = message?.content;
     if (typeof content === "string") return content;
     if (!Array.isArray(content)) return "";
-    return content.filter((block) => isRecord13(block) && block.type === "text").map((block) => typeof block.text === "string" ? block.text : "").join("");
+    return content.filter((block) => isRecord14(block) && block.type === "text").map((block) => typeof block.text === "string" ? block.text : "").join("");
   }
   function displayText(message) {
     const display = message?.displayContent;
@@ -52264,7 +52428,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
         }
         const content = Array.isArray(metadata.content) ? metadata.content : [];
         for (const block of content) {
-          if (!isRecord13(block) || block.type !== "toolCall") continue;
+          if (!isRecord14(block) || block.type !== "toolCall") continue;
           const callId = String(block.id || "");
           const toolName = String(block.name || "tool");
           const existing = callId ? toolsByCallId.get(callId) : void 0;
@@ -52754,11 +52918,11 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   };
 
   // src/unity-public-api.ts
-  function isRecord14(value) {
+  function isRecord15(value) {
     return typeof value === "object" && value !== null;
   }
   function stringField(value, key) {
-    return isRecord14(value) && typeof value[key] === "string" ? value[key] : void 0;
+    return isRecord15(value) && typeof value[key] === "string" ? value[key] : void 0;
   }
   var MAX_IMAGE_ATTACHMENTS = 4;
   var ALLOWED_IMAGE_MIME_TYPES = /* @__PURE__ */ new Set(["image/png", "image/jpeg"]);
@@ -52778,7 +52942,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
       if (images.length >= MAX_IMAGE_ATTACHMENTS) {
         return { images, error: `too many image attachments (max ${MAX_IMAGE_ATTACHMENTS})` };
       }
-      if (!isRecord14(image) || typeof image.data !== "string" || typeof image.mimeType !== "string") {
+      if (!isRecord15(image) || typeof image.data !== "string" || typeof image.mimeType !== "string") {
         return { images, error: `images[${index}] must be { data: string, mimeType: string }` };
       }
       if (!ALLOWED_IMAGE_MIME_TYPES.has(image.mimeType)) {
@@ -52843,7 +53007,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
           code = check();
           if (code) return ack(false, code);
           if (!loaded) return ack(false, "SESSION_NOT_FOUND");
-          host.restoreSessionRecord(isRecord14(data2) && data2.recoverInterrupted === true ? host.trimInterruptedTail(loaded, stringField(data2, "lastUserText") || "") : loaded);
+          host.restoreSessionRecord(isRecord15(data2) && data2.recoverInterrupted === true ? host.trimInterruptedTail(loaded, stringField(data2, "lastUserText") || "") : loaded);
           captureTarget();
         } else {
           await host.persistCurrentSession();
@@ -52946,10 +53110,10 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
               const provider = stringField(data2, "provider") || "";
               const model = stringField(data2, "model") || "";
               const baseUrl = stringField(data2, "baseUrl");
-              const verboseLogs = isRecord14(data2) && data2.verboseLogs === true;
+              const verboseLogs = isRecord15(data2) && data2.verboseLogs === true;
               const webSearchMode = stringField(data2, "webSearchMode");
               const thinkingLevel = stringField(data2, "thinkingLevel");
-              if (isRecord14(data2) && data2.verboseLogs !== void 0) host.setVerboseLogs(verboseLogs);
+              if (isRecord15(data2) && data2.verboseLogs !== void 0) host.setVerboseLogs(verboseLogs);
               host.setModelSelection(provider, model, apiKey, baseUrl);
               if (webSearchMode !== void 0) host.setRuntimeWebSearchMode(webSearchMode);
               if (thinkingLevel !== void 0) {
@@ -53031,7 +53195,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
                 break;
               }
               if (loaded) {
-                const recoverInterrupted = isRecord14(data2) && data2.recoverInterrupted === true;
+                const recoverInterrupted = isRecord15(data2) && data2.recoverInterrupted === true;
                 const lastUserText = stringField(data2, "lastUserText") || "";
                 host.restoreSessionRecord(recoverInterrupted ? host.trimInterruptedTail(loaded, lastUserText) : loaded);
               } else {
@@ -53409,7 +53573,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
   }
 
   // src/unity-local-commands.ts
-  function isRecord15(value) {
+  function isRecord16(value) {
     return !!value && typeof value === "object" && !Array.isArray(value);
   }
   async function tryExplainExternalSessionId(host, sessionId) {
@@ -53425,7 +53589,7 @@ return module.exports?.default ?? module.exports ?? exports.default ?? exports;`
     }
     try {
       const registry2 = JSON.parse(String(CS.System.IO.File.ReadAllText(registryPath) || "{}"));
-      const entries = Object.values(isRecord15(registry2) ? registry2 : {});
+      const entries = Object.values(isRecord16(registry2) ? registry2 : {});
       const matched = entries.find((entry) => String(entry.id || "") === trimmed);
       if (!matched) {
         return null;
