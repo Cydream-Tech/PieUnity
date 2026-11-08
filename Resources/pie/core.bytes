@@ -17845,9 +17845,20 @@ ${delta}`;
     }
     const path3 = firstError.path || "/";
     const hint = buildArgumentHint(tool.parameters, firstError.path || "", args);
+    const lengthHint = buildLengthHint(firstError, args, path3);
     throw new Error(
-      `Invalid arguments for tool "${tool.name}" at ${path3}: ${firstError.message}${hint ? `; ${hint}` : ""}`
+      `Invalid arguments for tool "${tool.name}" at ${path3}: ${firstError.message}${lengthHint ? ` ${lengthHint}` : ""}${hint ? `; ${hint}` : ""}`
     );
+  }
+  function buildLengthHint(error, args, path3) {
+    if (error.type !== ValueErrorType.StringMaxLength && error.type !== ValueErrorType.StringMinLength) return "";
+    const direction = error.type === ValueErrorType.StringMaxLength ? "trim to at most the limit" : "extend to at least the minimum";
+    let value = args;
+    for (const segment of path3.split("/").filter(Boolean)) {
+      value = value?.[segment];
+    }
+    if (typeof value !== "string") return "";
+    return `(got length ${value.length} \u2014 ${direction} and retry)`;
   }
   function buildArgumentHint(schema, errorPath, args) {
     const parentPath = errorPath.includes("/") ? errorPath.slice(0, errorPath.lastIndexOf("/")) : "";
@@ -18222,6 +18233,8 @@ ${delta}`;
       let isError = false;
       let executionArgs = toolCall.arguments;
       let started = false;
+      const startedAt = Date.now();
+      let completedAt = startedAt;
       const pushToolStart = () => {
         if (started) return;
         started = true;
@@ -18257,6 +18270,7 @@ ${delta}`;
             });
           });
           isError = isError || !!result.isError;
+          completedAt = Date.now();
         } catch (e) {
           pushToolStart();
           result = {
@@ -18264,6 +18278,7 @@ ${delta}`;
             details: {}
           };
           isError = true;
+          completedAt = Date.now();
           try {
             await hooks?.onError?.(e instanceof Error ? e : new Error(String(e)), {
               toolName: toolCall.name,
@@ -18294,7 +18309,9 @@ ${delta}`;
         content: result.content,
         details: result.details,
         isError,
-        timestamp: Date.now()
+        startedAt,
+        durationMs: completedAt - startedAt,
+        timestamp: completedAt
       };
       results.push(toolResultMessage);
       stream.push({ type: "message_start", message: toolResultMessage });
@@ -23048,17 +23065,17 @@ ${summary2}`;
     }
     options;
     dispatchTimer;
+    /** Epoch-ms deadline of the armed dispatch timer (replacement test). */
+    dispatchTimerDeadline;
     generation = 0;
     pendingDispatch;
     resolvePendingDispatch;
     /** Single-flight: at most one dispatchNext at a time; a wakeup during
-     *  execution (end hook racing the busy-poll) is remembered and served after
-     *  it settles instead of overlapping a second concurrent dispatch. */
+     *  execution is served after it settles. */
     executing = false;
     wakeupRequested = false;
-    /** Busy/policy re-arm backoff (100ms → 800ms cap): streaming can last
-     *  minutes and a policy hold indefinitely; a flat 100ms poll wakes the
-     *  process ~10×/s for nothing. Enqueue still re-arms via schedule(). */
+    /** Busy/policy re-arm backoff (100ms → 800ms cap) so a long stream does
+     *  not pin a 100ms poll; enqueue still re-arms via schedule(). */
     backoffDelayMs = 100;
     get hasPendingDispatch() {
       return this.dispatchTimer !== void 0 || this.pendingDispatch !== void 0;
@@ -23070,16 +23087,27 @@ ${summary2}`;
       this.backoffDelayMs = 100;
       this.armTimer(delayMs);
     }
-    /** Timer-arming core shared by schedule() and the busy re-arm. */
+    /** Timer-arming core. Replaces an armed timer only for a strictly
+     *  earlier deadline: fresh public work never sits out a busy backoff. */
     armTimer(delayMs) {
-      if (this.options.getDisposed() || this.options.getRuntimeGuardTriggered() || this.dispatchTimer !== void 0) {
+      if (this.options.getDisposed() || this.options.getRuntimeGuardTriggered()) {
         return;
       }
-      this.ensurePending();
-      const setTimer = this.options.retry?.setTimeout ?? defaultSetTimeout3;
-      const generation = this.generation;
-      this.dispatchTimer = setTimer(() => {
+      const deadline = Date.now() + Math.max(0, delayMs);
+      if (this.dispatchTimer !== void 0) {
+        if (this.dispatchTimerDeadline === void 0 || deadline >= this.dispatchTimerDeadline) {
+          return;
+        }
+        (this.options.retry?.clearTimeout ?? defaultClearTimeout3)(this.dispatchTimer);
         this.dispatchTimer = void 0;
+        this.dispatchTimerDeadline = void 0;
+      }
+      this.ensurePending();
+      const generation = this.generation;
+      this.dispatchTimerDeadline = deadline;
+      this.dispatchTimer = (this.options.retry?.setTimeout ?? defaultSetTimeout3)(() => {
+        this.dispatchTimer = void 0;
+        this.dispatchTimerDeadline = void 0;
         if (this.executing) {
           this.wakeupRequested = true;
           return;
@@ -23100,15 +23128,14 @@ ${summary2}`;
     cancel() {
       this.generation++;
       if (this.dispatchTimer !== void 0) {
-        const clearTimer = this.options.retry?.clearTimeout ?? defaultClearTimeout3;
-        clearTimer(this.dispatchTimer);
+        (this.options.retry?.clearTimeout ?? defaultClearTimeout3)(this.dispatchTimer);
         this.dispatchTimer = void 0;
       }
+      this.dispatchTimerDeadline = void 0;
       this.resolvePending();
     }
-    /** Busy/policy re-arm: exponential backoff, 100ms → 800ms cap. Bypasses
-     *  schedule() so the ladder is not reset. True (not-dispatched) when
-     *  streaming/policy obstruction was found. */
+    /** Busy/policy re-arm: exponential backoff, 100ms → 800ms cap; bypasses
+     *  schedule() so the ladder is not reset. */
     busyRearm() {
       if (!this.options.isStreaming() && !this.options.isBlockedByRuntimePolicy()) return false;
       const delay = this.backoffDelayMs;
@@ -23129,9 +23156,7 @@ ${summary2}`;
       if (generation !== this.generation) return false;
       if (this.options.getDisposed() || this.busyRearm()) return false;
       const queuedInput = this.options.queue.peek();
-      if (!queuedInput) {
-        return false;
-      }
+      if (!queuedInput) return false;
       const decision = await this.options.canDispatchQueuedTurn?.({
         agent: this.options.agent,
         sessionManager: this.options.sessionManager,
@@ -23155,9 +23180,7 @@ ${summary2}`;
       if (generation !== this.generation) return false;
       if (this.options.getDisposed() || this.busyRearm()) return false;
       const dispatched = this.options.queue.shift();
-      if (!dispatched) {
-        return false;
-      }
+      if (!dispatched) return false;
       this.options.emit({ type: "queued_turn_dispatched", queuedInput: cloneQueuedInput(dispatched) });
       if (!dispatched.deliveredToAgent) {
         const originalMessages = dispatched.messages;
@@ -23192,6 +23215,10 @@ ${summary2}`;
         await this.options.syncNewAgentMessages();
       }
       return true;
+    }
+    /** Test hook: drive one busy re-arm directly. */
+    busyRearmForTest() {
+      return this.busyRearm();
     }
     ensurePending() {
       if (this.pendingDispatch) return;
@@ -30763,6 +30790,7 @@ When a todo list exists, keep executing from the current in-progress item until 
     const maxFiles = Math.max(1, Math.floor(options.maxFiles ?? 100));
     const maxRangesPerFile = Math.max(0, Math.floor(options.maxRangesPerFile ?? 8));
     let generation = 0;
+    let lastClear;
     function touchFile(absolutePath, observed) {
       files.delete(absolutePath);
       files.set(absolutePath, observed);
@@ -30891,9 +30919,13 @@ When a todo list exists, keep executing from the current in-progress item until 
       getGeneration() {
         return generation;
       },
-      clear() {
+      clear(reason) {
         files.clear();
         generation++;
+        lastClear = reason ? { reason, timestamp: Date.now() } : void 0;
+      },
+      getLastClear() {
+        return lastClear;
       }
     };
   }
@@ -32810,9 +32842,11 @@ ${[...shown, ...suffix].join("\n")}`);
                 const summary2 = fileObservationState.describeObservation(absolutePath);
                 const knownByWrite = fileObservationState.getCompleteTextSnapshot(absolutePath) !== void 0;
                 if ((!summary2 || summary2.readCount === 0) && !knownByWrite) {
+                  const lastClear = fileObservationState.getLastClear?.();
+                  const resetNote = lastClear ? ` Note: the session's read ledger was reset by ${lastClear.reason} at ${new Date(lastClear.timestamp).toISOString()} \u2014 if you read this file before that reset, its content is no longer in your context and must be re-read.` : "";
                   if (signal) signal.removeEventListener("abort", onAbort);
                   resolve2(createEditErrorResult({
-                    message: `edit_file blocked: ${path3} has not been read in this session.`,
+                    message: `edit_file blocked: ${path3} has not been read in this session.${resetNote}`,
                     matchKind: "none",
                     errorReason: "old_text_not_found",
                     oldTextOccurrences: 0,
@@ -38880,6 +38914,820 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
         }
       }
     };
+  }
+
+  // ../../packages/shared-headless-capabilities/src/memory/redact.ts
+  var REDACTED = "[REDACTED]";
+  var SECRET_KEY_NAMES = "(?:api[_-]?key|apikey|npm[_-]?token|node[_-]?auth[_-]?token|gh[_-]?token|git[_-]?token|docker[_-]?token|vault[_-]?token|jwt[_-]?secret|session[_-]?secret|secret[_-]?key|client[_-]?key[_-]?data|client[_-]?certificate[_-]?data|secret|token|password|passwd|pwd|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|authorization|credential|client[_-]?secret|private[_-]?key|aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key)";
+  var KEY_ANCHOR = "(?:^|[^A-Za-z0-9])";
+  var PATTERNS = [
+    // PEM blocks, including truncated/encrypted ones: mask from BEGIN to the
+    // matching END or, when the block is cut off, to the end of input.
+    {
+      name: "pem",
+      regex: /-----BEGIN (?:RSA |EC |OPENSSH |PGP |DSA |ENCRYPTED )?PRIVATE KEY-----[\s\S]*?(?:-----END (?:RSA |EC |OPENSSH |PGP |DSA |ENCRYPTED )?PRIVATE KEY-----|$)/g
+    },
+    // Provider-native credential literals. Prefixes require a delimiter
+    // (hyphen/underscore) so plain identifiers like `skill_configuration_helper`
+    // never match.
+    { name: "anthropic", regex: /\bsk-ant-[A-Za-z0-9_-]{8,}\b/g },
+    { name: "openai", regex: /\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b/g },
+    { name: "github-pat", regex: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b/g },
+    { name: "npm-pat", regex: /\bnpm_[A-Za-z0-9]{20,}\b/g },
+    { name: "pypi", regex: /\bpypi-[A-Za-z0-9_-]{20,}\b|\bAgAAA[A-Za-z0-9_-]{20,}\b/g },
+    { name: "linear", regex: /\blin_api_[A-Za-z0-9_]{20,}\b/g },
+    { name: "figma", regex: /\bfigd_[A-Za-z0-9_-]{20,}\b/g },
+    { name: "generic-pat", regex: /\b[a-z]{2,8}_[A-Za-z0-9]{28,}\b/g },
+    { name: "gitlab", regex: /\bglpat-[A-Za-z0-9_-]{16,}\b/g },
+    { name: "slack", regex: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g },
+    { name: "google", regex: /\bya29\.[A-Za-z0-9_-]{16,}\b|\bAIza[0-9A-Za-z_-]{30,}\b/g },
+    { name: "aws-access-key", regex: /\b(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}\b/g },
+    // Authorization headers (any scheme, case-insensitive): mask the ENTIRE
+    // credential payload — everything after the scheme to the end of the
+    // header value INCLUDING folded continuation lines (leading space/tab),
+    // so Basic blobs and wrapped Digest parameter strings are fully consumed
+    // (review P1-R4-1 / P1-R5-2).
+    {
+      name: "authorization",
+      regex: /\b((?:proxy-)?authorization)(\s*[:=]\s*)(bearer|basic|digest|negotiate|ntlm|hawk|oauth|token|apikey)?\s*([^\n]*(?:\r?\n[ \t]+[^\n]*)*)/gi
+    },
+    // Bearer token usage outside headers (any case — "use BEARER xxx").
+    { name: "bearer", regex: /\b(bearer)(\s+)([A-Za-z0-9\-_.~+/=]{1,})/gi },
+    // URLs with embedded credentials: explicit credential context — mask any
+    // nonempty password with NO arbitrary length cap (a 200-char access token
+    // in a URL is still a credential; review P1-R4-2).
+    { name: "url-cred", regex: /\b([a-z][a-z0-9+.-]*:\/\/)([^\s:@/"']+):([^\s@/"']+)@/gi },
+    // JWTs (three base64url segments, dotted).
+    { name: "jwt", regex: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g }
+  ];
+  function mask(value) {
+    const tail = value.slice(-4);
+    return `${REDACTED}(\u2026${tail})`;
+  }
+  function redactQuotedAssignments(text, counts) {
+    const opener = new RegExp(
+      `(${KEY_ANCHOR}(?:"${SECRET_KEY_NAMES}"|'${SECRET_KEY_NAMES}'|${SECRET_KEY_NAMES}))(\\s*[:=]\\s*)(["'])`,
+      "gi"
+    );
+    let result = "";
+    let cursor = 0;
+    for (let match2 = opener.exec(text); match2; match2 = opener.exec(text)) {
+      const [full, keyForm, separator, quote] = match2;
+      const valueStart = match2.index + full.length;
+      if (valueStart <= cursor) continue;
+      let value = "";
+      let index = valueStart;
+      let closed = false;
+      while (index < text.length) {
+        const ch = text[index];
+        if (ch === "\\" && index + 1 < text.length) {
+          value += ch + text[index + 1];
+          index += 2;
+          continue;
+        }
+        if (ch === quote) {
+          closed = true;
+          index += 1;
+          break;
+        }
+        value += ch;
+        index += 1;
+      }
+      if (!value.trim()) {
+        if (!closed) {
+          counts["key-assign-quoted"] = (counts["key-assign-quoted"] ?? 0) + 1;
+          const consumed2 = text.length;
+          result += text.slice(cursor, match2.index) + `${keyForm}${separator}${quote}${REDACTED}`;
+          cursor = consumed2;
+        }
+        continue;
+      }
+      if (value.trim()) counts["key-assign-quoted"] = (counts["key-assign-quoted"] ?? 0) + 1;
+      const consumed = closed ? index : text.length;
+      result += text.slice(cursor, match2.index) + `${keyForm}${separator}${quote}${REDACTED}${closed ? quote : ""}`;
+      cursor = consumed;
+    }
+    result += text.slice(cursor);
+    return result;
+  }
+  var SCHEME_WORDS = "bearer|basic|digest|negotiate|ntlm|hawk|oauth|token|apikey";
+  function redactUnquotedAssignments(text, counts) {
+    const re = new RegExp(
+      `(${KEY_ANCHOR}(?:"${SECRET_KEY_NAMES}"|'${SECRET_KEY_NAMES}'|${SECRET_KEY_NAMES}))(\\s*[=:]\\s*)("[^"]*"|'[^']*'|[^\\s]+)`,
+      "gi"
+    );
+    return text.replace(re, (...groups) => {
+      const full = String(groups[0]);
+      const keyForm = String(groups[1]);
+      const separator = String(groups[2]);
+      const value = String(groups[3] ?? "");
+      if (value.startsWith('"') && value.endsWith('"') && value.length > 1 || value.startsWith("'") && value.endsWith("'") && value.length > 1) {
+        return full;
+      }
+      const key = keyForm.toLowerCase();
+      const isAuthorizationKey = /(?:^|[^\\w-])(?:"|')?(proxy-)?authorization(?:"|')?$/i.test(key);
+      if (isAuthorizationKey && new RegExp(`^${SCHEME_WORDS}$`, "i").test(value)) {
+        return full;
+      }
+      counts["key-assign"] = (counts["key-assign"] ?? 0) + 1;
+      if (/["']$/.test(value) && !/^["']/.test(value)) {
+        return `${keyForm}${separator}${REDACTED}${value.slice(-1)}`;
+      }
+      return `${keyForm}${separator}${REDACTED}`;
+    });
+  }
+  function redactText(input) {
+    const counts = {};
+    if (!input) return { text: input, counts };
+    let text = redactBlockScalars(input, counts);
+    text = redactQuotedAssignments(text, counts);
+    text = redactUnquotedAssignments(text, counts);
+    for (const { name, regex } of PATTERNS) {
+      const re = new RegExp(regex.source, regex.flags);
+      text = text.replace(re, (...groups) => {
+        counts[name] = (counts[name] ?? 0) + 1;
+        const full = groups[0];
+        switch (name) {
+          case "authorization":
+            return `${groups[1]}${groups[2]}${groups[3] ?? ""}${groups[4] ? ` ${REDACTED}` : ""}`;
+          case "url-cred":
+            return `${groups[1]}${groups[2]}:${REDACTED}@`;
+          case "bearer":
+            return `${groups[1]}${groups[2]}${REDACTED}`;
+          case "pem":
+          case "jwt":
+            return REDACTED;
+          default:
+            return full.length <= 8 ? REDACTED : mask(full);
+        }
+      });
+    }
+    return { text, counts };
+  }
+  function redactBlockScalars(text, counts) {
+    const re = new RegExp(
+      `(${KEY_ANCHOR}(?:"${SECRET_KEY_NAMES}"|'${SECRET_KEY_NAMES}'|${SECRET_KEY_NAMES}))(\\s*[:=]\\s*)([|>](?:(?:[1-9][+-]?)|(?:[+-][1-9]?))?[ \\t]*(?:#.*)?)(?=\\r?
+|$)`,
+      "gi"
+    );
+    let result = "";
+    let cursor = 0;
+    let match2;
+    while ((match2 = re.exec(text)) !== null) {
+      if (match2.index < cursor) continue;
+      const valueStart = match2.index + match2[0].length;
+      const keyLineStart = text.lastIndexOf("\n", match2.index) + 1;
+      const keyIndent = /^(?:[ \t]*)/.exec(text.slice(keyLineStart))[0].length;
+      let lastConsumed = valueStart;
+      let contentLines = 0;
+      const lines = text.slice(valueStart).split("\n");
+      for (const line of lines) {
+        if (line.trim() === "") {
+          lastConsumed += line.length + 1;
+          continue;
+        }
+        const indent = line.length - line.replace(/^[ \t]+/, "").length;
+        if (indent > keyIndent) {
+          lastConsumed += line.length + 1;
+          contentLines++;
+          continue;
+        }
+        lastConsumed -= 1;
+        break;
+      }
+      if (contentLines === 0) continue;
+      counts["key-block"] = (counts["key-block"] ?? 0) + 1;
+      result += text.slice(cursor, valueStart) + REDACTED;
+      cursor = lastConsumed;
+    }
+    result += text.slice(cursor);
+    return result;
+  }
+
+  // ../../packages/shared-headless-capabilities/src/memory/store.ts
+  var ENTRY_FILE = ".entries.json";
+  var STATE_FILE = ".state.json";
+  var SNAPSHOTS_DIR = ".snapshots";
+  var ARCHIVE_DIR = "archive";
+  var JOURNAL_DIR = "journal";
+  var KNOWLEDGE_DIR = "knowledge";
+  var PROJECTS_DIR = "projects";
+  function isEntryFile(value) {
+    if (!value || typeof value !== "object") return false;
+    const file = value;
+    return file.version === 1 && Array.isArray(file.entries);
+  }
+  function isEntry(value) {
+    if (!value || typeof value !== "object") return false;
+    const entry = value;
+    return typeof entry.id === "string" && !!entry.id && ["preference", "fact", "project", "thread"].includes(entry.kind) && ["user", "memory", "threads", "project", "knowledge"].includes(entry.surface) && typeof entry.text === "string" && !!entry.text && !entry.text.includes("\n") && typeof entry.created === "number" && typeof entry.lastAccessed === "number" && (entry.injectedCount === void 0 || typeof entry.injectedCount === "number") && (entry.consumedCount === void 0 || typeof entry.consumedCount === "number") && (entry.lastConsumedAt === void 0 || typeof entry.lastConsumedAt === "number") && (entry.ns === void 0 || ["user", "project", "org", "machine"].includes(entry.ns)) && (entry.originMachine === void 0 || typeof entry.originMachine === "string") && typeof entry.usageCount === "number" && typeof entry.sourceSessionId === "string" && Array.isArray(entry.evidence) && entry.evidence.every((item) => item && typeof item.sessionId === "string" && typeof item.quote === "string" && !!item.quote) && ["user-attested", "distilled"].includes(entry.provenance);
+  }
+  function loadPosixLibc(koffi) {
+    const darwin = process.platform === "darwin";
+    const candidates = darwin ? ["libc.dylib"] : ["libc.so.6", "libc.musl-x86_64.so.1", "libc.musl-aarch64.so.1", null];
+    let lastError;
+    for (const candidate of candidates) {
+      try {
+        return candidate === null ? koffi.load(null) : koffi.load(candidate);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw new Error(`could not load a libc providing flock(2) (tried ${candidates.map((c) => c ?? "self").join(", ")}): ${String(lastError)}`);
+  }
+  function createPosixBackend(koffi) {
+    const libc = loadPosixLibc(koffi);
+    const flock = libc.func("int flock(int fd, int operation)");
+    const LOCK_EX = 2, LOCK_UN = 8, LOCK_NB = 4;
+    const EWOULDBLOCK = koffi.os.errno.EWOULDBLOCK ?? koffi.os.errno.EAGAIN;
+    return {
+      open(lockPath) {
+        return (void 0)(lockPath, "a");
+      },
+      lock(handle) {
+        const fd = handle;
+        if (flock(fd, LOCK_EX | LOCK_NB) === 0) return "acquired";
+        const errno = koffi.errno();
+        if (errno === EWOULDBLOCK || errno === koffi.os.errno.EAGAIN) return "busy";
+        throw new Error(`flock failed (errno ${errno})`);
+      },
+      unlock(handle) {
+        try {
+          flock(handle, LOCK_UN);
+        } catch {
+        }
+        try {
+          (void 0)(handle);
+        } catch {
+        }
+      }
+    };
+  }
+  function createWindowsBackend(koffi) {
+    const kernel = koffi.load("kernel32.dll");
+    const createFile = kernel.func("void * __stdcall CreateFileW(const char16_t *name, uint32 access, uint32 share, void *sec, uint32 disp, uint32 flags, void *tmpl)");
+    const lockFileEx = kernel.func("int32 __stdcall LockFileEx(void *h, uint32 flags, uint32 reserved, uint32 low, uint32 high, void *overlapped)");
+    const unlockFileEx = kernel.func("int32 __stdcall UnlockFileEx(void *h, uint32 reserved, uint32 low, uint32 high, void *overlapped)");
+    const closeHandle = kernel.func("int32 __stdcall CloseHandle(void *h)");
+    const getLastError = kernel.func("uint32 __stdcall GetLastError(void)");
+    const GENERIC_WRITE = 1073741824;
+    const FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, FILE_SHARE_DELETE = 4;
+    const OPEN_ALWAYS = 4;
+    const INVALID_HANDLE_VALUE = 0xffffffffffffffffn;
+    const LOCKFILE_EXCLUSIVE_LOCK = 2, LOCKFILE_FAIL_IMMEDIATELY = 1;
+    const ERROR_LOCK_VIOLATION = 33;
+    return {
+      open(lockPath) {
+        const handle = createFile(lockPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, null, OPEN_ALWAYS, 0, null);
+        const addr = BigInt(koffi.address(handle));
+        if (addr === INVALID_HANDLE_VALUE || addr === 0n) {
+          throw new Error(`CreateFileW failed for lock file (GetLastError ${Number(getLastError())})`);
+        }
+        return handle;
+      },
+      lock(handle) {
+        const overlapped = Buffer.alloc(32);
+        if (lockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 4294967295, 4294967295, overlapped)) return "acquired";
+        const err = Number(getLastError());
+        if (err === ERROR_LOCK_VIOLATION) return "busy";
+        throw new Error(`LockFileEx failed (GetLastError ${err})`);
+      },
+      unlock(handle) {
+        try {
+          const overlapped = Buffer.alloc(32);
+          unlockFileEx(handle, 0, 4294967295, 4294967295, overlapped);
+        } catch {
+        }
+        try {
+          closeHandle(handle);
+        } catch {
+        }
+      }
+    };
+  }
+  var storeLockBackendInstance = /* @__PURE__ */ (() => {
+    let backend;
+    return () => {
+      if (backend) return backend;
+      const requireFn = createRequire("file:///pie/core.bytes");
+      const koffi = requireFn("koffi");
+      backend = createMemoryLockBackend(koffi);
+      return backend;
+    };
+  })();
+  function createMemoryLockBackend(koffi) {
+    return process.platform === "win32" ? createWindowsBackend(koffi) : createPosixBackend(koffi);
+  }
+  function removeLegacyLockDirectory(lockPath) {
+    const entries = readdirSync(lockPath);
+    for (const name of entries) (void 0)(join(lockPath, name), { force: true });
+    try {
+      (void 0)(lockPath);
+    } catch (error) {
+      const code = error.code;
+      if (code !== "ENOTEMPTY" && code !== "ENOTDIR" && code !== "ENOENT") throw error;
+    }
+  }
+  function acquireStoreWriteLock(lockPath) {
+    const backend = storeLockBackendInstance();
+    mkdirSync(dirname(lockPath), { recursive: true });
+    try {
+      if (statSync(lockPath).isDirectory()) removeLegacyLockDirectory(lockPath);
+    } catch {
+    }
+    let handle;
+    try {
+      handle = backend.open(lockPath);
+    } catch (error) {
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+    try {
+      for (let attempt = 0; ; attempt++) {
+        const result = backend.lock(handle);
+        if (result === "acquired") {
+          let released = false;
+          return {
+            release() {
+              if (released) return;
+              released = true;
+              backend.unlock(handle);
+            }
+          };
+        }
+        if (attempt >= 40) {
+          backend.unlock(handle);
+          return null;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25 + Math.floor(Math.random() * 25));
+      }
+    } catch (error) {
+      backend.unlock(handle);
+      throw error;
+    }
+  }
+  var MemoryStore = class _MemoryStore {
+    constructor(root) {
+      this.root = root;
+    }
+    root;
+    get dir() {
+      return this.root;
+    }
+    /** Serialize a canonical mutation across processes with an OS-backed
+     *  advisory lock (flock on POSIX, LockFileEx on Windows — kernel-owned
+     *  exclusion, AUTOMATIC release on process death; no owner payloads or
+     *  recovery protocol exist or are needed). Contended (another live
+     *  writer holds it) after a bounded retry budget → thrown, fail closed.
+     *  Atomic renames of the data files prevent torn reads; the kernel lock
+     *  prevents LOST UPDATES (two writers each reading base state E and
+     *  writing E+their-op). Re-entrant within a store instance; two
+     *  instances over the same root contend normally. */
+    transaction(fn) {
+      const runOnce = () => {
+        const result = fn();
+        if (result !== null && result !== void 0 && typeof result.then === "function") {
+          Promise.resolve(result).catch(() => {
+          });
+          throw new Error("MemoryStore.transaction callbacks must be synchronous (no Promises)");
+        }
+        return result;
+      };
+      if (this.transactionDepth > 0) {
+        this.transactionDepth += 1;
+        try {
+          return runOnce();
+        } finally {
+          this.transactionDepth -= 1;
+        }
+      }
+      this.transactionDepth = 1;
+      try {
+        return this.withStoreLock(runOnce);
+      } finally {
+        this.transactionDepth = 0;
+      }
+    }
+    transactionDepth = 0;
+    /** Bounded-retry acquisition of the store's advisory write lock. */
+    withStoreLock(fn) {
+      const lock = acquireStoreWriteLock(join(this.root, "write.lock"));
+      if (!lock) throw new Error("memory store is contended (write.lock); retry the operation");
+      try {
+        return fn();
+      } finally {
+        lock.release();
+      }
+    }
+    // ------------------------------------------------------------------
+    // Entries (canonical records)
+    // ------------------------------------------------------------------
+    entryPath() {
+      return join(this.root, ENTRY_FILE);
+    }
+    loadEntries() {
+      let raw;
+      try {
+        raw = readFileSync(this.entryPath(), "utf8");
+      } catch (error) {
+        if (error.code === "ENOENT") return [];
+        throw new Error(`memory entries unreadable: ${String(error)}`);
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new Error("memory entries file is corrupt (invalid JSON); refusing to overwrite \u2014 restore from .snapshots/");
+      }
+      if (!isEntryFile(parsed)) {
+        throw new Error("memory entries file has an unexpected format; refusing to overwrite \u2014 restore from .snapshots/");
+      }
+      if (!parsed.entries.every(isEntry)) {
+        throw new Error("memory entries file contains malformed records; refusing to overwrite \u2014 restore from .snapshots/");
+      }
+      return parsed.entries;
+    }
+    saveEntries(entries) {
+      if (!entries.every(isEntry)) {
+        throw new Error("refusing to persist malformed memory entries");
+      }
+      const seen = /* @__PURE__ */ new Set();
+      for (const entry of entries) {
+        if (seen.has(entry.id)) throw new Error(`duplicate entry id: ${entry.id}`);
+        seen.add(entry.id);
+      }
+      const file = { version: 1, entries };
+      const target = this.entryPath();
+      mkdirSync(this.root, { recursive: true });
+      const tmp = `${target}.${process.pid}.${Date.now().toString(36)}.tmp`;
+      writeFileSync(tmp, JSON.stringify(file, null, "	"));
+      renameSync(tmp, target);
+    }
+    entryById(id) {
+      return this.loadEntries().find((entry) => entry.id === id);
+    }
+    // ------------------------------------------------------------------
+    // Surfaces (rendered views; entries are the source of truth)
+    // ------------------------------------------------------------------
+    surfaceFileName(surface) {
+      switch (surface) {
+        case "user":
+          return "USER.md";
+        case "memory":
+          return "MEMORY.md";
+        case "threads":
+          return "THREADS.md";
+        case "knowledge":
+          return join(KNOWLEDGE_DIR, "index.md");
+        case "project":
+          return join(PROJECTS_DIR, "unknown", "MEMORY.md");
+      }
+    }
+    projectSurfacePath(projectKey) {
+      return join(this.root, PROJECTS_DIR, projectKey, "MEMORY.md");
+    }
+    entryLine(entry) {
+      return `- ${entry.text} _(since ${dayOf(entry.created)}${entry.provenance === "user-attested" ? ", user-attested" : ""})_`;
+    }
+    /** Render every active surface file from the current entries. */
+    renderSurfaces(projectKeys = []) {
+      const entries = this.loadEntries();
+      const bySurface = (surface) => entries.filter((entry) => entry.surface === surface && !isRetired(entry));
+      mkdirSync(this.root, { recursive: true });
+      const writeSurface = (file, title, list2) => {
+        const lines = [`# ${title}`, ""];
+        if (list2.length === 0) lines.push("_(empty)_", "");
+        for (const entry of list2) lines.push(this.entryLine(entry));
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, lines.join("\n") + "\n");
+      };
+      writeSurface(join(this.root, "USER.md"), "User", bySurface("user"));
+      writeSurface(join(this.root, "MEMORY.md"), "Memory", bySurface("memory"));
+      writeSurface(join(this.root, "THREADS.md"), "Threads", bySurface("threads"));
+      for (const key of projectKeys) {
+        const list2 = entries.filter(
+          (entry) => (entry.kind === "project" || entry.surface === "project") && entry.projectKey === key && !isRetired(entry)
+        );
+        writeSurface(this.projectSurfacePath(key), `Project ${key}`, list2);
+      }
+    }
+    // ------------------------------------------------------------------
+    // Journal
+    // ------------------------------------------------------------------
+    static DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+    journalPath(date) {
+      if (!_MemoryStore.DATE_RE.test(date)) throw new Error(`invalid journal date: ${JSON.stringify(date)}`);
+      return join(this.root, JOURNAL_DIR, `${date}.md`);
+    }
+    writeJournal(date, content) {
+      const file = this.journalPath(date);
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, content);
+    }
+    readJournal(date) {
+      try {
+        return readFileSync(this.journalPath(date), "utf8");
+      } catch {
+        return void 0;
+      }
+    }
+    /** SOUL.md static persona (v2 stage E): human-maintained, NEVER
+     *  auto-edited by pie. Absent file = no persona injection (silent skip —
+     *  a persona is never mandatory). Read is size-capped defensively. */
+    readSoul(maxChars = 4e3) {
+      try {
+        const text = readFileSync(join(this.root, "SOUL.md"), "utf8");
+        const trimmed = text.trim();
+        return trimmed.length > 0 ? trimmed.slice(0, maxChars) : void 0;
+      } catch {
+        return void 0;
+      }
+    }
+    listJournalDates() {
+      try {
+        return readdirSync(join(this.root, JOURNAL_DIR)).filter((name) => /^\d{4}-\d{2}-\d{2}\.md$/.test(name)).map((name) => name.slice(0, -3)).sort();
+      } catch {
+        return [];
+      }
+    }
+    // ------------------------------------------------------------------
+    // Project meta
+    // ------------------------------------------------------------------
+    writeProjectMeta(meta) {
+      this.transaction(() => {
+        const dir = join(this.root, PROJECTS_DIR, meta.key);
+        mkdirSync(dir, { recursive: true });
+        const target = join(dir, "meta.json");
+        const tmp = `${target}.${process.pid}.${Date.now().toString(36)}.tmp`;
+        writeFileSync(tmp, JSON.stringify(meta, null, "	"));
+        renameSync(tmp, target);
+      });
+    }
+    readProjectMeta(projectKey) {
+      try {
+        const raw = readFileSync(
+          join(this.root, PROJECTS_DIR, projectKey, "meta.json"),
+          "utf8"
+        );
+        return JSON.parse(raw);
+      } catch {
+        return void 0;
+      }
+    }
+    listProjectKeys() {
+      try {
+        return readdirSync(join(this.root, PROJECTS_DIR)).filter((name) => {
+          try {
+            return statSync(join(this.root, PROJECTS_DIR, name)).isDirectory();
+          } catch {
+            return false;
+          }
+        });
+      } catch {
+        return [];
+      }
+    }
+    // ------------------------------------------------------------------
+    // Snapshots & rollback
+    // ------------------------------------------------------------------
+    /** Snapshot entries, state, and global surfaces before a patch (not the archive).
+     * Project surfaces are regenerated on rollback. Returns the snapshot id. */
+    snapshot(label) {
+      const id = `snap-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}-${label.replace(/[^a-z0-9-]/gi, "")}`;
+      const dir = join(this.root, SNAPSHOTS_DIR, id);
+      mkdirSync(dir, { recursive: true });
+      for (const name of [ENTRY_FILE, STATE_FILE, "USER.md", "MEMORY.md", "THREADS.md"]) {
+        const from = join(this.root, name);
+        if (existsSync(from)) {
+          (void 0)(from, join(dir, name));
+        } else {
+          writeFileSync(join(dir, `${name}.absent`), "");
+        }
+      }
+      this.pruneSnapshots();
+      return id;
+    }
+    listSnapshots() {
+      try {
+        return readdirSync(join(this.root, SNAPSHOTS_DIR)).sort().reverse();
+      } catch {
+        return [];
+      }
+    }
+    /** Restore every snapshotted file (tombstones delete files created since). */
+    rollback(snapshotId) {
+      if (!/^snap-[a-z0-9]+-[a-z0-9]+(-[a-z0-9-]*)?$/.test(snapshotId)) throw new Error(`invalid snapshot id`);
+      const dir = join(this.root, SNAPSHOTS_DIR, snapshotId);
+      if (!existsSync(dir)) throw new Error(`unknown memory snapshot: ${snapshotId}`);
+      this.transaction(() => {
+        for (const name of readdirSync(dir)) {
+          if (name.endsWith(".absent")) {
+            (void 0)(join(this.root, name.slice(0, -".absent".length)), { force: true });
+          } else {
+            const dest = join(this.root, name);
+            const temp = `${dest}.${process.pid}.${Date.now()}.tmp`;
+            (void 0)(join(dir, name), temp);
+            renameSync(temp, dest);
+          }
+        }
+        this.renderSurfaces(this.listProjectKeys());
+      });
+    }
+    pruneSnapshots(keep = 30) {
+      const ids = this.listSnapshots();
+      for (const id of ids.slice(keep)) {
+        (void 0)(join(this.root, SNAPSHOTS_DIR, id), { recursive: true, force: true });
+      }
+    }
+    // ------------------------------------------------------------------
+    // State (per-date idempotency)
+    // ------------------------------------------------------------------
+    loadState() {
+      try {
+        const raw = readFileSync(join(this.root, STATE_FILE), "utf8");
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.version === 1 && parsed.runs && typeof parsed.runs === "object") {
+          return parsed;
+        }
+      } catch {
+      }
+      return { version: 1, runs: {} };
+    }
+    writeState(state) {
+      const target = join(this.root, STATE_FILE);
+      mkdirSync(this.root, { recursive: true });
+      const tmp = `${target}.${process.pid}.${Date.now().toString(36)}.tmp`;
+      writeFileSync(tmp, JSON.stringify(state, null, "	"));
+      renameSync(tmp, target);
+    }
+    hasRun(date) {
+      const run = this.loadState().runs[date];
+      return Boolean(run) && (run.ops > 0 || (run.failures ?? 0) === 0);
+    }
+    /** Record a distillation failure for a date (visibility ledger).
+     *  Creates/keeps the entry retryable; success clears failures/lastError. */
+    recordFailure(date, error, now = Date.now()) {
+      this.transaction(() => {
+        const state = this.loadState();
+        const existing = state.runs[date];
+        state.runs[date] = {
+          ranAt: now,
+          ops: existing?.ops ?? 0,
+          gated: existing?.gated ?? false,
+          failures: (existing?.failures ?? 0) + 1,
+          lastError: error.slice(0, 300)
+        };
+        this.writeState(state);
+      });
+    }
+    /** Clear the failure ledger for a date after a successful run. */
+    clearFailures(date) {
+      this.transaction(() => {
+        const state = this.loadState();
+        const run = state.runs[date];
+        if (run?.failures || run?.lastError) {
+          delete run.failures;
+          delete run.lastError;
+          this.writeState(state);
+        }
+      });
+    }
+    // ------------------------------------------------------------------
+    // Patch application (snapshot → validate → mutate → render)
+    // ------------------------------------------------------------------
+    /** Hard cap on one transaction's ops (docs/memory.md: bounded patches). */
+    static MAX_PATCH_OPS = 8;
+    /** Retention window backing the skipConflicts retire re-verification:
+     *  mirrors limits.retireUnusedAfterDays (default 90d; see
+     *  buildRetentionOps) without importing the limits type here. */
+    static RETIRE_UNUSED_CUTOFF_MS = 90 * 24 * 60 * 60 * 1e3;
+    /**
+     * Validate + apply a content transaction. Every persisted text field is
+     * redacted here — the store is the last-chance boundary, so model output
+     * and tool input cannot bypass redaction.
+     */
+    applyEntryPatch(ops, date = dayOf(Date.now())) {
+      if (ops.length === 0) return { applied: 0, snapshotId: "" };
+      return this.transaction(() => this.applyEntryPatchLocked(ops, date));
+    }
+    applyEntryPatchLocked(ops, _date, options = {}) {
+      if (ops.length > _MemoryStore.MAX_PATCH_OPS) {
+        throw new Error(`patch exceeds the hard op cap (${ops.length} > ${_MemoryStore.MAX_PATCH_OPS})`);
+      }
+      if (options.skipConflicts) {
+        const current2 = this.loadEntries();
+        const effective = [];
+        for (const op of ops) {
+          if (op.op === "update" || op.op === "retire") {
+            const entry = current2.find((candidate) => candidate.id === op.id);
+            if (!entry) continue;
+            if (op.expectText !== void 0 && entry.text !== op.expectText) continue;
+            if (op.op === "retire" && op.policy) {
+              const cutoff = op.decidedCutoff ?? Date.now() - _MemoryStore.RETIRE_UNUSED_CUTOFF_MS;
+              const lastUse = Math.max(entry.lastAccessed, entry.lastConsumedAt ?? 0);
+              if (entry.usageCount !== 0 || lastUse >= cutoff) continue;
+            }
+          }
+          if (op.op === "add" && current2.some((entry) => entry.id === op.entry.id)) continue;
+          effective.push(op);
+        }
+        if (effective.length === 0) return { applied: 0, snapshotId: "" };
+        return this.applyEntryPatchLocked(effective, _date);
+      }
+      const entries = this.loadEntries();
+      const ids = new Set(entries.map((entry) => entry.id));
+      for (const op of ops) {
+        if (op.op === "update" && !ids.has(op.id)) throw new Error(`update target missing: ${op.id}`);
+        if (op.op === "retire" && !ids.has(op.id)) throw new Error(`retire target missing: ${op.id}`);
+        if (op.op === "add") {
+          if (ids.has(op.entry.id)) throw new Error(`add duplicates existing entry id: ${op.entry.id}`);
+          ids.add(op.entry.id);
+        }
+        if (op.op === "add" || op.op === "update") {
+          const text = redactText(op.op === "add" ? op.entry.text : op.text).text.trim();
+          if (!text || text.includes("\n") || text.length > 240) {
+            throw new Error("entry text must be a non-empty single line <= 240 chars");
+          }
+          if (op.op === "add") {
+            op.entry.text = text;
+            op.entry.evidence = op.entry.evidence.map((item) => ({ sessionId: item.sessionId, quote: redactText(item.quote).text.slice(0, 240) })).filter((item) => item.quote.trim().length > 0);
+            if (op.entry.evidence.length === 0) throw new Error("add requires at least one non-empty evidence quote");
+          } else {
+            op.text = text;
+          }
+        }
+      }
+      const snapshotId = this.snapshot("apply");
+      const archived = [];
+      const now = Date.now();
+      for (const op of ops) {
+        if (op.op === "add") {
+          entries.push(op.entry);
+        } else if (op.op === "update") {
+          const entry = entries.find((candidate) => candidate.id === op.id);
+          if (entry) {
+            entry.text = op.text;
+            for (const evidence of op.evidence) {
+              const quote = redactText(evidence.quote).text;
+              if (!quote) continue;
+              const key = `${evidence.sessionId}\0${quote.slice(0, 240)}`;
+              if (entry.evidence.some((existing) => `${existing.sessionId}\0${existing.quote.slice(0, 240)}` === key)) continue;
+              entry.evidence.push({ sessionId: evidence.sessionId, quote: quote.slice(0, 240) });
+            }
+          }
+        } else {
+          const entry = entries.find((candidate) => candidate.id === op.id);
+          if (entry) {
+            entry.retiredAt = now;
+            entry.retireReason = redactText(op.reason).text.slice(0, 240);
+            archived.push(entry);
+          }
+        }
+      }
+      this.saveEntries(entries.filter((entry) => !archived.includes(entry)));
+      if (archived.length > 0) {
+        const archivePath = join(this.root, ARCHIVE_DIR, "retired.jsonl");
+        mkdirSync(dirname(archivePath), { recursive: true });
+        appendFileSync(archivePath, archived.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+      }
+      const projectKeys = /* @__PURE__ */ new Set([...this.listProjectKeys(), ...entries.filter((entry) => entry.projectKey).map((entry) => entry.projectKey)]);
+      this.renderSurfaces([...projectKeys]);
+      return { applied: ops.length, snapshotId };
+    }
+    /**
+     * Distillation completion transaction: apply ops AND record the per-date
+     * checkpoint — INCLUDING for empty patches (a completed run with nothing
+     * to do must checkpoint, or it re-runs forever; review F8). Only the
+     * engine may call this after a successful run — content-only writers
+     * (memory_save) must use applyEntryPatch so they never mark a day as
+     * already distilled.
+     */
+    applyPatch(patch, options = {}) {
+      return this.transaction(() => {
+        const applied = patch.ops.length ? this.applyEntryPatchLocked(patch.ops, patch.date, { skipConflicts: true }) : { applied: 0, snapshotId: "" };
+        if (applied.applied === 0) {
+          const keys = new Set(this.listProjectKeys());
+          for (const entry of this.loadEntries()) if (entry.projectKey) keys.add(entry.projectKey);
+          for (const op of patch.ops) {
+            if (op.op === "add" && op.entry.projectKey) keys.add(op.entry.projectKey);
+          }
+          this.renderSurfaces([...keys]);
+        }
+        const state = this.loadState();
+        const prior = state.runs[patch.date];
+        state.runs[patch.date] = { ranAt: Date.now(), ops: (prior?.ops ?? 0) + applied.applied, gated: Boolean(options.gated) };
+        this.writeState(state);
+        return applied;
+      });
+    }
+  };
+  function isRetired(entry) {
+    return typeof entry.retiredAt === "number";
+  }
+  function dayOf(timestamp) {
+    const date = new Date(timestamp);
+    const month = `${date.getMonth() + 1}`.padStart(2, "0");
+    const day = `${date.getDate()}`.padStart(2, "0");
+    return `${date.getFullYear()}-${month}-${day}`;
   }
 
   // src/unity-websocket-client.ts
@@ -48289,6 +49137,20 @@ ${lines.join("\n")}`;
     if (!first) throw new Error("no options offered");
     return first;
   }
+  function missingLeaseMethod(value, depth = 0) {
+    if (depth > 6 || value == null) return false;
+    if (typeof value === "object") {
+      const error = value;
+      return [error.code, error.message, error.error, error.cause].some((part) => missingLeaseMethod(part, depth + 1));
+    }
+    if (typeof value !== "string") return false;
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed !== value && missingLeaseMethod(parsed, depth + 1)) return true;
+    } catch {
+    }
+    return /RUNTIME_PATH_NOT_FOUND|RUNTIME_MEMBER_NOT_CALLABLE|MissingMethodException|(?:method|member|runtime path).*?(?:not found|missing|not callable|does not exist)|(?:no|missing) (?:such )?method|SetEpisodeSeconds.*?(?:not a function|undefined)/i.test(value);
+  }
   function createGameUseScriptApi(runtime, services = {}) {
     return {
       async playWithHarness(config) {
@@ -48299,15 +49161,16 @@ ${lines.join("\n")}`;
         const decisions = [];
         const actions = [];
         let inputReleased = false;
+        let leaseMethod = "SetEpisodeSeconds";
         const releaseInput = () => {
           if (inputReleased) return;
           inputReleased = true;
           if (services.releaseInput) {
-            services.releaseInput();
+            services.releaseInput(leaseMethod);
             return;
           }
+          void Promise.resolve().then(() => runtime.call(`CS.Pie.GameUse.PieInputHands.${leaseMethod}`, [0])).catch(() => void 0);
           void Promise.resolve().then(() => runtime.call("CS.Pie.GameUse.PieInputHands.ReleaseAll", [])).catch(() => void 0);
-          void Promise.resolve().then(() => runtime.call("CS.Pie.GameUse.PieInputHands.SetEpisodeActive", [0])).catch(() => void 0);
         };
         const unregisterTermination = services.onTermination?.(releaseInput) ?? (() => {
         });
@@ -48319,8 +49182,18 @@ ${lines.join("\n")}`;
           ...error ? { error: error instanceof Error ? error.message : String(error) } : {}
         });
         try {
-          const budget = Math.min(1e5, Math.ceil((config.maxSeconds ?? 60) * 60 * 1.5));
-          await Promise.resolve().then(() => runtime.call("CS.Pie.GameUse.PieInputHands.SetEpisodeActive", [budget])).catch(() => void 0);
+          try {
+            const result = await runtime.call("CS.Pie.GameUse.PieInputHands.SetEpisodeSeconds", [config.maxSeconds ?? 60]);
+            if (missingLeaseMethod(result)) throw result;
+          } catch (error) {
+            if (missingLeaseMethod(error)) {
+              leaseMethod = "SetEpisodeActive";
+              try {
+                await runtime.call("CS.Pie.GameUse.PieInputHands.SetEpisodeActive", [Math.ceil((config.maxSeconds ?? 60) * 90)]);
+              } catch {
+              }
+            }
+          }
           const decider = config.jev ? createJevDecider({ apiKey: config.jev.key, baseUrl: config.jev.baseUrl, http: gameUseHttpClient(services), timeoutMs: 8e3 }) : createScriptedDecider(config.policy ?? firstListedPolicy, config.policy ? "scripted" : "first-listed");
           const episode = await runEpisode({
             harness: inlineHarness(config.harness),
@@ -48523,8 +49396,9 @@ ${lines.join("\n")}`;
         checkpoint: (value) => {
           if (task.status === "running") task.partialResult = toSerializable(value);
         },
-        releaseInput: () => {
-          for (const [path3, args2] of [["CS.Pie.GameUse.PieInputHands.ReleaseAll", []], ["CS.Pie.GameUse.PieInputHands.SetEpisodeActive", [0]]]) {
+        releaseInput: (leaseMethod = "SetEpisodeSeconds") => {
+          const otherLease = leaseMethod === "SetEpisodeSeconds" ? "SetEpisodeActive" : "SetEpisodeSeconds";
+          for (const [path3, args2] of [[`CS.Pie.GameUse.PieInputHands.${leaseMethod}`, [0]], [`CS.Pie.GameUse.PieInputHands.${otherLease}`, [0]], ["CS.Pie.GameUse.PieInputHands.ReleaseAll", []]]) {
             try {
               const pending = getRuntimeApi().call(path3, [...args2]);
               if (isThenable(pending)) void Promise.resolve(pending).catch(() => void 0);

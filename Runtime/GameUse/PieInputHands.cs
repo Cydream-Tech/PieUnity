@@ -42,6 +42,10 @@ namespace Pie.GameUse
         // Foreign keys the human holds are re-released the same way; during
         // an episode that is the documented contract (the loop owns input).
         private static int _activeEpisodeFrames;
+        private static double _episodeDeadline;
+        // Desired state can be empty before the device has received its up-edge.
+        private static bool _lastEmittedDown;
+        private static bool _releaseQueued;
 
         /// <summary>Declare an episode in progress for the next N frames:
         /// re-assert synthesized state every frame so interleaved human
@@ -52,7 +56,19 @@ namespace Pie.GameUse
             EnsureDriver();
             var n = frames <= 0 ? 0 : frames > 100000 ? 100000 : frames;
             _activeEpisodeFrames = n;
+            _episodeDeadline = 0;
             return $"{{\"ok\":true,\"episodeFrames\":{n}}}";
+        }
+
+        /// <summary>Lease input ownership in real seconds, independent of FPS/timeScale.</summary>
+        [UnityEngine.Scripting.Preserve]
+        public static string SetEpisodeSeconds(float seconds)
+        {
+            EnsureDriver();
+            _activeEpisodeFrames = 0;
+            _episodeDeadline = seconds > 0 && !float.IsInfinity(seconds)
+                ? Time.realtimeSinceStartupAsDouble + seconds : 0;
+            return Json(true, null);
         }
 
         [UnityEngine.Scripting.Preserve]
@@ -93,8 +109,12 @@ string keyName)
 )
         {
             EnsureDriver();
-            foreach (var key in Held) Enqueue(key, false, bypassHeld: true);
+            Pending.Clear();
             Held.Clear();
+            _axis = Vector2.zero;
+            _queuedAxis = Vector2.zero;
+            _axisQueued = false;
+            _releaseQueued = true;
             return Json(true, null);
         }
 
@@ -117,18 +137,13 @@ string keyName)
             return $"[{string.Join(",", names)}]";
         }
 
-        private static void Enqueue(Key key, bool down, int framesDelay = 0, bool bypassHeld = false)
+        private static void Enqueue(Key key, bool down, int framesDelay = 0)
         {
             // framesDelay defers this event by that many Updates (markers
             // first, the event after) so a press spans real frames and games
             // see wasPressedThisFrame exactly once.
             for (var i = 0; i < framesDelay; i++) Pending.Enqueue((null, false));
             Pending.Enqueue((key, down));
-            if (!bypassHeld)
-            {
-                if (down) Held.Add(key);
-                else Held.Remove(key);
-            }
         }
 
         private static Key? ParseKey(string name)
@@ -174,7 +189,8 @@ string keyName)
                 var keyboard = Keyboard.current;
                 if (keyboard == null) return;
                 var idle = Held.Count == 0 && Mathf.Abs(_axis.x) < 0.01f && Mathf.Abs(_axis.y) < 0.01f;
-                if (idle && _activeEpisodeFrames <= 0)
+                var episodeActive = _activeEpisodeFrames > 0 || Time.realtimeSinceStartupAsDouble < _episodeDeadline;
+                if (idle && !episodeActive && !_lastEmittedDown && !_releaseQueued)
                 {
                     // Nothing synthesized: stay silent so a human typing
                     // between episodes is never fought over.
@@ -187,6 +203,8 @@ string keyName)
                 if (_axis.x < -0.5f) pressed.Add(Key.A);
                 if (_axis.x > 0.5f) pressed.Add(Key.D);
                 InputSystem.QueueStateEvent(keyboard, new KeyboardState(pressed.ToArray()));
+                _lastEmittedDown = pressed.Count > 0;
+                _releaseQueued = false;
             }
         }
 
