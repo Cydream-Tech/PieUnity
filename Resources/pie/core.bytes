@@ -7901,6 +7901,824 @@ var _PieAgent = (() => {
     });
   }
 
+  // ../../packages/ai/src/providers/responses/responses-wire.ts
+  var RESPONSES_PROTOCOL_ERROR_CODE = "responses_protocol_error";
+  var ResponsesProtocolError = class extends Error {
+    code = RESPONSES_PROTOCOL_ERROR_CODE;
+    constructor(message) {
+      super(`${RESPONSES_PROTOCOL_ERROR_CODE}: ${message}`);
+      this.name = "ResponsesProtocolError";
+    }
+  };
+  function isRecord(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  }
+  function isResponsesEventLike(value) {
+    return isRecord(value) && typeof value.type === "string";
+  }
+  function formatResponsesErrorEvent(event) {
+    const source = isRecord(event.error) ? event.error : event;
+    const message = typeof source.message === "string" && source.message.length > 0 ? source.message : "Responses stream returned an error";
+    const metadata = [];
+    if (typeof source.code === "string" && source.code.length > 0) {
+      metadata.push(`code=${source.code}`);
+    }
+    if (typeof source.param === "string" && source.param.length > 0) {
+      metadata.push(`param=${source.param}`);
+    }
+    if (typeof event.status === "number") {
+      metadata.push(`status=${event.status}`);
+    }
+    return metadata.length > 0 ? `${message} (${metadata.join(", ")})` : message;
+  }
+
+  // ../../packages/ai/src/providers/responses/responses-remote-failure.ts
+  var MAX_TEXT = 4096;
+  var transientCodes = /* @__PURE__ */ new Set(["server_error", "rate_limit_exceeded", "slow_down", "rate_limit_error", "server_is_overloaded", "service_unavailable_error"]);
+  function responsesRemoteFailure(value, status, headers) {
+    const root = isRecord(value) ? value : {};
+    const response = isRecord(root.response) ? root.response : {};
+    const error = isRecord(root.error) ? root.error : isRecord(response.error) ? response.error : root;
+    const code = typeof error.code === "string" ? error.code.slice(0, 128).toLowerCase() : "";
+    const type = typeof error.type === "string" ? error.type.slice(0, 128).toLowerCase() : "";
+    const message = (typeof value === "string" ? value : typeof error.message === "string" ? error.message : "").slice(0, MAX_TEXT).toLowerCase();
+    const httpStatus = status ?? root.status ?? root.statusCode;
+    const fields = `${code} ${type}`;
+    let category = "other";
+    if (/context_length_exceeded|context_window_exceeded|context_overflow/.test(fields) || /context (?:length|window).{0,60}(?:exceed|too (?:long|large))|maximum context length|exceeds.{0,30}context window/.test(message)) category = "context_overflow";
+    else if (/billing|insufficient_quota|insufficient_balance|credit|usage_limit|spend_limit/.test(fields) || /billing|(?:account|monthly) quota|exceeded your current quota|insufficient (?:credit|balance)|credit balance|spend(?:ing)? limit/.test(message)) category = "other";
+    else if (typeof httpStatus === "number" && httpStatus >= 400 && httpStatus < 500 && httpStatus !== 429) category = "other";
+    else if (httpStatus === 429 || typeof httpStatus === "number" && httpStatus >= 500 && httpStatus <= 599 || transientCodes.has(code) || transientCodes.has(type) || /server (?:is )?overloaded|temporarily unavailable|internal server error|rate limit (?:exceeded|reached)/.test(message)) category = "transient";
+    const retryAfterMs = parseRetryAfter(headers ?? root.headers);
+    return { category, ...retryAfterMs !== void 0 ? { retryAfterMs } : {} };
+  }
+  function parseRetryAfter(headers) {
+    if (!headers || typeof headers !== "object") return void 0;
+    let raw;
+    if ("get" in headers && typeof headers.get === "function") raw = headers.get("retry-after");
+    else for (const [key, value] of Object.entries(headers)) if (key.toLowerCase() === "retry-after") raw = value;
+    if (typeof raw !== "string" || raw.length > 128) return void 0;
+    const text = raw.trim();
+    if (/^\d+(?:\.\d+)?$/.test(text)) {
+      const delay = Number(text) * 1e3;
+      return Number.isFinite(delay) ? delay : Number.MAX_VALUE;
+    }
+    if (!/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(text)) return void 0;
+    const date = Date.parse(text);
+    if (!Number.isFinite(date) || new Date(date).toUTCString() !== text) return void 0;
+    return Math.max(0, date - Date.now());
+  }
+  async function readResponsesErrorBody(read, signal) {
+    let timer;
+    let onAbort;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(read).then((text) => text.slice(0, MAX_TEXT)).catch(() => ""),
+        new Promise((resolve2) => {
+          onAbort = () => resolve2("");
+          if (signal.aborted) resolve2("");
+          else signal.addEventListener("abort", onAbort, { once: true });
+          timer = setTimeout(() => resolve2(""), 250);
+        })
+      ]);
+    } finally {
+      if (timer !== void 0) clearTimeout(timer);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+  }
+  function parseResponsesErrorBody(text) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+
+  // ../../packages/ai/src/providers/responses/responses-usage.ts
+  function tokenCount(value) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return void 0;
+    return Math.floor(value);
+  }
+  function normalizeResponsesUsage(model, usage) {
+    const inputTokens = tokenCount(usage?.input_tokens);
+    const cachedTokens = tokenCount(usage?.input_tokens_details?.cached_tokens) ?? 0;
+    const cacheWriteTokens = tokenCount(usage?.input_tokens_details?.cache_write_tokens) ?? 0;
+    const outputTokens = tokenCount(usage?.output_tokens);
+    const reasoningTokens = tokenCount(usage?.output_tokens_details?.reasoning_tokens);
+    const totalTokens = tokenCount(usage?.total_tokens);
+    const input = inputTokens ?? (totalTokens !== void 0 && outputTokens !== void 0 ? Math.max(cachedTokens + cacheWriteTokens, totalTokens - outputTokens) : cachedTokens + cacheWriteTokens);
+    const output = outputTokens ?? (totalTokens !== void 0 ? Math.max(reasoningTokens ?? 0, totalTokens - input) : reasoningTokens ?? 0);
+    const cacheRead = Math.min(cachedTokens, input);
+    const cacheWrite = Math.min(cacheWriteTokens, input - cacheRead);
+    const inputExclusive = input - cacheRead - cacheWrite;
+    const partitionTotal = input + output;
+    const base = {
+      input: inputExclusive,
+      output,
+      cacheRead,
+      cacheWrite,
+      totalTokens: Math.max(totalTokens ?? 0, partitionTotal)
+    };
+    return { ...base, cost: calculateCost(model, base) };
+  }
+
+  // ../../packages/ai/src/providers/responses/responses-events.ts
+  var ResponsesEventReducer = class {
+    output;
+    model;
+    started = false;
+    terminal = null;
+    items = /* @__PURE__ */ new Map();
+    toolCallStates = [];
+    diagnostics = { unknownEventTypes: /* @__PURE__ */ new Set(), ignoredItemTypes: /* @__PURE__ */ new Set(), terminalType: null };
+    constructor(model) {
+      this.model = model;
+      this.output = {
+        role: "assistant",
+        content: [],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usageReported: false,
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+        },
+        stopReason: "stop",
+        timestamp: Date.now()
+      };
+    }
+    get message() {
+      return this.output;
+    }
+    get isTerminal() {
+      return this.terminal !== null;
+    }
+    /** Terminal response object (present on completed/incomplete/failed). */
+    get terminalResponse() {
+      return this.terminal?.response;
+    }
+    /** Feed one raw wire event; returns the AssistantMessageEvents to emit. */
+    feed(raw) {
+      if (this.terminal) return [];
+      try {
+        const events = this.feedInbound(raw);
+        if (this.isTerminal && this.output.stopReason === "error") {
+          this.output.remoteFailure = responsesRemoteFailure(raw);
+        }
+        return events;
+      } catch (error) {
+        this.terminal = null;
+        throw error;
+      }
+    }
+    feedInbound(raw) {
+      const events = [];
+      if (!isResponsesEventLike(raw)) {
+        throw new ResponsesProtocolError("Responses stream returned an event without a string type.");
+      }
+      if (this.terminal) return events;
+      switch (raw.type) {
+        case "response.created":
+        case "response.in_progress":
+        case "response.queued":
+          if (!this.started) {
+            this.started = true;
+            events.push({ type: "start", partial: this.output });
+          }
+          break;
+        case "response.output_item.added":
+          events.push(...this.onOutputItemAdded(raw));
+          break;
+        case "response.output_item.done":
+          events.push(...this.onOutputItemDone(raw));
+          break;
+        case "response.content_part.added":
+          events.push(...this.onContentPartAdded(raw));
+          break;
+        case "response.content_part.done":
+          break;
+        case "response.output_text.delta":
+          events.push(...this.appendTextDelta(raw, "text"));
+          break;
+        case "response.output_text.done":
+          this.validateTextDone(raw);
+          break;
+        case "response.refusal.delta":
+          events.push(...this.appendTextDelta(raw, "refusal"));
+          break;
+        case "response.refusal.done":
+          break;
+        case "response.reasoning_summary_text.delta":
+        case "response.reasoning_text.delta":
+          events.push(...this.appendReasoningDelta(raw));
+          break;
+        case "response.reasoning_summary_text.done":
+        case "response.reasoning_text.done":
+          break;
+        case "response.reasoning_summary_part.added":
+        case "response.reasoning_summary_part.done":
+          break;
+        case "response.function_call_arguments.delta":
+          events.push(...this.appendFunctionCallArgsDelta(raw));
+          break;
+        case "response.function_call_arguments.done":
+          this.onFunctionCallArgsDone(raw);
+          break;
+        case "response.completed":
+          events.push(...this.onTerminal(raw, "response.completed"));
+          break;
+        case "response.incomplete":
+          events.push(...this.onIncomplete(raw));
+          break;
+        case "response.failed":
+          events.push(...this.onTerminal(raw, "response.failed", "error", this.failedText(raw)));
+          break;
+        case "error":
+          events.push(...this.onTerminal(raw, "error", "error", formatResponsesErrorEvent(raw)));
+          break;
+        default:
+          this.diagnostics.unknownEventTypes.add(raw.type);
+          break;
+      }
+      return events;
+    }
+    /** Stream ended without a terminal event. Caller decides how to fail. */
+    finishWithoutTerminal() {
+      return new ResponsesProtocolError(
+        `Responses stream ended without a terminal event (${this.diagnostics.terminalType ?? "none"} seen).`
+      );
+    }
+    // ─── item lifecycle ─────────────────────────────────────────────────────
+    ensureStarted() {
+      if (this.started) return [];
+      this.started = true;
+      return [{ type: "start", partial: this.output }];
+    }
+    requireItemIndex(raw) {
+      const index = raw.output_index;
+      if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
+        throw new ResponsesProtocolError(`Responses event "${raw.type}" is missing a valid output_index.`);
+      }
+      return index;
+    }
+    onOutputItemAdded(raw) {
+      const outputIndex = this.requireItemIndex(raw);
+      const item = raw.item;
+      if (!isRecord(item)) {
+        throw new ResponsesProtocolError(`response.output_item.added at index ${outputIndex} is missing the item.`);
+      }
+      if (this.items.has(outputIndex)) {
+        throw new ResponsesProtocolError(`Responses stream reused output_index ${outputIndex}.`);
+      }
+      const itemId = typeof item.id === "string" ? item.id : "";
+      if (item.type === "message") {
+        this.items.set(outputIndex, { kind: "message", itemId, blocks: /* @__PURE__ */ new Map() });
+        return this.ensureStarted();
+      }
+      if (item.type === "reasoning") {
+        const block = { type: "thinking", thinking: "" };
+        this.output.content.push(block);
+        this.items.set(outputIndex, { kind: "reasoning", itemId, block, lastSummaryIndex: null });
+        const startEvents = this.ensureStarted();
+        return [
+          ...startEvents,
+          { type: "thinking_start", contentIndex: this.output.content.length - 1, partial: this.output }
+        ];
+      }
+      if (item.type === "function_call") {
+        const callId = typeof item.call_id === "string" ? item.call_id : "";
+        if (!callId) {
+          throw new ResponsesProtocolError(`function_call output item at index ${outputIndex} is missing call_id.`);
+        }
+        const name = typeof item.name === "string" ? item.name : "";
+        if (!name || !itemId) throw new ResponsesProtocolError("function_call requires name and item id.");
+        const block = { type: "toolCall", id: callId, name, arguments: {} };
+        this.output.content.push(block);
+        const state = {
+          kind: "function_call",
+          itemId,
+          block,
+          partialArgs: "",
+          finalArgs: null,
+          completed: false,
+          contentIndex: this.output.content.length - 1
+        };
+        this.items.set(outputIndex, state);
+        this.toolCallStates.push(state);
+        const startEvents = this.ensureStarted();
+        return [
+          ...startEvents,
+          { type: "toolcall_start", contentIndex: state.contentIndex, partial: this.output }
+        ];
+      }
+      this.items.set(outputIndex, { kind: "ignored", itemType: String(item.type) });
+      this.diagnostics.ignoredItemTypes.add(String(item.type));
+      return [];
+    }
+    lookupItem(raw, kinds, label) {
+      const outputIndex = this.requireItemIndex(raw);
+      let state = this.items.get(outputIndex);
+      if (!state || !kinds.includes(state.kind)) {
+        throw new ResponsesProtocolError(
+          `Responses event "${raw.type ?? label}" references ${label} output_index ${outputIndex} that was never added (or is of the wrong item type).`
+        );
+      }
+      if (state.kind !== "ignored" && raw.item_id !== void 0 && raw.item_id !== state.itemId) throw new ResponsesProtocolError("Response item identity changed.");
+      return { state, outputIndex };
+    }
+    onContentPartAdded(raw) {
+      const part = raw.part;
+      const partType = isRecord(part) ? part.type : void 0;
+      const kind = partType === "reasoning_text" ? "reasoning" : "message";
+      const { state } = this.lookupItem(raw, [kind], kind);
+      const partIndex = raw.content_index;
+      if (typeof partIndex !== "number" || !Number.isInteger(partIndex) || partIndex < 0) {
+        throw new ResponsesProtocolError("response.content_part.added is missing a valid content_index.");
+      }
+      if (state.kind !== "message") return [];
+      if (state.blocks.has(partIndex)) {
+        throw new ResponsesProtocolError(`Responses stream reused content_index ${partIndex} on one message item.`);
+      }
+      if (partType !== "output_text" && partType !== "refusal") {
+        return [];
+      }
+      const block = { type: "text", text: "" };
+      this.output.content.push(block);
+      state.blocks.set(partIndex, { block, contentIndex: this.output.content.length - 1 });
+      return [{ type: "text_start", contentIndex: this.output.content.length - 1, partial: this.output }];
+    }
+    messageBlockFor(raw) {
+      const { state } = this.lookupItem(raw, ["message"], "message");
+      if (state.kind !== "message") throw new ResponsesProtocolError("internal: expected message item");
+      const partIndex = raw.content_index;
+      if (typeof partIndex !== "number" || !Number.isInteger(partIndex) || partIndex < 0) {
+        throw new ResponsesProtocolError(`Responses event "${raw.type}" is missing a valid content_index.`);
+      }
+      const entry = state.blocks.get(partIndex);
+      if (!entry) {
+        throw new ResponsesProtocolError(
+          `Responses event "${raw.type}" references content_index ${partIndex} that was never added.`
+        );
+      }
+      return entry;
+    }
+    appendTextDelta(raw, kind) {
+      const delta = raw.delta;
+      if (typeof delta !== "string" || delta.length === 0) return [];
+      const entry = this.messageBlockFor(raw);
+      entry.block.text += delta;
+      return [{ type: "text_delta", contentIndex: entry.contentIndex, delta, partial: this.output }];
+    }
+    validateTextDone(raw) {
+      this.messageBlockFor(raw);
+    }
+    appendReasoningDelta(raw) {
+      const delta = raw.delta;
+      if (typeof delta !== "string" || delta.length === 0) return [];
+      const { state } = this.lookupItem(raw, ["reasoning"], "reasoning");
+      if (state.kind !== "reasoning") return [];
+      let text = delta;
+      const summaryIndex = raw.summary_index;
+      if (typeof summaryIndex === "number" && Number.isInteger(summaryIndex)) {
+        if (state.lastSummaryIndex !== null && summaryIndex !== state.lastSummaryIndex) {
+          text = `
+
+${delta}`;
+        }
+        state.lastSummaryIndex = summaryIndex;
+      }
+      state.block.thinking += text;
+      return [{ type: "thinking_delta", contentIndex: this.output.content.indexOf(state.block), delta: text, partial: this.output }];
+    }
+    appendFunctionCallArgsDelta(raw) {
+      const delta = raw.delta ?? raw.arguments;
+      if (typeof delta !== "string" || delta.length === 0) return [];
+      const { state } = this.lookupItem(raw, ["function_call"], "function_call");
+      if (state.kind !== "function_call") return [];
+      state.partialArgs += delta;
+      state.block.arguments = parseStreamingJson(state.partialArgs);
+      return [{ type: "toolcall_delta", contentIndex: state.contentIndex, delta, partial: this.output }];
+    }
+    onFunctionCallArgsDone(raw) {
+      const { state } = this.lookupItem(raw, ["function_call"], "function_call");
+      if (state.kind !== "function_call") return;
+      if (typeof raw.arguments === "string") {
+        state.finalArgs = raw.arguments;
+      }
+    }
+    onOutputItemDone(raw) {
+      const outputIndex = this.requireItemIndex(raw);
+      const item = raw.item;
+      if (!isRecord(item)) {
+        throw new ResponsesProtocolError(`response.output_item.done at index ${outputIndex} is missing the item.`);
+      }
+      const state = this.items.get(outputIndex);
+      if (!state) {
+        throw new ResponsesProtocolError(`response.output_item.done references output_index ${outputIndex} that was never added.`);
+      }
+      if (state.kind !== "ignored" && (item.id !== state.itemId || item.type !== state.kind)) throw new ResponsesProtocolError("Response done item identity changed.");
+      switch (state.kind) {
+        case "message": {
+          const events = [];
+          for (const { block, contentIndex } of state.blocks.values()) {
+            events.push({ type: "text_end", contentIndex, content: block.text, partial: this.output });
+          }
+          return events;
+        }
+        case "reasoning": {
+          const events = [];
+          const encrypted = typeof item.encrypted_content === "string" ? item.encrypted_content : null;
+          const itemId = typeof item.id === "string" && item.id.length > 0 ? item.id : state.itemId;
+          if (itemId) {
+            state.block.thinkingSignature = JSON.stringify({ v: 1, id: itemId, encrypted_content: encrypted });
+          }
+          events.push({
+            type: "thinking_end",
+            contentIndex: this.output.content.indexOf(state.block),
+            content: state.block.thinking,
+            partial: this.output
+          });
+          return events;
+        }
+        case "function_call": {
+          const finalText = typeof item.arguments === "string" && item.arguments.length > 0 ? item.arguments : state.finalArgs ?? state.partialArgs;
+          if (typeof item.call_id === "string" && item.call_id.length > 0 && item.call_id !== state.block.id) {
+            throw new ResponsesProtocolError(`function_call item changed call_id from "${state.block.id}" to "${item.call_id}".`);
+          }
+          if (typeof item.name === "string" && item.name.length > 0 && item.name !== state.block.name) {
+            throw new ResponsesProtocolError(`function_call item changed name from "${state.block.name}" to "${item.name}".`);
+          }
+          state.completed = true;
+          state.finalArgs = finalText;
+          if (this.canParseArgs(state)) {
+            return this.finalizeFunctionCall(state, finalText);
+          }
+          return [];
+        }
+        case "ignored":
+          return [];
+      }
+    }
+    finalizeFunctionCall(state, argsText) {
+      const text = argsText.trim();
+      let parsed;
+      if (text.length === 0) {
+        parsed = {};
+      } else {
+        try {
+          const value = JSON.parse(text);
+          if (!isRecord(value)) {
+            throw new ResponsesProtocolError(`function_call "${state.block.name || "unknown"}" arguments are not a JSON object.`);
+          }
+          parsed = value;
+        } catch (error) {
+          if (error instanceof ResponsesProtocolError) throw error;
+          const message = error instanceof Error ? error.message : String(error);
+          throw new ResponsesProtocolError(
+            `function_call "${state.block.name || "unknown"}" returned incomplete or invalid JSON arguments: ${message}`
+          );
+        }
+      }
+      state.block.arguments = parsed;
+      return [{ type: "toolcall_end", contentIndex: state.contentIndex, toolCall: state.block, partial: this.output }];
+    }
+    // ─── terminals ──────────────────────────────────────────────────────────
+    requireTerminalResponse(raw) {
+      const response = raw.response;
+      const expected = raw.type.slice("response.".length);
+      if (!isRecord(response) || typeof response.id !== "string" || !response.id || response.status !== expected) {
+        throw new ResponsesProtocolError(`Malformed ${raw.type}: requires response id and status ${expected}.`);
+      }
+      return response;
+    }
+    onTerminal(raw, type, reason = "stop", errorText) {
+      this.diagnostics.terminalType = type;
+      const response = type === "error" ? void 0 : this.requireTerminalResponse(raw);
+      this.terminal = { reason, response, errorText };
+      return this.closeResponse(type);
+    }
+    onIncomplete(raw) {
+      this.diagnostics.terminalType = "response.incomplete";
+      const response = this.requireTerminalResponse(raw);
+      const reason = response?.incomplete_details?.reason;
+      if (reason === "content_filter" || reason === "steered" || reason === void 0) {
+        this.terminal = {
+          reason: "error",
+          response,
+          errorText: reason === "steered" ? "Response ended incomplete with reason 'steered' but no steering was sent." : `Response ended incomplete${reason ? ` (${reason})` : " without a reason"}.`
+        };
+        return this.closeResponse("response.incomplete");
+      }
+      this.terminal = { reason: "length", response };
+      return this.closeResponse("response.incomplete");
+    }
+    failedText(raw) {
+      const response = isRecord(raw.response) ? raw.response : void 0;
+      const error = isRecord(response?.error) ? response?.error : void 0;
+      const message = typeof error?.message === "string" && error.message.length > 0 ? error.message : "Response failed";
+      const code = typeof error?.code === "string" && error.code.length > 0 ? ` (code=${error.code})` : "";
+      return `${message}${code}`;
+    }
+    /** Apply terminal semantics and produce the final event. */
+    closeResponse(terminalType) {
+      const terminal = this.terminal;
+      const response = terminal.response;
+      if (response && isRecord(response.usage)) {
+        this.output.usage = normalizeResponsesUsage(this.model, response.usage);
+        this.output.usageReported = [response.usage.input_tokens, response.usage.output_tokens].every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0);
+      }
+      if (terminal.reason === "error") {
+        this.output.stopReason = "error";
+        this.output.errorMessage = terminal.errorText ?? "Response failed";
+        return [{ type: "error", reason: "error", error: this.output }];
+      }
+      let stopReason = terminal.reason === "length" ? "length" : "stop";
+      if (this.toolCallStates.length > 0) {
+        stopReason = "toolUse";
+      }
+      if (terminal.reason === "length") {
+        const truncated = this.toolCallStates.filter((state) => !state.completed || !this.canParseArgs(state));
+        if (truncated.length > 0) {
+          const dropped = new Set(truncated.map((state) => state.block));
+          this.output.content = this.output.content.filter(
+            (block) => block.type !== "toolCall" || !dropped.has(block)
+          );
+          this.toolCallStates = this.toolCallStates.filter((state) => !dropped.has(state.block));
+          this.output.content.push({
+            type: "text",
+            text: `[output truncated: max_output_tokens cut ${truncated.length === 1 ? "a tool call" : `${truncated.length} tool calls`} mid-arguments (${summarizeTruncatedCallNames(truncated.map((state) => state.block.name))}); the call${truncated.length === 1 ? " was" : "s were"} dropped. Re-issue the call or continue with fewer/smaller requests.]`
+          });
+          if (this.toolCallStates.length === 0) {
+            stopReason = "length";
+          }
+        }
+      } else if (terminal.reason === "stop") {
+        const brokenCalls = this.toolCallStates.filter((state) => !state.completed || !this.canParseArgs(state));
+        if (brokenCalls.length > 0) {
+          const first = brokenCalls[0];
+          this.output.stopReason = "error";
+          this.output.errorMessage = `function_call "${first.block.name || "unknown"}" returned incomplete or invalid JSON arguments on a completed response.`;
+          return [{ type: "error", reason: "error", error: this.output }];
+        }
+      }
+      if (stopReason === "toolUse" && this.toolCallStates.length === 0) {
+        stopReason = "stop";
+      }
+      this.output.stopReason = stopReason;
+      void terminalType;
+      return [{ type: "done", reason: stopReason, message: this.output }];
+    }
+    canParseArgs(state) {
+      const text = (state.finalArgs ?? state.partialArgs).trim();
+      if (text.length === 0) return false;
+      try {
+        return isRecord(JSON.parse(text));
+      } catch {
+        return false;
+      }
+    }
+  };
+  var TRUNCATED_NAME_LIST_LIMIT = 8;
+  var TRUNCATED_NAME_CLIP_BYTES = 48;
+  var TRUNCATED_NAME_SUMMARY_BUDGET_BYTES = 512;
+  function utf8Size(value) {
+    let bytes = 0;
+    for (const character of value) {
+      const point = character.codePointAt(0);
+      bytes += point <= 127 ? 1 : point <= 2047 ? 2 : point <= 65535 ? 3 : 4;
+    }
+    return bytes;
+  }
+  function clipUtf8(value, maxBytes) {
+    if (utf8Size(value) <= maxBytes) return { text: value, clipped: false };
+    const ellipsisBytes = utf8Size("\u2026");
+    let bytes = 0;
+    let cut = 0;
+    for (const character of value) {
+      const size = character.codePointAt(0) <= 127 ? 1 : character.codePointAt(0) <= 2047 ? 2 : character.codePointAt(0) <= 65535 ? 3 : 4;
+      if (bytes + size > maxBytes - ellipsisBytes) break;
+      bytes += size;
+      cut += character.length;
+    }
+    return { text: value.slice(0, cut) + "\u2026", clipped: true };
+  }
+  function summarizeTruncatedCallNames(names) {
+    const counts = /* @__PURE__ */ new Map();
+    let unnamed = 0;
+    for (const name of names) {
+      if (typeof name !== "string" || name.length === 0) {
+        unnamed += 1;
+        continue;
+      }
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    const render = (name, count) => {
+      const clipped = clipUtf8(name, TRUNCATED_NAME_CLIP_BYTES);
+      const shown = JSON.stringify(clipped.text);
+      return count === 1 ? shown : `${shown}\xD7${count}`;
+    };
+    const entries = [...counts.entries()].sort(([a], [b]) => a.localeCompare(b));
+    const parts = entries.length <= TRUNCATED_NAME_LIST_LIMIT ? entries.map(([name, count]) => render(name, count)) : [`${entries.length} distinct names`, `(${render(entries[0][0], entries[0][1])}, \u2026)`];
+    if (unnamed > 0) parts.push(`${unnamed} unnamed call${unnamed === 1 ? "" : "s"}`);
+    let summary2 = parts.join(", ");
+    if (utf8Size(summary2) > TRUNCATED_NAME_SUMMARY_BUDGET_BYTES) {
+      summary2 = `${entries.length} distinct names, ${unnamed} unnamed calls`;
+    }
+    return summary2;
+  }
+
+  // ../../packages/ai/src/providers/responses/sse-dump.ts
+  var CAPTURE_ENABLED_VALUES = /* @__PURE__ */ new Set(["1", "true", "yes", "on"]);
+  var MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
+  var DUMP_TTL_MS = 7 * 24 * 60 * 60 * 1e3;
+  var MAX_DUMP_FILES = 400;
+  var MAX_PRUNE_STAT = 200;
+  var MAX_PRUNE_UNLINK = 50;
+  function isSseDumpEnabled(env = readEnv()) {
+    try {
+      return CAPTURE_ENABLED_VALUES.has((env.PIE_DEBUG_SSE ?? "").trim().toLowerCase());
+    } catch {
+      return false;
+    }
+  }
+  function readEnv() {
+    const proc = globalThis.process;
+    return proc?.env ?? {};
+  }
+  var NullSseDumpSink = class {
+    record() {
+    }
+    async flush() {
+    }
+  };
+  var NULL_SSE_DUMP_SINK = new NullSseDumpSink();
+  var BoundedSseDumpSink = class {
+    constructor(directory, fileName, fs) {
+      this.directory = directory;
+      this.fileName = fileName;
+      this.fs = fs;
+    }
+    directory;
+    fileName;
+    fs;
+    lines = [];
+    bytes = 0;
+    truncated = false;
+    flushed = false;
+    record(event) {
+      if (this.flushed || this.truncated) return;
+      try {
+        const line = JSON.stringify(event) + "\n";
+        const size = utf8Length(line);
+        if (this.bytes + size > MAX_CAPTURE_BYTES) {
+          this.truncated = true;
+          return;
+        }
+        this.bytes += size;
+        this.lines.push(line);
+      } catch {
+        this.truncated = true;
+      }
+    }
+    async flush() {
+      if (this.flushed) return;
+      this.flushed = true;
+      try {
+        if (this.lines.length === 0) return;
+        await this.fs.mkdir(this.directory, { recursive: true });
+        await this.fs.writeFile(this.path(), this.header() + this.lines.join(""));
+        await this.pruneOld();
+      } catch {
+      }
+    }
+    path() {
+      return this.fs.join(this.directory, this.fileName);
+    }
+    header() {
+      const meta = JSON.stringify({
+        capturedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        truncated: this.truncated,
+        events: this.lines.length,
+        bytes: this.bytes
+      });
+      return `# ${meta}
+`;
+    }
+    async pruneOld() {
+      try {
+        const names = await this.fs.readdir(this.directory);
+        const eligible = names.filter((name) => name.endsWith(".ndjson"));
+        if (eligible.length <= MAX_DUMP_FILES && eligible.length === 0) return;
+        const sample = eligible.slice(0, MAX_PRUNE_STAT);
+        const dated = [];
+        for (const name of sample) {
+          try {
+            const stat = await this.fs.stat(this.fs.join(this.directory, name));
+            dated.push({ name, mtimeMs: stat.mtime.getTime() });
+          } catch {
+          }
+        }
+        dated.sort((a, b) => a.mtimeMs - b.mtimeMs);
+        const expired = dated.filter((entry) => Date.now() - entry.mtimeMs > DUMP_TTL_MS);
+        const excessCount = Math.max(0, eligible.length - MAX_DUMP_FILES);
+        const excess = excessCount > 0 ? dated.slice(0, Math.min(excessCount, dated.length)) : [];
+        let removed = 0;
+        for (const entry of /* @__PURE__ */ new Set([...expired, ...excess])) {
+          if (removed >= MAX_PRUNE_UNLINK) break;
+          try {
+            await this.fs.unlink(this.fs.join(this.directory, entry.name));
+            removed += 1;
+          } catch {
+          }
+        }
+      } catch {
+      }
+    }
+  };
+  function openSseDumpSink(requestId, modelLabel3) {
+    try {
+      if (!isSseDumpEnabled()) return NULL_SSE_DUMP_SINK;
+      let fs;
+      try {
+        fs = getFileSystem();
+      } catch {
+        return NULL_SSE_DUMP_SINK;
+      }
+      if (!fs || typeof fs.writeFile !== "function") return NULL_SSE_DUMP_SINK;
+      const dir = sseDumpDirectory();
+      if (!dir) return NULL_SSE_DUMP_SINK;
+      const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:.]/g, "-");
+      return new BoundedSseDumpSink(dir, `${stamp}__${sanitize(modelLabel3)}__${sanitize(requestId)}.ndjson`, fs);
+    } catch {
+      return NULL_SSE_DUMP_SINK;
+    }
+  }
+  function sanitize(token) {
+    const cleaned = token.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 80);
+    return cleaned || "unknown";
+  }
+  function sseDumpDirectory() {
+    const env = readEnv();
+    const custom = env.PIE_DEBUG_SSE_DIR;
+    if (custom && custom.trim()) {
+      return custom.trim();
+    }
+    const proc = globalThis.process;
+    const home = proc?.env?.HOME;
+    if (!home) return void 0;
+    return `${home}/.pie/logs/sse-dump`;
+  }
+  function utf8Length(value) {
+    let bytes = 0;
+    for (const character of value) {
+      const point = character.codePointAt(0);
+      bytes += point <= 127 ? 1 : point <= 2047 ? 2 : point <= 65535 ? 3 : 4;
+    }
+    return bytes;
+  }
+
+  // ../../packages/ai/src/providers/responses/responses-diagnostics.ts
+  function reportSubmission(options, body, details) {
+    if (!options?.onTransportDiagnostic) return;
+    let requestBytes = 0;
+    for (const character of body) {
+      const point = character.codePointAt(0);
+      requestBytes += point <= 127 ? 1 : point <= 2047 ? 2 : point <= 65535 ? 3 : 4;
+    }
+    try {
+      options.onTransportDiagnostic({ ...details, requestBytes });
+    } catch {
+    }
+  }
+  function reportLifecycle(options, event) {
+    if (!options?.onTransportLifecycle) return;
+    try {
+      options.onTransportLifecycle({ ...event });
+    } catch {
+    }
+  }
+  var localRequestCounter = 0;
+  function nextLocalRequestId(prefix = "req") {
+    localRequestCounter += 1;
+    return `${prefix}-${localRequestCounter}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+  function timeoutSuffix(budgetMs, lagMs) {
+    const budget = budgetMs && budgetMs > 0 ? ` (budget ${Math.round(budgetMs / 1e3)}s)` : "";
+    if (lagMs > 1e3) {
+      return `${budget} \u2014 timer fired ${Math.round(lagMs / 1e3)}s late (system sleep or suspended process)`;
+    }
+    return budget;
+  }
+  function monotonicNow() {
+    const perf = globalThis.performance;
+    return typeof perf?.now === "function" ? perf.now() : Date.now();
+  }
+
   // ../../packages/ai/src/providers/openai-compat.ts
   var DEFAULT_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS = 2 * 60 * 1e3;
   var DEFAULT_OPENAI_COMPAT_FIRST_BYTE_TIMEOUT_MS = 3 * 60 * 1e3;
@@ -7986,7 +8804,7 @@ var _PieAgent = (() => {
     }
     return metadata.length > 0 ? `${message} (${metadata.join(", ")})` : message;
   }
-  function isRecord(value) {
+  function isRecord2(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
   }
   function createProtocolError(message) {
@@ -8009,7 +8827,7 @@ var _PieAgent = (() => {
       const message = error instanceof Error ? error.message : String(error);
       throw createProtocolError(`OpenAI-compatible stream returned incomplete or invalid JSON arguments for tool "${toolName || "unknown"}": ${message}`);
     }
-    if (!isRecord(parsed)) {
+    if (!isRecord2(parsed)) {
       throw createProtocolError(`OpenAI-compatible stream returned non-object JSON arguments for tool "${toolName || "unknown"}".`);
     }
     return parsed;
@@ -8019,7 +8837,7 @@ var _PieAgent = (() => {
     if (!text) return null;
     try {
       const parsed = JSON.parse(text);
-      return isRecord(parsed) ? parsed : null;
+      return isRecord2(parsed) ? parsed : null;
     } catch {
       return null;
     }
@@ -8028,6 +8846,7 @@ var _PieAgent = (() => {
     if ((options?.transport ?? model.transport) === "websocket") throw new Error(`API ${model.api} does not support WebSocket transport.`);
     const stream = new AssistantMessageEventStream();
     (async () => {
+      const sseDump = openSseDumpSink(`compat-${nextLocalRequestId("compat")}`, `${model.provider}/${model.id}`);
       const output = {
         role: "assistant",
         content: [],
@@ -8209,6 +9028,7 @@ var _PieAgent = (() => {
               const message = error instanceof Error ? error.message : String(error);
               throw createProtocolError(`OpenAI-compatible stream returned malformed SSE JSON: ${message}`);
             }
+            sseDump.record(chunk);
             if (chunk?.error) {
               throw new Error(formatOpenAIStreamError(chunk.error));
             }
@@ -8358,10 +9178,9 @@ var _PieAgent = (() => {
             output.content = output.content.filter(
               (block) => block.type !== "toolCall" || !truncatedBlocks.has(block)
             );
-            const dropped = truncatedEntries.map((entry) => entry.block.name || "unnamed").sort().map((name) => `"${name}"`).join(", ");
             output.content.push({
               type: "text",
-              text: `[output truncated: finish_reason=length cut ${truncatedEntries.length === 1 ? "a tool call" : `${truncatedEntries.length} tool calls`} mid-arguments (${dropped}); the call${truncatedEntries.length === 1 ? " was" : "s were"} dropped. Re-issue the call or continue with fewer/smaller requests.]`
+              text: `[output truncated: finish_reason=length cut ${truncatedEntries.length === 1 ? "a tool call" : `${truncatedEntries.length} tool calls`} mid-arguments (${summarizeTruncatedCallNames(truncatedEntries.map((entry) => entry.block.name))}); the call${truncatedEntries.length === 1 ? " was" : "s were"} dropped. Re-issue the call or continue with fewer/smaller requests.]`
             });
           }
         }
@@ -8448,6 +9267,8 @@ ${entry.partialArgs}`;
         output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
         stream.push({ type: "error", reason: output.stopReason, error: output });
         stream.end();
+      } finally {
+        await sseDump.flush();
       }
     })();
     return stream;
@@ -11627,7 +12448,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
   };
 
   // ../../node_modules/@anthropic-ai/sdk/internal/utils/env.mjs
-  var readEnv = (env) => {
+  var readEnv2 = (env) => {
     if (typeof globalThis.process !== "undefined") {
       return globalThis.process.env?.[env]?.trim() ?? void 0;
     }
@@ -11655,7 +12476,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
      * @param {Record<string, string | undefined>} opts.defaultQuery - Default query parameters to include with every request to the API.
      * @param {boolean} [opts.dangerouslyAllowBrowser=false] - By default, client-side use of this library is not allowed, as it risks exposing your secret API credentials to attackers.
      */
-    constructor({ baseURL = readEnv("ANTHROPIC_BASE_URL"), apiKey = readEnv("ANTHROPIC_API_KEY") ?? null, authToken = readEnv("ANTHROPIC_AUTH_TOKEN") ?? null, ...opts } = {}) {
+    constructor({ baseURL = readEnv2("ANTHROPIC_BASE_URL"), apiKey = readEnv2("ANTHROPIC_API_KEY") ?? null, authToken = readEnv2("ANTHROPIC_AUTH_TOKEN") ?? null, ...opts } = {}) {
       _BaseAnthropic_encoder.set(this, void 0);
       const options = {
         apiKey,
@@ -11671,7 +12492,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
       this.logger = options.logger ?? console;
       const defaultLogLevel = "warn";
       this.logLevel = defaultLogLevel;
-      this.logLevel = parseLogLevel(options.logLevel, "ClientOptions.logLevel", this) ?? parseLogLevel(readEnv("ANTHROPIC_LOG"), "process.env['ANTHROPIC_LOG']", this) ?? defaultLogLevel;
+      this.logLevel = parseLogLevel(options.logLevel, "ClientOptions.logLevel", this) ?? parseLogLevel(readEnv2("ANTHROPIC_LOG"), "process.env['ANTHROPIC_LOG']", this) ?? defaultLogLevel;
       this.fetchOptions = options.fetchOptions;
       this.maxRetries = options.maxRetries ?? 2;
       this.fetch = options.fetch ?? getDefaultFetch();
@@ -12570,37 +13391,6 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
     };
   }
 
-  // ../../packages/ai/src/providers/responses/responses-wire.ts
-  var RESPONSES_PROTOCOL_ERROR_CODE = "responses_protocol_error";
-  var ResponsesProtocolError = class extends Error {
-    code = RESPONSES_PROTOCOL_ERROR_CODE;
-    constructor(message) {
-      super(`${RESPONSES_PROTOCOL_ERROR_CODE}: ${message}`);
-      this.name = "ResponsesProtocolError";
-    }
-  };
-  function isRecord2(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
-  }
-  function isResponsesEventLike(value) {
-    return isRecord2(value) && typeof value.type === "string";
-  }
-  function formatResponsesErrorEvent(event) {
-    const source = isRecord2(event.error) ? event.error : event;
-    const message = typeof source.message === "string" && source.message.length > 0 ? source.message : "Responses stream returned an error";
-    const metadata = [];
-    if (typeof source.code === "string" && source.code.length > 0) {
-      metadata.push(`code=${source.code}`);
-    }
-    if (typeof source.param === "string" && source.param.length > 0) {
-      metadata.push(`param=${source.param}`);
-    }
-    if (typeof event.status === "number") {
-      metadata.push(`status=${event.status}`);
-    }
-    return metadata.length > 0 ? `${message} (${metadata.join(", ")})` : message;
-  }
-
   // ../../packages/ai/src/providers/responses/responses-request.ts
   var MAX_REASONING_ENVELOPE_BYTES = 512 * 1024;
   function decodeReasoningEnvelope(signature) {
@@ -12613,7 +13403,7 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
     } catch {
       return null;
     }
-    if (!isRecord2(parsed) || parsed.v !== 1 || typeof parsed.id !== "string" || parsed.id.length === 0) {
+    if (!isRecord(parsed) || parsed.v !== 1 || typeof parsed.id !== "string" || parsed.id.length === 0) {
       return null;
     }
     const encrypted = parsed.encrypted_content;
@@ -12784,596 +13574,6 @@ Please migrate to a newer model. Visit https://docs.anthropic.com/en/docs/resour
     return { type: "response.create", ...params };
   }
 
-  // ../../packages/ai/src/providers/responses/responses-remote-failure.ts
-  var MAX_TEXT = 4096;
-  var transientCodes = /* @__PURE__ */ new Set(["server_error", "rate_limit_exceeded", "slow_down", "rate_limit_error", "server_is_overloaded", "service_unavailable_error"]);
-  function responsesRemoteFailure(value, status, headers) {
-    const root = isRecord2(value) ? value : {};
-    const response = isRecord2(root.response) ? root.response : {};
-    const error = isRecord2(root.error) ? root.error : isRecord2(response.error) ? response.error : root;
-    const code = typeof error.code === "string" ? error.code.slice(0, 128).toLowerCase() : "";
-    const type = typeof error.type === "string" ? error.type.slice(0, 128).toLowerCase() : "";
-    const message = (typeof value === "string" ? value : typeof error.message === "string" ? error.message : "").slice(0, MAX_TEXT).toLowerCase();
-    const httpStatus = status ?? root.status ?? root.statusCode;
-    const fields = `${code} ${type}`;
-    let category = "other";
-    if (/context_length_exceeded|context_window_exceeded|context_overflow/.test(fields) || /context (?:length|window).{0,60}(?:exceed|too (?:long|large))|maximum context length|exceeds.{0,30}context window/.test(message)) category = "context_overflow";
-    else if (/billing|insufficient_quota|insufficient_balance|credit|usage_limit|spend_limit/.test(fields) || /billing|(?:account|monthly) quota|exceeded your current quota|insufficient (?:credit|balance)|credit balance|spend(?:ing)? limit/.test(message)) category = "other";
-    else if (typeof httpStatus === "number" && httpStatus >= 400 && httpStatus < 500 && httpStatus !== 429) category = "other";
-    else if (httpStatus === 429 || typeof httpStatus === "number" && httpStatus >= 500 && httpStatus <= 599 || transientCodes.has(code) || transientCodes.has(type) || /server (?:is )?overloaded|temporarily unavailable|internal server error|rate limit (?:exceeded|reached)/.test(message)) category = "transient";
-    const retryAfterMs = parseRetryAfter(headers ?? root.headers);
-    return { category, ...retryAfterMs !== void 0 ? { retryAfterMs } : {} };
-  }
-  function parseRetryAfter(headers) {
-    if (!headers || typeof headers !== "object") return void 0;
-    let raw;
-    if ("get" in headers && typeof headers.get === "function") raw = headers.get("retry-after");
-    else for (const [key, value] of Object.entries(headers)) if (key.toLowerCase() === "retry-after") raw = value;
-    if (typeof raw !== "string" || raw.length > 128) return void 0;
-    const text = raw.trim();
-    if (/^\d+(?:\.\d+)?$/.test(text)) {
-      const delay = Number(text) * 1e3;
-      return Number.isFinite(delay) ? delay : Number.MAX_VALUE;
-    }
-    if (!/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(text)) return void 0;
-    const date = Date.parse(text);
-    if (!Number.isFinite(date) || new Date(date).toUTCString() !== text) return void 0;
-    return Math.max(0, date - Date.now());
-  }
-  async function readResponsesErrorBody(read, signal) {
-    let timer;
-    let onAbort;
-    try {
-      return await Promise.race([
-        Promise.resolve().then(read).then((text) => text.slice(0, MAX_TEXT)).catch(() => ""),
-        new Promise((resolve2) => {
-          onAbort = () => resolve2("");
-          if (signal.aborted) resolve2("");
-          else signal.addEventListener("abort", onAbort, { once: true });
-          timer = setTimeout(() => resolve2(""), 250);
-        })
-      ]);
-    } finally {
-      if (timer !== void 0) clearTimeout(timer);
-      if (onAbort) signal.removeEventListener("abort", onAbort);
-    }
-  }
-  function parseResponsesErrorBody(text) {
-    try {
-      return JSON.parse(text);
-    } catch {
-      return text;
-    }
-  }
-
-  // ../../packages/ai/src/providers/responses/responses-usage.ts
-  function tokenCount(value) {
-    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return void 0;
-    return Math.floor(value);
-  }
-  function normalizeResponsesUsage(model, usage) {
-    const inputTokens = tokenCount(usage?.input_tokens);
-    const cachedTokens = tokenCount(usage?.input_tokens_details?.cached_tokens) ?? 0;
-    const cacheWriteTokens = tokenCount(usage?.input_tokens_details?.cache_write_tokens) ?? 0;
-    const outputTokens = tokenCount(usage?.output_tokens);
-    const reasoningTokens = tokenCount(usage?.output_tokens_details?.reasoning_tokens);
-    const totalTokens = tokenCount(usage?.total_tokens);
-    const input = inputTokens ?? (totalTokens !== void 0 && outputTokens !== void 0 ? Math.max(cachedTokens + cacheWriteTokens, totalTokens - outputTokens) : cachedTokens + cacheWriteTokens);
-    const output = outputTokens ?? (totalTokens !== void 0 ? Math.max(reasoningTokens ?? 0, totalTokens - input) : reasoningTokens ?? 0);
-    const cacheRead = Math.min(cachedTokens, input);
-    const cacheWrite = Math.min(cacheWriteTokens, input - cacheRead);
-    const inputExclusive = input - cacheRead - cacheWrite;
-    const partitionTotal = input + output;
-    const base = {
-      input: inputExclusive,
-      output,
-      cacheRead,
-      cacheWrite,
-      totalTokens: Math.max(totalTokens ?? 0, partitionTotal)
-    };
-    return { ...base, cost: calculateCost(model, base) };
-  }
-
-  // ../../packages/ai/src/providers/responses/responses-events.ts
-  var ResponsesEventReducer = class {
-    output;
-    model;
-    started = false;
-    terminal = null;
-    items = /* @__PURE__ */ new Map();
-    toolCallStates = [];
-    diagnostics = { unknownEventTypes: /* @__PURE__ */ new Set(), ignoredItemTypes: /* @__PURE__ */ new Set(), terminalType: null };
-    constructor(model) {
-      this.model = model;
-      this.output = {
-        role: "assistant",
-        content: [],
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usageReported: false,
-        usage: {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
-        },
-        stopReason: "stop",
-        timestamp: Date.now()
-      };
-    }
-    get message() {
-      return this.output;
-    }
-    get isTerminal() {
-      return this.terminal !== null;
-    }
-    /** Terminal response object (present on completed/incomplete/failed). */
-    get terminalResponse() {
-      return this.terminal?.response;
-    }
-    /** Feed one raw wire event; returns the AssistantMessageEvents to emit. */
-    feed(raw) {
-      if (this.terminal) return [];
-      try {
-        const events = this.feedInbound(raw);
-        if (this.isTerminal && this.output.stopReason === "error") {
-          this.output.remoteFailure = responsesRemoteFailure(raw);
-        }
-        return events;
-      } catch (error) {
-        this.terminal = null;
-        throw error;
-      }
-    }
-    feedInbound(raw) {
-      const events = [];
-      if (!isResponsesEventLike(raw)) {
-        throw new ResponsesProtocolError("Responses stream returned an event without a string type.");
-      }
-      if (this.terminal) return events;
-      switch (raw.type) {
-        case "response.created":
-        case "response.in_progress":
-        case "response.queued":
-          if (!this.started) {
-            this.started = true;
-            events.push({ type: "start", partial: this.output });
-          }
-          break;
-        case "response.output_item.added":
-          events.push(...this.onOutputItemAdded(raw));
-          break;
-        case "response.output_item.done":
-          events.push(...this.onOutputItemDone(raw));
-          break;
-        case "response.content_part.added":
-          events.push(...this.onContentPartAdded(raw));
-          break;
-        case "response.content_part.done":
-          break;
-        case "response.output_text.delta":
-          events.push(...this.appendTextDelta(raw, "text"));
-          break;
-        case "response.output_text.done":
-          this.validateTextDone(raw);
-          break;
-        case "response.refusal.delta":
-          events.push(...this.appendTextDelta(raw, "refusal"));
-          break;
-        case "response.refusal.done":
-          break;
-        case "response.reasoning_summary_text.delta":
-        case "response.reasoning_text.delta":
-          events.push(...this.appendReasoningDelta(raw));
-          break;
-        case "response.reasoning_summary_text.done":
-        case "response.reasoning_text.done":
-          break;
-        case "response.reasoning_summary_part.added":
-        case "response.reasoning_summary_part.done":
-          break;
-        case "response.function_call_arguments.delta":
-          events.push(...this.appendFunctionCallArgsDelta(raw));
-          break;
-        case "response.function_call_arguments.done":
-          this.onFunctionCallArgsDone(raw);
-          break;
-        case "response.completed":
-          events.push(...this.onTerminal(raw, "response.completed"));
-          break;
-        case "response.incomplete":
-          events.push(...this.onIncomplete(raw));
-          break;
-        case "response.failed":
-          events.push(...this.onTerminal(raw, "response.failed", "error", this.failedText(raw)));
-          break;
-        case "error":
-          events.push(...this.onTerminal(raw, "error", "error", formatResponsesErrorEvent(raw)));
-          break;
-        default:
-          this.diagnostics.unknownEventTypes.add(raw.type);
-          break;
-      }
-      return events;
-    }
-    /** Stream ended without a terminal event. Caller decides how to fail. */
-    finishWithoutTerminal() {
-      return new ResponsesProtocolError(
-        `Responses stream ended without a terminal event (${this.diagnostics.terminalType ?? "none"} seen).`
-      );
-    }
-    // ─── item lifecycle ─────────────────────────────────────────────────────
-    ensureStarted() {
-      if (this.started) return [];
-      this.started = true;
-      return [{ type: "start", partial: this.output }];
-    }
-    requireItemIndex(raw) {
-      const index = raw.output_index;
-      if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
-        throw new ResponsesProtocolError(`Responses event "${raw.type}" is missing a valid output_index.`);
-      }
-      return index;
-    }
-    onOutputItemAdded(raw) {
-      const outputIndex = this.requireItemIndex(raw);
-      const item = raw.item;
-      if (!isRecord2(item)) {
-        throw new ResponsesProtocolError(`response.output_item.added at index ${outputIndex} is missing the item.`);
-      }
-      if (this.items.has(outputIndex)) {
-        throw new ResponsesProtocolError(`Responses stream reused output_index ${outputIndex}.`);
-      }
-      const itemId = typeof item.id === "string" ? item.id : "";
-      if (item.type === "message") {
-        this.items.set(outputIndex, { kind: "message", itemId, blocks: /* @__PURE__ */ new Map() });
-        return this.ensureStarted();
-      }
-      if (item.type === "reasoning") {
-        const block = { type: "thinking", thinking: "" };
-        this.output.content.push(block);
-        this.items.set(outputIndex, { kind: "reasoning", itemId, block, lastSummaryIndex: null });
-        const startEvents = this.ensureStarted();
-        return [
-          ...startEvents,
-          { type: "thinking_start", contentIndex: this.output.content.length - 1, partial: this.output }
-        ];
-      }
-      if (item.type === "function_call") {
-        const callId = typeof item.call_id === "string" ? item.call_id : "";
-        if (!callId) {
-          throw new ResponsesProtocolError(`function_call output item at index ${outputIndex} is missing call_id.`);
-        }
-        const name = typeof item.name === "string" ? item.name : "";
-        if (!name || !itemId) throw new ResponsesProtocolError("function_call requires name and item id.");
-        const block = { type: "toolCall", id: callId, name, arguments: {} };
-        this.output.content.push(block);
-        const state = {
-          kind: "function_call",
-          itemId,
-          block,
-          partialArgs: "",
-          finalArgs: null,
-          completed: false,
-          contentIndex: this.output.content.length - 1
-        };
-        this.items.set(outputIndex, state);
-        this.toolCallStates.push(state);
-        const startEvents = this.ensureStarted();
-        return [
-          ...startEvents,
-          { type: "toolcall_start", contentIndex: state.contentIndex, partial: this.output }
-        ];
-      }
-      this.items.set(outputIndex, { kind: "ignored", itemType: String(item.type) });
-      this.diagnostics.ignoredItemTypes.add(String(item.type));
-      return [];
-    }
-    lookupItem(raw, kinds, label) {
-      const outputIndex = this.requireItemIndex(raw);
-      let state = this.items.get(outputIndex);
-      if (!state || !kinds.includes(state.kind)) {
-        throw new ResponsesProtocolError(
-          `Responses event "${raw.type ?? label}" references ${label} output_index ${outputIndex} that was never added (or is of the wrong item type).`
-        );
-      }
-      if (state.kind !== "ignored" && raw.item_id !== void 0 && raw.item_id !== state.itemId) throw new ResponsesProtocolError("Response item identity changed.");
-      return { state, outputIndex };
-    }
-    onContentPartAdded(raw) {
-      const part = raw.part;
-      const partType = isRecord2(part) ? part.type : void 0;
-      const kind = partType === "reasoning_text" ? "reasoning" : "message";
-      const { state } = this.lookupItem(raw, [kind], kind);
-      const partIndex = raw.content_index;
-      if (typeof partIndex !== "number" || !Number.isInteger(partIndex) || partIndex < 0) {
-        throw new ResponsesProtocolError("response.content_part.added is missing a valid content_index.");
-      }
-      if (state.kind !== "message") return [];
-      if (state.blocks.has(partIndex)) {
-        throw new ResponsesProtocolError(`Responses stream reused content_index ${partIndex} on one message item.`);
-      }
-      if (partType !== "output_text" && partType !== "refusal") {
-        return [];
-      }
-      const block = { type: "text", text: "" };
-      this.output.content.push(block);
-      state.blocks.set(partIndex, { block, contentIndex: this.output.content.length - 1 });
-      return [{ type: "text_start", contentIndex: this.output.content.length - 1, partial: this.output }];
-    }
-    messageBlockFor(raw) {
-      const { state } = this.lookupItem(raw, ["message"], "message");
-      if (state.kind !== "message") throw new ResponsesProtocolError("internal: expected message item");
-      const partIndex = raw.content_index;
-      if (typeof partIndex !== "number" || !Number.isInteger(partIndex) || partIndex < 0) {
-        throw new ResponsesProtocolError(`Responses event "${raw.type}" is missing a valid content_index.`);
-      }
-      const entry = state.blocks.get(partIndex);
-      if (!entry) {
-        throw new ResponsesProtocolError(
-          `Responses event "${raw.type}" references content_index ${partIndex} that was never added.`
-        );
-      }
-      return entry;
-    }
-    appendTextDelta(raw, kind) {
-      const delta = raw.delta;
-      if (typeof delta !== "string" || delta.length === 0) return [];
-      const entry = this.messageBlockFor(raw);
-      entry.block.text += delta;
-      return [{ type: "text_delta", contentIndex: entry.contentIndex, delta, partial: this.output }];
-    }
-    validateTextDone(raw) {
-      this.messageBlockFor(raw);
-    }
-    appendReasoningDelta(raw) {
-      const delta = raw.delta;
-      if (typeof delta !== "string" || delta.length === 0) return [];
-      const { state } = this.lookupItem(raw, ["reasoning"], "reasoning");
-      if (state.kind !== "reasoning") return [];
-      let text = delta;
-      const summaryIndex = raw.summary_index;
-      if (typeof summaryIndex === "number" && Number.isInteger(summaryIndex)) {
-        if (state.lastSummaryIndex !== null && summaryIndex !== state.lastSummaryIndex) {
-          text = `
-
-${delta}`;
-        }
-        state.lastSummaryIndex = summaryIndex;
-      }
-      state.block.thinking += text;
-      return [{ type: "thinking_delta", contentIndex: this.output.content.indexOf(state.block), delta: text, partial: this.output }];
-    }
-    appendFunctionCallArgsDelta(raw) {
-      const delta = raw.delta ?? raw.arguments;
-      if (typeof delta !== "string" || delta.length === 0) return [];
-      const { state } = this.lookupItem(raw, ["function_call"], "function_call");
-      if (state.kind !== "function_call") return [];
-      state.partialArgs += delta;
-      state.block.arguments = parseStreamingJson(state.partialArgs);
-      return [{ type: "toolcall_delta", contentIndex: state.contentIndex, delta, partial: this.output }];
-    }
-    onFunctionCallArgsDone(raw) {
-      const { state } = this.lookupItem(raw, ["function_call"], "function_call");
-      if (state.kind !== "function_call") return;
-      if (typeof raw.arguments === "string") {
-        state.finalArgs = raw.arguments;
-      }
-    }
-    onOutputItemDone(raw) {
-      const outputIndex = this.requireItemIndex(raw);
-      const item = raw.item;
-      if (!isRecord2(item)) {
-        throw new ResponsesProtocolError(`response.output_item.done at index ${outputIndex} is missing the item.`);
-      }
-      const state = this.items.get(outputIndex);
-      if (!state) {
-        throw new ResponsesProtocolError(`response.output_item.done references output_index ${outputIndex} that was never added.`);
-      }
-      if (state.kind !== "ignored" && (item.id !== state.itemId || item.type !== state.kind)) throw new ResponsesProtocolError("Response done item identity changed.");
-      switch (state.kind) {
-        case "message": {
-          const events = [];
-          for (const { block, contentIndex } of state.blocks.values()) {
-            events.push({ type: "text_end", contentIndex, content: block.text, partial: this.output });
-          }
-          return events;
-        }
-        case "reasoning": {
-          const events = [];
-          const encrypted = typeof item.encrypted_content === "string" ? item.encrypted_content : null;
-          const itemId = typeof item.id === "string" && item.id.length > 0 ? item.id : state.itemId;
-          if (itemId) {
-            state.block.thinkingSignature = JSON.stringify({ v: 1, id: itemId, encrypted_content: encrypted });
-          }
-          events.push({
-            type: "thinking_end",
-            contentIndex: this.output.content.indexOf(state.block),
-            content: state.block.thinking,
-            partial: this.output
-          });
-          return events;
-        }
-        case "function_call": {
-          const finalText = typeof item.arguments === "string" && item.arguments.length > 0 ? item.arguments : state.finalArgs ?? state.partialArgs;
-          if (typeof item.call_id === "string" && item.call_id.length > 0 && item.call_id !== state.block.id) {
-            throw new ResponsesProtocolError(`function_call item changed call_id from "${state.block.id}" to "${item.call_id}".`);
-          }
-          if (typeof item.name === "string" && item.name.length > 0 && item.name !== state.block.name) {
-            throw new ResponsesProtocolError(`function_call item changed name from "${state.block.name}" to "${item.name}".`);
-          }
-          state.completed = true;
-          state.finalArgs = finalText;
-          if (this.canParseArgs(state)) {
-            return this.finalizeFunctionCall(state, finalText);
-          }
-          return [];
-        }
-        case "ignored":
-          return [];
-      }
-    }
-    finalizeFunctionCall(state, argsText) {
-      const text = argsText.trim();
-      let parsed;
-      if (text.length === 0) {
-        parsed = {};
-      } else {
-        try {
-          const value = JSON.parse(text);
-          if (!isRecord2(value)) {
-            throw new ResponsesProtocolError(`function_call "${state.block.name || "unknown"}" arguments are not a JSON object.`);
-          }
-          parsed = value;
-        } catch (error) {
-          if (error instanceof ResponsesProtocolError) throw error;
-          const message = error instanceof Error ? error.message : String(error);
-          throw new ResponsesProtocolError(
-            `function_call "${state.block.name || "unknown"}" returned incomplete or invalid JSON arguments: ${message}`
-          );
-        }
-      }
-      state.block.arguments = parsed;
-      return [{ type: "toolcall_end", contentIndex: state.contentIndex, toolCall: state.block, partial: this.output }];
-    }
-    // ─── terminals ──────────────────────────────────────────────────────────
-    requireTerminalResponse(raw) {
-      const response = raw.response;
-      const expected = raw.type.slice("response.".length);
-      if (!isRecord2(response) || typeof response.id !== "string" || !response.id || response.status !== expected) {
-        throw new ResponsesProtocolError(`Malformed ${raw.type}: requires response id and status ${expected}.`);
-      }
-      return response;
-    }
-    onTerminal(raw, type, reason = "stop", errorText) {
-      this.diagnostics.terminalType = type;
-      const response = type === "error" ? void 0 : this.requireTerminalResponse(raw);
-      this.terminal = { reason, response, errorText };
-      return this.closeResponse(type);
-    }
-    onIncomplete(raw) {
-      this.diagnostics.terminalType = "response.incomplete";
-      const response = this.requireTerminalResponse(raw);
-      const reason = response?.incomplete_details?.reason;
-      if (reason === "content_filter" || reason === "steered" || reason === void 0) {
-        this.terminal = {
-          reason: "error",
-          response,
-          errorText: reason === "steered" ? "Response ended incomplete with reason 'steered' but no steering was sent." : `Response ended incomplete${reason ? ` (${reason})` : " without a reason"}.`
-        };
-        return this.closeResponse("response.incomplete");
-      }
-      this.terminal = { reason: "length", response };
-      return this.closeResponse("response.incomplete");
-    }
-    failedText(raw) {
-      const response = isRecord2(raw.response) ? raw.response : void 0;
-      const error = isRecord2(response?.error) ? response?.error : void 0;
-      const message = typeof error?.message === "string" && error.message.length > 0 ? error.message : "Response failed";
-      const code = typeof error?.code === "string" && error.code.length > 0 ? ` (code=${error.code})` : "";
-      return `${message}${code}`;
-    }
-    /** Apply terminal semantics and produce the final event. */
-    closeResponse(terminalType) {
-      const terminal = this.terminal;
-      const response = terminal.response;
-      if (response && isRecord2(response.usage)) {
-        this.output.usage = normalizeResponsesUsage(this.model, response.usage);
-        this.output.usageReported = [response.usage.input_tokens, response.usage.output_tokens].every((value) => typeof value === "number" && Number.isFinite(value) && value >= 0);
-      }
-      if (terminal.reason === "error") {
-        this.output.stopReason = "error";
-        this.output.errorMessage = terminal.errorText ?? "Response failed";
-        return [{ type: "error", reason: "error", error: this.output }];
-      }
-      let stopReason = terminal.reason === "length" ? "length" : "stop";
-      if (this.toolCallStates.length > 0) {
-        stopReason = "toolUse";
-      }
-      if (terminal.reason === "length") {
-        const truncated = this.toolCallStates.filter((state) => !state.completed || !this.canParseArgs(state));
-        if (truncated.length > 0) {
-          const dropped = new Set(truncated.map((state) => state.block));
-          this.output.content = this.output.content.filter(
-            (block) => block.type !== "toolCall" || !dropped.has(block)
-          );
-          this.toolCallStates = this.toolCallStates.filter((state) => !dropped.has(state.block));
-          const names = truncated.map((state) => `"${state.block.name || "unnamed"}"`).sort().join(", ");
-          this.output.content.push({
-            type: "text",
-            text: `[output truncated: max_output_tokens cut ${truncated.length === 1 ? "a tool call" : `${truncated.length} tool calls`} mid-arguments (${names}); the call${truncated.length === 1 ? " was" : "s were"} dropped. Re-issue the call or continue with fewer/smaller requests.]`
-          });
-          if (this.toolCallStates.length === 0) {
-            stopReason = "length";
-          }
-        }
-      } else if (terminal.reason === "stop") {
-        const brokenCalls = this.toolCallStates.filter((state) => !state.completed || !this.canParseArgs(state));
-        if (brokenCalls.length > 0) {
-          const first = brokenCalls[0];
-          this.output.stopReason = "error";
-          this.output.errorMessage = `function_call "${first.block.name || "unknown"}" returned incomplete or invalid JSON arguments on a completed response.`;
-          return [{ type: "error", reason: "error", error: this.output }];
-        }
-      }
-      if (stopReason === "toolUse" && this.toolCallStates.length === 0) {
-        stopReason = "stop";
-      }
-      this.output.stopReason = stopReason;
-      void terminalType;
-      return [{ type: "done", reason: stopReason, message: this.output }];
-    }
-    canParseArgs(state) {
-      const text = (state.finalArgs ?? state.partialArgs).trim();
-      if (text.length === 0) return false;
-      try {
-        return isRecord2(JSON.parse(text));
-      } catch {
-        return false;
-      }
-    }
-  };
-
-  // ../../packages/ai/src/providers/responses/responses-diagnostics.ts
-  function reportSubmission(options, body, details) {
-    if (!options?.onTransportDiagnostic) return;
-    let requestBytes = 0;
-    for (const character of body) {
-      const point = character.codePointAt(0);
-      requestBytes += point <= 127 ? 1 : point <= 2047 ? 2 : point <= 65535 ? 3 : 4;
-    }
-    try {
-      options.onTransportDiagnostic({ ...details, requestBytes });
-    } catch {
-    }
-  }
-  function reportLifecycle(options, event) {
-    if (!options?.onTransportLifecycle) return;
-    try {
-      options.onTransportLifecycle({ ...event });
-    } catch {
-    }
-  }
-  var localRequestCounter = 0;
-  function nextLocalRequestId(prefix = "req") {
-    localRequestCounter += 1;
-    return `${prefix}-${localRequestCounter}-${Math.random().toString(36).slice(2, 8)}`;
-  }
-  function timeoutSuffix(budgetMs, lagMs) {
-    const budget = budgetMs && budgetMs > 0 ? ` (budget ${Math.round(budgetMs / 1e3)}s)` : "";
-    if (lagMs > 1e3) {
-      return `${budget} \u2014 timer fired ${Math.round(lagMs / 1e3)}s late (system sleep or suspended process)`;
-    }
-    return budget;
-  }
-  function monotonicNow() {
-    const perf = globalThis.performance;
-    return typeof perf?.now === "function" ? perf.now() : Date.now();
-  }
-
   // ../../packages/ai/src/providers/responses/responses-sse.ts
   var DEFAULT_RESPONSES_STREAM_IDLE_TIMEOUT_MS = 2 * 60 * 1e3;
   var DEFAULT_RESPONSES_FIRST_BYTE_TIMEOUT_MS = 3 * 60 * 1e3;
@@ -13439,6 +13639,7 @@ ${delta}`;
     void (async () => {
       const reducer = new ResponsesEventReducer(model);
       const localRequestId = nextLocalRequestId("sse");
+      const sseDump = openSseDumpSink(localRequestId, `${model.provider}/${model.id}`);
       const startedAt = monotonicNow();
       let lastReceiveAt = startedAt;
       let receivedMessageCount = 0;
@@ -13601,6 +13802,7 @@ ${delta}`;
               const message = error instanceof Error ? error.message : String(error);
               throw new ResponsesProtocolError(`Responses SSE stream returned malformed JSON: ${message}`);
             }
+            sseDump.record(event);
             if (!isResponsesEventLike(event)) {
               throw new ResponsesProtocolError("Responses SSE payload is not an event object with a string type.");
             }
@@ -13608,10 +13810,10 @@ ${delta}`;
               sawModelContent = true;
             }
             const incomingResponse = event.response;
-            if (event.type === "response.created" && (!isRecord2(incomingResponse) || typeof incomingResponse.id !== "string" || !incomingResponse.id)) {
+            if (event.type === "response.created" && (!isRecord(incomingResponse) || typeof incomingResponse.id !== "string" || !incomingResponse.id)) {
               throw new ResponsesProtocolError("response.created requires a response id.");
             }
-            if (isRecord2(incomingResponse) && typeof incomingResponse.id === "string") {
+            if (isRecord(incomingResponse) && typeof incomingResponse.id === "string") {
               if (responseId && (incomingResponse.id !== responseId || event.type === "response.created")) {
                 throw new ResponsesProtocolError("Response identity changed within a request.");
               }
@@ -13685,6 +13887,7 @@ ${delta}`;
       } finally {
         clearTotalTimer();
         options?.signal?.removeEventListener("abort", onUserAbort);
+        await sseDump.flush();
       }
     })();
     return stream;
@@ -13920,6 +14123,7 @@ ${delta}`;
     }
     state.busy = true;
     const localRequestId = nextLocalRequestId("ws");
+    const sseDump = openSseDumpSink(localRequestId, `${model.provider}/${model.id}`);
     const requestGeneration = ++state.requestGeneration;
     const startedAt = monotonicNow();
     let lastReceiveAt = startedAt;
@@ -14266,12 +14470,13 @@ ${delta}`;
               try {
                 if (message.isBinary) throw new ResponsesProtocolError("Responses requires JSON text messages.");
                 const event = JSON.parse(message.data);
-                if (!isRecord2(event)) throw new ResponsesProtocolError("Invalid Responses WebSocket event.");
+                sseDump.record(event);
+                if (!isRecord(event)) throw new ResponsesProtocolError("Invalid Responses WebSocket event.");
                 if (typeof event.type === "string") {
                   if (event.type === "response.created") sawResponseCreated = true;
                   else if (event.type.startsWith("response.output") || event.type.startsWith("response.content") || event.type.startsWith("response.reasoning")) sawModelContent = true;
                 }
-                if (!started && attempt === 0 && payload.previous_response_id && event.type === "error" && event.status === 400 && isRecord2(event.error) && event.error.code === "previous_response_not_found" && event.error.param === "previous_response_id") {
+                if (!started && attempt === 0 && payload.previous_response_id && event.type === "error" && event.status === 400 && isRecord(event.error) && event.error.code === "previous_response_not_found" && event.error.param === "previous_response_id") {
                   delete payload.previous_response_id;
                   payload.input = fullInput;
                   continuationReason = "previous_response_not_found";
@@ -14281,13 +14486,13 @@ ${delta}`;
                 if (!started && typeof event.type === "string" && event.type !== "error" && !event.type.startsWith("response.")) continue;
                 if (started && event.type === "response.created") throw new ResponsesProtocolError("Duplicate response.created within a request.");
                 if (!started && event.type !== "error") {
-                  if (event.type !== "response.created" || !isRecord2(event.response) || typeof event.response.id !== "string" || !event.response.id || event.response.id === state.lastResponseId) {
+                  if (event.type !== "response.created" || !isRecord(event.response) || typeof event.response.id !== "string" || !event.response.id || event.response.id === state.lastResponseId) {
                     throw new ResponsesProtocolError("Expected a new response.created before output.");
                   }
                   started = true;
                   responseId = event.response.id;
                 }
-                if (responseId && isRecord2(event.response) && event.response.id !== responseId) throw new ResponsesProtocolError("Response identity changed within a request.");
+                if (responseId && isRecord(event.response) && event.response.id !== responseId) throw new ResponsesProtocolError("Response identity changed within a request.");
                 events = reducer.feed(event);
               } catch (error) {
                 reducer.message.remoteFailure = { category: "other" };
@@ -14399,6 +14604,7 @@ ${delta}`;
         });
         for (const event of terminalEvents) stream.push(event);
         stream.end();
+        await sseDump.flush();
       }
     })();
     return stream;
@@ -39760,6 +39966,9 @@ Queries tried: ${details.actualQueries.join("; ") || query}` }],
     const day = `${date.getDate()}`.padStart(2, "0");
     return `${date.getFullYear()}-${month}-${day}`;
   }
+
+  // ../../packages/shared-headless-capabilities/src/memory/ledger.ts
+  var MAX_BYTES = 8 * 1024 * 1024;
 
   // src/unity-websocket-client.ts
   var pause = () => new Promise((resolve2) => setTimeout(resolve2, 10));
